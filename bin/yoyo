@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""A tiny cross-agent delegation CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "0.1.0"
+
+
+ROLE_PROMPTS = {
+    "opinion": """You are being called as an independent second-opinion agent.
+
+Do not edit files. Focus on disagreement, missing evidence, hidden failure modes, and the smallest next step that would change the conclusion.
+
+Return concise sections:
+- Verdict
+- Reasons
+- Risks
+- Recommendation
+""",
+    "review": """You are being called as an independent code reviewer.
+
+Do not edit files. Prioritize concrete bugs, security issues, behavioral regressions, missing tests, and overcomplication. Findings must include file/line references when the context allows it.
+
+Return findings first, ordered by severity. If you find no issues, say that directly and name residual test gaps.
+""",
+    "worker": """You are being called as a delegated worker by another agent.
+
+Stay inside the requested scope. Make the minimum change needed. If write access was not explicitly granted, do not edit files. If you do edit files, report exactly what changed and how you verified it.
+
+Return concise sections:
+- Result
+- Changed files
+- Verification
+- Open risks
+""",
+}
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    command: list[str]
+
+
+DEFAULT_AGENTS: dict[str, AgentSpec] = {
+    "codex": AgentSpec("codex", ["codex", "exec"]),
+    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"]),
+    "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"]),
+}
+
+
+class YoyoError(Exception):
+    pass
+
+
+def eprint(*parts: object, **kwargs: Any) -> None:
+    print(*parts, file=sys.stderr, **kwargs)
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("YOYO_CONFIG", "~/.config/yoyo/agents.json")).expanduser()
+
+
+def load_configured_agents() -> dict[str, AgentSpec]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise YoyoError(f"Could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise YoyoError(f"Invalid JSON in {path}: {exc}") from exc
+
+    agents: dict[str, AgentSpec] = {}
+    for name, raw in data.get("agents", {}).items():
+        if isinstance(raw, str):
+            command = shlex.split(raw)
+        elif isinstance(raw, dict) and isinstance(raw.get("command"), list):
+            command = [str(part) for part in raw["command"]]
+        else:
+            raise YoyoError(f"Invalid agent config for {name!r}; use a string or {{\"command\": [...]}}")
+        if not command:
+            raise YoyoError(f"Agent {name!r} has an empty command")
+        agents[name] = AgentSpec(name, command)
+    return agents
+
+
+def load_agents() -> dict[str, AgentSpec]:
+    agents = dict(DEFAULT_AGENTS)
+    agents.update(load_configured_agents())
+
+    for key, value in os.environ.items():
+        if key.startswith("YOYO_AGENT_") and value.strip():
+            name = key.removeprefix("YOYO_AGENT_").lower().replace("_", "-")
+            agents[name] = AgentSpec(name, shlex.split(value))
+    return agents
+
+
+def read_file_context(paths: list[str], base: Path) -> str:
+    blocks: list[str] = []
+    for item in paths:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        if not path.exists():
+            raise YoyoError(f"Context file not found: {path}")
+        if not path.is_file():
+            raise YoyoError(f"Context path is not a file: {path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        label = os.path.relpath(path, base) if path.is_relative_to(base) else str(path)
+        blocks.append(f"<file path=\"{label}\">\n{text}\n</file>")
+    return "\n\n".join(blocks)
+
+
+def build_prompt(args: argparse.Namespace) -> str:
+    cwd = Path(args.cwd).expanduser().resolve()
+    prompt_parts: list[str] = []
+    if args.role:
+        prompt_parts.append(ROLE_PROMPTS[args.role].strip())
+
+    scope = "write access granted" if args.write else "read-only delegation"
+    prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}.")
+
+    if args.prompt:
+        prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
+
+    if not sys.stdin.isatty():
+        stdin_text = sys.stdin.read()
+        if stdin_text.strip():
+            prompt_parts.append("<stdin>\n" + stdin_text.rstrip() + "\n</stdin>")
+
+    if args.file:
+        prompt_parts.append("Context files:\n" + read_file_context(args.file, cwd))
+
+    prompt = "\n\n".join(part for part in prompt_parts if part.strip()).strip()
+    if not prompt:
+        raise YoyoError("No prompt provided. Pass text, pipe stdin, or use --file.")
+    return prompt + "\n"
+
+
+def command_for_agent(
+    spec: AgentSpec,
+    args: argparse.Namespace,
+    codex_output_file: str | None = None,
+) -> list[str]:
+    cmd = list(spec.command)
+    cwd = str(Path(args.cwd).expanduser().resolve())
+
+    if spec.name == "codex":
+        cmd.extend(["--skip-git-repo-check", "--ephemeral", "--color", "never", "-C", cwd])
+        cmd.extend(["--sandbox", "workspace-write" if args.write else "read-only"])
+        if codex_output_file:
+            cmd.extend(["--output-last-message", codex_output_file])
+        if args.model:
+            cmd.extend(["--model", args.model])
+        for extra in args.agent_arg or []:
+            cmd.append(extra)
+        cmd.append("-")
+    elif spec.name == "claude":
+        if args.model:
+            cmd.extend(["--model", args.model])
+        if not args.write:
+            cmd.extend(["--tools", "Read,Grep,Glob,LS"])
+        for extra in args.agent_arg or []:
+            cmd.append(extra)
+    elif spec.name == "pi":
+        if args.model:
+            cmd.extend(["--model", args.model])
+        if args.write:
+            cmd.extend(["--tools", "read,grep,find,ls,bash,edit,write"])
+        else:
+            cmd.extend(["--tools", "read,grep,find,ls"])
+        for extra in args.agent_arg or []:
+            cmd.append(extra)
+    else:
+        for extra in args.agent_arg or []:
+            cmd.append(extra)
+    return cmd
+
+
+def run_agent(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    if args.agent not in agents:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+
+    prompt = build_prompt(args)
+    codex_output_file: str | None = None
+    if agents[args.agent].name == "codex" and not args.dry_run:
+        handle = tempfile.NamedTemporaryFile(prefix="yoyo-codex-", suffix=".txt", delete=False)
+        codex_output_file = handle.name
+        handle.close()
+
+    cmd = command_for_agent(agents[args.agent], args, codex_output_file)
+    if args.dry_run:
+        payload = {"agent": args.agent, "command": cmd, "prompt": prompt}
+        print(json.dumps(payload, indent=2) if args.json else shlex.join(cmd) + "\n\n" + prompt)
+        return 0
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            text=True,
+            cwd=str(Path(args.cwd).expanduser().resolve()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=args.timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        if codex_output_file:
+            Path(codex_output_file).unlink(missing_ok=True)
+        result = {
+            "agent": args.agent,
+            "command": cmd,
+            "exit_code": 124,
+            "duration_s": round(elapsed, 3),
+            "stdout": exc.stdout or "",
+            "stderr": f"Timed out after {args.timeout}s",
+        }
+        emit_result(result, args.json)
+        return 124
+
+    stdout = proc.stdout
+    stderr = proc.stderr
+    if codex_output_file:
+        path = Path(codex_output_file)
+        if path.exists():
+            final_message = path.read_text(encoding="utf-8", errors="replace")
+            path.unlink(missing_ok=True)
+            if final_message.strip():
+                stdout = final_message
+                if proc.returncode == 0:
+                    stderr = ""
+
+    result = {
+        "agent": args.agent,
+        "command": cmd,
+        "exit_code": proc.returncode,
+        "duration_s": round(time.monotonic() - started, 3),
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    emit_result(result, args.json)
+    return proc.returncode
+
+
+def emit_result(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if result["stdout"]:
+        print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
+    if result["stderr"]:
+        eprint(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n")
+
+
+def list_agents(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    rows = []
+    for name, spec in sorted(agents.items()):
+        rows.append({"name": name, "command": spec.command, "found": bool(shutil_which(spec.command[0]))})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    width = max([len(row["name"]) for row in rows] + [5])
+    for row in rows:
+        status = "ok" if row["found"] else "missing"
+        print(f"{row['name']:<{width}}  {status:7}  {shlex.join(row['command'])}")
+    return 0
+
+
+def shutil_which(command: str) -> str | None:
+    if os.path.isabs(command):
+        candidate = Path(command)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        return None
+    path = os.environ.get("PATH", "")
+    for directory in path.split(os.pathsep):
+        candidate = Path(directory) / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def doctor(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    failed = 0
+    for name, spec in sorted(agents.items()):
+        found = shutil_which(spec.command[0])
+        if not found:
+            failed += 1
+            print(f"{name}: missing ({spec.command[0]})")
+            continue
+        print(f"{name}: ok ({found})")
+    path = config_path()
+    print(f"config: {path} ({'present' if path.exists() else 'not present'})")
+    return 1 if failed and args.strict else 0
+
+
+def install_skill(args: argparse.Namespace) -> int:
+    source_env = os.environ.get("YOYO_SKILL_SOURCE")
+    if source_env:
+        source = Path(source_env).expanduser()
+    else:
+        source = Path(__file__).resolve().parents[1] / "skills" / "yoyo"
+    if not source.exists():
+        raise YoyoError(f"Bundled skill not found: {source}")
+    targets = [
+        Path("~/.codex/skills/yoyo").expanduser(),
+        Path("~/.claude/skills/yoyo").expanduser(),
+        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills" / "yoyo",
+    ]
+    for target in targets:
+        target.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            if child.is_file():
+                (target / child.name).write_text(child.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"installed skill: {target}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="yoyo", description="Tiny cross-agent delegation CLI")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    ask = sub.add_parser("ask", help="Call another agent non-interactively")
+    ask.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
+    ask.add_argument("prompt", nargs="*", help="Prompt text. Also accepts piped stdin.")
+    ask.add_argument("--role", choices=sorted(ROLE_PROMPTS), default="opinion")
+    ask.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    ask.add_argument("--cwd", default=os.getcwd())
+    ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
+    ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", "600")))
+    ask.add_argument("--model", help="Pass a model name to agents that support --model")
+    ask.add_argument("--write", action="store_true", help="Grant write-capable mode where the target agent supports it")
+    ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    ask.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
+    ask.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
+    ask.set_defaults(func=run_agent)
+
+    agents = sub.add_parser("agents", help="List configured agents")
+    agents.add_argument("--json", action="store_true")
+    agents.set_defaults(func=list_agents)
+
+    diag = sub.add_parser("doctor", help="Check whether configured agent commands exist")
+    diag.add_argument("--strict", action="store_true", help="Exit non-zero if any configured agent is missing")
+    diag.set_defaults(func=doctor)
+
+    skill = sub.add_parser("install-skill", help="Install the bundled yoyo coordination skill")
+    skill.set_defaults(func=install_skill)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except BrokenPipeError:
+        return 141
+    except YoyoError as exc:
+        eprint(f"yoyo: {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
