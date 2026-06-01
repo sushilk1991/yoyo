@@ -6,17 +6,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import signal
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
+DEFAULT_MAX_INPUT_BYTES = 2_000_000
 
 
 ROLE_PROMPTS = {
@@ -53,12 +58,15 @@ Return concise sections:
 class AgentSpec:
     name: str
     command: list[str]
+    flavor: str | None = None
+    read_only_args: list[str] | None = None
+    full_access_args: list[str] | None = None
 
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
-    "codex": AgentSpec("codex", ["codex", "exec"]),
-    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"]),
-    "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"]),
+    "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
+    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude"),
+    "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi"),
 }
 
 
@@ -74,6 +82,90 @@ def config_path() -> Path:
     return Path(os.environ.get("YOYO_CONFIG", "~/.config/yoyo/agents.json")).expanduser()
 
 
+def resolve_cwd(raw: str) -> Path:
+    cwd = Path(raw).expanduser().resolve()
+    if not cwd.exists():
+        raise YoyoError(f"Working directory does not exist: {cwd}")
+    if not cwd.is_dir():
+        raise YoyoError(f"Working directory is not a directory: {cwd}")
+    return cwd
+
+
+def display_path(path: Path, base: Path) -> str:
+    try:
+        return os.path.relpath(path, base)
+    except ValueError:
+        return path.name
+
+
+def read_limited_text(path: Path, limit: int) -> tuple[str, bool]:
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    truncated = len(data) > limit
+    if truncated:
+        data = data[:limit]
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n...[truncated after {limit} bytes]\n"
+    return text, truncated
+
+
+def read_limited_stdin(limit: int) -> tuple[str, bool, int]:
+    chunks: list[str] = []
+    total = 0
+    truncated = False
+    while True:
+        chunk = sys.stdin.read(min(65536, max(1, limit + 1 - total)))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk.encode("utf-8", errors="replace"))
+        if total > limit:
+            truncated = True
+            break
+    text = "".join(chunks)
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) > limit:
+        text = encoded[:limit].decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n...[stdin truncated after {limit} bytes]\n"
+    consumed = min(len(encoded), limit)
+    return text, truncated, consumed
+
+
+def run_to_files(
+    cmd: list[str],
+    prompt: str,
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+            cwd=str(cwd),
+            start_new_session=os.name == "posix",
+        )
+        try:
+            proc.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode)
+
+
 def load_configured_agents() -> dict[str, AgentSpec]:
     path = config_path()
     if not path.exists():
@@ -87,15 +179,23 @@ def load_configured_agents() -> dict[str, AgentSpec]:
 
     agents: dict[str, AgentSpec] = {}
     for name, raw in data.get("agents", {}).items():
+        read_only_args: list[str] = []
+        full_access_args: list[str] = []
+        flavor: str | None = None
         if isinstance(raw, str):
             command = shlex.split(raw)
         elif isinstance(raw, dict) and isinstance(raw.get("command"), list):
             command = [str(part) for part in raw["command"]]
+            read_only_args = [str(part) for part in raw.get("read_only_args", [])]
+            full_access_args = [str(part) for part in raw.get("full_access_args", [])]
+            flavor = raw.get("kind")
+            if flavor is not None:
+                flavor = str(flavor)
         else:
             raise YoyoError(f"Invalid agent config for {name!r}; use a string or {{\"command\": [...]}}")
         if not command:
             raise YoyoError(f"Agent {name!r} has an empty command")
-        agents[name] = AgentSpec(name, command)
+        agents[name] = AgentSpec(name, command, flavor=flavor, read_only_args=read_only_args, full_access_args=full_access_args)
     return agents
 
 
@@ -110,8 +210,22 @@ def load_agents() -> dict[str, AgentSpec]:
     return agents
 
 
-def read_file_context(paths: list[str], base: Path) -> str:
+def read_input_file(path: Path, limit: int) -> tuple[str, bool, int]:
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    truncated = len(data) > limit
+    consumed = min(len(data), limit)
+    if truncated:
+        data = data[:limit]
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n...[file truncated after input budget limit]\n"
+    return text, truncated, consumed
+
+
+def read_file_context(paths: list[str], base: Path, limit: int) -> str:
     blocks: list[str] = []
+    remaining = limit
     for item in paths:
         path = Path(item).expanduser()
         if not path.is_absolute():
@@ -120,31 +234,43 @@ def read_file_context(paths: list[str], base: Path) -> str:
             raise YoyoError(f"Context file not found: {path}")
         if not path.is_file():
             raise YoyoError(f"Context path is not a file: {path}")
-        text = path.read_text(encoding="utf-8", errors="replace")
-        label = os.path.relpath(path, base) if path.is_relative_to(base) else str(path)
+        label = display_path(path, base)
+        if remaining < 1:
+            blocks.append(f"<file path=\"{label}\">\n...[input budget exhausted before this file]\n</file>")
+            continue
+        text, _, consumed = read_input_file(path, remaining)
+        remaining -= consumed
         blocks.append(f"<file path=\"{label}\">\n{text}\n</file>")
     return "\n\n".join(blocks)
 
 
 def build_prompt(args: argparse.Namespace) -> str:
-    cwd = Path(args.cwd).expanduser().resolve()
+    cwd = resolve_cwd(args.cwd)
+    stdin_is_piped = not sys.stdin.isatty()
+    stdin_context_used = False
     prompt_parts: list[str] = []
     if args.role:
         prompt_parts.append(ROLE_PROMPTS[args.role].strip())
 
     scope = "read-only delegation" if args.read_only else "full-access delegation"
-    prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}.")
+    prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
 
     if args.prompt:
         prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
 
-    if not sys.stdin.isatty():
-        stdin_text = sys.stdin.read()
-        if stdin_text.strip():
-            prompt_parts.append("<stdin>\n" + stdin_text.rstrip() + "\n</stdin>")
+    remaining_input = args.max_input_bytes
+    if stdin_is_piped:
+            stdin_text, _, consumed = read_limited_stdin(remaining_input)
+            remaining_input -= consumed
+            if stdin_text.strip():
+                stdin_context_used = True
+                prompt_parts.append("<stdin>\n" + stdin_text.rstrip() + "\n</stdin>")
 
     if args.file:
-        prompt_parts.append("Context files:\n" + read_file_context(args.file, cwd))
+        prompt_parts.append("Context files:\n" + read_file_context(args.file, cwd, remaining_input))
+
+    if not args.read_only and (args.file or stdin_context_used) and not os.environ.get("YOYO_SUPPRESS_FULL_ACCESS_WARNING"):
+        eprint("warning: full-access delegation includes stdin/--file context; use --read-only for untrusted input")
 
     prompt = "\n\n".join(part for part in prompt_parts if part.strip()).strip()
     if not prompt:
@@ -160,17 +286,18 @@ def command_for_agent(
     interactive: bool = False,
 ) -> list[str]:
     cmd = list(spec.command)
-    cwd = str(Path(args.cwd).expanduser().resolve())
+    cwd = str(resolve_cwd(args.cwd))
 
-    if spec.name == "codex":
+    if spec.flavor == "codex":
+        codex_bin = spec.command[0]
         if interactive:
-            cmd = ["codex", "-C", cwd]
+            cmd = [codex_bin, "-C", cwd]
             if args.read_only:
                 cmd.extend(["--sandbox", "read-only"])
             else:
                 cmd.extend(["--sandbox", "danger-full-access", "--ask-for-approval", "never"])
         else:
-            cmd = ["codex"]
+            cmd = [codex_bin]
             if not args.read_only:
                 cmd.extend(["--ask-for-approval", "never"])
             cmd.append("exec")
@@ -190,9 +317,9 @@ def command_for_agent(
                 cmd.append(" ".join(args.prompt).strip())
         else:
             cmd.append("-")
-    elif spec.name == "claude":
+    elif spec.flavor == "claude":
         if interactive:
-            cmd = ["claude"]
+            cmd = [spec.command[0]]
         if args.model:
             cmd.extend(["--model", args.model])
         if args.read_only:
@@ -203,9 +330,9 @@ def command_for_agent(
             cmd.append(extra)
         if interactive and args.prompt:
             cmd.append(" ".join(args.prompt).strip())
-    elif spec.name == "pi":
+    elif spec.flavor == "pi":
         if interactive:
-            cmd = ["pi"]
+            cmd = [spec.command[0]]
         if args.model:
             cmd.extend(["--model", args.model])
         if args.read_only:
@@ -217,6 +344,12 @@ def command_for_agent(
         if interactive and args.prompt:
             cmd.append(" ".join(args.prompt).strip())
     else:
+        if args.read_only and not spec.read_only_args:
+            raise YoyoError(f"Agent {spec.name!r} has no configured read_only_args, so --read-only cannot be enforced")
+        if args.read_only:
+            cmd.extend(spec.read_only_args or [])
+        else:
+            cmd.extend(spec.full_access_args or [])
         for extra in args.agent_arg or []:
             cmd.append(extra)
         if interactive and args.prompt:
@@ -229,71 +362,90 @@ def run_agent(args: argparse.Namespace) -> int:
     if args.agent not in agents:
         known = ", ".join(sorted(agents))
         raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
 
+    cwd = resolve_cwd(args.cwd)
     prompt = build_prompt(args)
     codex_output_file: str | None = None
-    if agents[args.agent].name == "codex" and not args.dry_run:
-        handle = tempfile.NamedTemporaryFile(prefix="yoyo-codex-", suffix=".txt", delete=False)
-        codex_output_file = handle.name
-        handle.close()
+    with tempfile.TemporaryDirectory(prefix="yoyo-") as tmp:
+        tmpdir = Path(tmp)
+        if agents[args.agent].flavor == "codex" and not args.dry_run:
+            codex_output_file = str(tmpdir / "codex-last-message.txt")
 
-    cmd = command_for_agent(agents[args.agent], args, codex_output_file)
-    if args.dry_run:
-        payload = {"agent": args.agent, "command": cmd, "prompt": prompt}
-        print(json.dumps(payload, indent=2) if args.json else shlex.join(cmd) + "\n\n" + prompt)
-        return 0
+        cmd = command_for_agent(agents[args.agent], args, codex_output_file)
+        if args.dry_run:
+            payload = {"agent": args.agent, "command": cmd, "prompt": prompt, "trace_id": args.trace_id}
+            print(json.dumps(payload, indent=2) if args.json else shlex.join(cmd) + "\n\n" + prompt)
+            return 0
 
-    started = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            text=True,
-            cwd=str(Path(args.cwd).expanduser().resolve()),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=args.timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.monotonic() - started
+        started = time.monotonic()
+        stdout_path = tmpdir / "stdout.txt"
+        stderr_path = tmpdir / "stderr.txt"
+        try:
+            proc = run_to_files(cmd, prompt, cwd, stdout_path, stderr_path, args.timeout)
+        except FileNotFoundError as exc:
+            raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+            stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+            if stderr:
+                stderr += "\n"
+            stderr += f"Timed out after {args.timeout}s"
+            result = {
+                "agent": args.agent,
+                "command": cmd,
+                "exit_code": 124,
+                "duration_s": round(elapsed, 3),
+                "trace_id": args.trace_id,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stderr_plain": stderr,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }
+            emit_result(result, args.json)
+            return 124
+
+        stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+        stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
         if codex_output_file:
-            Path(codex_output_file).unlink(missing_ok=True)
+            path = Path(codex_output_file)
+            if path.exists():
+                final_message, final_truncated = read_limited_text(path, args.max_output_bytes)
+                if final_message.strip():
+                    stdout = final_message
+                    stdout_truncated = final_truncated
+                    if proc.returncode == 0:
+                        stderr_plain = ""
+                    else:
+                        stderr_plain = stderr
+                else:
+                    stderr_plain = stderr
+            else:
+                stderr_plain = stderr
+        else:
+            stderr_plain = stderr
+
         result = {
             "agent": args.agent,
             "command": cmd,
-            "exit_code": 124,
-            "duration_s": round(elapsed, 3),
-            "stdout": exc.stdout or "",
-            "stderr": f"Timed out after {args.timeout}s",
+            "exit_code": proc.returncode,
+            "duration_s": round(time.monotonic() - started, 3),
+            "trace_id": args.trace_id,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stderr_plain": stderr_plain,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }
         emit_result(result, args.json)
-        return 124
-
-    stdout = proc.stdout
-    stderr = proc.stderr
-    if codex_output_file:
-        path = Path(codex_output_file)
-        if path.exists():
-            final_message = path.read_text(encoding="utf-8", errors="replace")
-            path.unlink(missing_ok=True)
-            if final_message.strip():
-                stdout = final_message
-                if proc.returncode == 0:
-                    stderr = ""
-
-    result = {
-        "agent": args.agent,
-        "command": cmd,
-        "exit_code": proc.returncode,
-        "duration_s": round(time.monotonic() - started, 3),
-        "stdout": stdout,
-        "stderr": stderr,
-    }
-    emit_result(result, args.json)
-    return proc.returncode
+        return proc.returncode
 
 
 def chat_agent(args: argparse.Namespace) -> int:
@@ -302,13 +454,14 @@ def chat_agent(args: argparse.Namespace) -> int:
         known = ", ".join(sorted(agents))
         raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
 
+    cwd = resolve_cwd(args.cwd)
     cmd = command_for_agent(agents[args.agent], args, interactive=True)
     if args.dry_run:
         print(shlex.join(cmd))
         return 0
 
     try:
-        return subprocess.call(cmd, cwd=str(Path(args.cwd).expanduser().resolve()))
+        return subprocess.call(cmd, cwd=str(cwd))
     except FileNotFoundError as exc:
         raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
 
@@ -319,15 +472,18 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
         return
     if result["stdout"]:
         print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
-    if result["stderr"]:
-        eprint(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n")
+    stderr = result.get("stderr_plain", result["stderr"])
+    if stderr:
+        eprint(stderr, end="" if stderr.endswith("\n") else "\n")
+    if result.get("trace_id"):
+        eprint(f"trace_id={result['trace_id']}")
 
 
 def list_agents(args: argparse.Namespace) -> int:
     agents = load_agents()
     rows = []
     for name, spec in sorted(agents.items()):
-        rows.append({"name": name, "command": spec.command, "found": bool(shutil_which(spec.command[0]))})
+        rows.append({"name": name, "command": spec.command, "found": bool(shutil.which(spec.command[0]))})
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
@@ -336,27 +492,11 @@ def list_agents(args: argparse.Namespace) -> int:
         status = "ok" if row["found"] else "missing"
         print(f"{row['name']:<{width}}  {status:7}  {shlex.join(row['command'])}")
     return 0
-
-
-def shutil_which(command: str) -> str | None:
-    if os.path.isabs(command):
-        candidate = Path(command)
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-        return None
-    path = os.environ.get("PATH", "")
-    for directory in path.split(os.pathsep):
-        candidate = Path(directory) / command
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
-
-
 def doctor(args: argparse.Namespace) -> int:
     agents = load_agents()
     failed = 0
     for name, spec in sorted(agents.items()):
-        found = shutil_which(spec.command[0])
+        found = shutil.which(spec.command[0])
         if not found:
             failed += 1
             print(f"{name}: missing ({spec.command[0]})")
@@ -402,6 +542,9 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--cwd", default=os.getcwd())
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
     ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", "600")))
+    ask.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
+    ask.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
+    ask.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
     ask.add_argument("--model", help="Pass a model name to agents that support --model")
     ask.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
     ask.add_argument("--write", action="store_false", dest="read_only", help=argparse.SUPPRESS)

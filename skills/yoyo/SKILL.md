@@ -44,6 +44,12 @@ yoyo doctor
 yoyo agents
 ```
 
+Trace/debug a delegation:
+
+```bash
+yoyo ask claude --trace-id "$USER-auth-review" --json "Review this plan."
+```
+
 ## Coordination Protocol
 
 1. Define the success criterion before delegating.
@@ -54,6 +60,8 @@ yoyo agents
 3. Pass only the context needed. Prefer `--file` for exact artifacts and a short prompt for the ask.
 4. Use default full access for trusted automation or worker tasks. Use `--read-only` for reviews, second opinions, or untrusted prompts.
 5. Verify the result yourself. Run tests, inspect diffs, and reconcile disagreements before acting.
+6. For long or noisy tasks, set `--trace-id` and consider `--max-output-bytes` so failures are auditable and output cannot grow without bound.
+7. For large diffs or generated files, use `--max-input-bytes`; yoyo applies it as an aggregate cap across stdin and `--file` context.
 
 ## Good Delegation Prompts
 
@@ -81,6 +89,8 @@ git diff -- src tests | yoyo ask pi --role review "Review this diff for correctn
 - Do not ask multiple agents broad open-ended questions and average the answers.
 - Do not let a worker perform irreversible operations, releases, credential changes, or destructive git commands unless the human explicitly asked for that and you can verify every step.
 - Use `yoyo chat` only when a human or supervising agent is available to interact. Use `yoyo ask` for autonomous one-shot delegation.
+- Use `--read-only` for built-in agents when reviewing untrusted diffs/files. For custom agents, configure `read_only_args`; yoyo fails loudly if read-only cannot be enforced.
+- Treat the full-access warning on stdin/`--file` as meaningful; switch to `--read-only` unless the input and task are trusted.
 - If agents disagree, identify the factual claim that would settle it, then inspect code, docs, tests, or live state.
 - If the target agent fails, times out, or lacks credentials, report that directly and continue with the best local verification path.
 

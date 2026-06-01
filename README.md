@@ -4,6 +4,8 @@
 
 The design is deliberately boring: one Python script, subprocess calls, explicit prompts, no daemon, no package manager requirement.
 
+Requires Python 3.9+.
+
 ## Install
 
 ```bash
@@ -37,6 +39,7 @@ yoyo ask claude --role opinion "Challenge this design and list failure modes."
 `--role` defaults to `opinion`; specify `review` or `worker` when you want those behaviors.
 
 By default, `yoyo ask` is one-shot, full-access, and configured not to ask follow-up permission prompts where the target agent supports that. Use `--read-only` for constrained review.
+When full-access mode includes piped stdin or `--file` context, `yoyo` prints a warning because that context may be untrusted.
 
 Review a file:
 
@@ -62,6 +65,24 @@ JSON output:
 yoyo ask claude --json --role opinion "Return one risk."
 ```
 
+Trace a delegated call:
+
+```bash
+yoyo ask claude --trace-id "auth-review-001" --json "Review this plan."
+```
+
+Limit captured output:
+
+```bash
+yoyo ask codex --max-output-bytes 200000 "Summarize this repo."
+```
+
+Limit captured input:
+
+```bash
+git diff | yoyo ask claude --max-input-bytes 200000 "Review this diff."
+```
+
 Open an interactive session:
 
 ```bash
@@ -84,9 +105,26 @@ Custom agents can be added with `~/.config/yoyo/agents.json`:
 {
   "agents": {
     "local": {
-      "command": ["python3", "/path/to/my-agent.py"]
+      "command": ["python3", "/path/to/my-agent.py"],
+      "read_only_args": ["--read-only"],
+      "full_access_args": ["--write"]
     },
     "echoer": "cat"
+  }
+}
+```
+
+For configured agents, `read_only_args` and `full_access_args` are appended automatically based on `--read-only`. If a custom agent has no `read_only_args`, `yoyo ask custom --read-only ...` fails loudly instead of pretending the custom agent is constrained.
+
+To override a built-in command while keeping built-in flag behavior, set `kind`:
+
+```json
+{
+  "agents": {
+    "codex": {
+      "kind": "codex",
+      "command": ["/custom/path/codex", "exec"]
+    }
   }
 }
 ```
@@ -115,6 +153,17 @@ Use `--read-only` when you want a bounded reviewer:
 - Pi receives read-oriented tools only
 
 This is intentionally powerful. Agent output is not truth; verify it with code, tests, docs, or live state before acting.
+
+## Durability
+
+- Each `ask` call carries a trace ID in the prompt metadata and JSON result.
+- Plain output also emits `trace_id=...` on stderr.
+- Subprocess stdout/stderr is captured through temporary files instead of unbounded in-memory pipes.
+- Output is capped by `--max-output-bytes` or `YOYO_MAX_OUTPUT_BYTES` and reports truncation in JSON mode.
+- Stdin and `--file` context share an aggregate cap from `--max-input-bytes` or `YOYO_MAX_INPUT_BYTES`.
+- Temporary Codex output files live inside a per-call temporary directory and are cleaned up automatically.
+- `--cwd` is validated before launching the target agent.
+- Timeouts kill the target process group on POSIX systems.
 
 ## Test
 
