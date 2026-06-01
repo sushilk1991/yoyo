@@ -5,9 +5,11 @@ description: Use this skill when an agent should call Codex, Claude, Pi, or anot
 
 # Yoyo Multi-Agent Coordination
 
-Use `yoyo` to call another CLI agent as a bounded subprocess. Treat the other agent as a worker or reviewer, not as an oracle. Its output is evidence to verify.
+Use `yoyo` to call another CLI agent as a subprocess or interactive session. Treat the other agent as a worker or reviewer, not as an oracle. Its output is evidence to verify.
 
 ## Quick Commands
+
+`yoyo ask` is one-shot by default. It also defaults to full-access/no-approval mode where the target agent supports that, so agent-to-agent work does not stop for permission prompts. Use `--read-only` for constrained review.
 
 `--role` defaults to `opinion`. Set `--role review` or `--role worker` explicitly when you want bug finding or delegated implementation.
 
@@ -26,7 +28,13 @@ yoyo ask codex --role review --file src/main.ts --caller claude "Review this cha
 Scoped worker with write access:
 
 ```bash
-yoyo ask pi --role worker --write --cwd "$PWD" --caller codex "Fix the failing test in tests/foo_test.py. Do not touch unrelated files."
+yoyo ask pi --role worker --cwd "$PWD" --caller codex "Fix the failing test in tests/foo_test.py. Do not touch unrelated files."
+```
+
+Interactive session:
+
+```bash
+yoyo chat claude --cwd "$PWD" "Help me debug this repo."
 ```
 
 Inspect setup:
@@ -44,7 +52,7 @@ yoyo agents
    - `review`: find concrete bugs and missing tests.
    - `worker`: do a bounded implementation task.
 3. Pass only the context needed. Prefer `--file` for exact artifacts and a short prompt for the ask.
-4. Keep default read-only mode unless the target agent must edit files. Use `--write` only for scoped worker tasks.
+4. Use default full access for trusted automation or worker tasks. Use `--read-only` for reviews, second opinions, or untrusted prompts.
 5. Verify the result yourself. Run tests, inspect diffs, and reconcile disagreements before acting.
 
 ## Good Delegation Prompts
@@ -58,7 +66,7 @@ yoyo ask claude --role opinion --file plan.md "Find the strongest reason this pl
 Ask for focused implementation:
 
 ```bash
-yoyo ask codex --role worker --write --file tests/test_cli.py "Make this test pass with the smallest production change."
+yoyo ask codex --role worker --file tests/test_cli.py "Make this test pass with the smallest production change."
 ```
 
 Ask for review after edits:
@@ -72,6 +80,7 @@ git diff -- src tests | yoyo ask pi --role review "Review this diff for correctn
 - Do not delegate deterministic work that a script or test can answer.
 - Do not ask multiple agents broad open-ended questions and average the answers.
 - Do not let a worker perform irreversible operations, releases, credential changes, or destructive git commands unless the human explicitly asked for that and you can verify every step.
+- Use `yoyo chat` only when a human or supervising agent is available to interact. Use `yoyo ask` for autonomous one-shot delegation.
 - If agents disagree, identify the factual claim that would settle it, then inspect code, docs, tests, or live state.
 - If the target agent fails, times out, or lacks credentials, report that directly and continue with the best local verification path.
 

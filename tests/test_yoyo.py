@@ -68,9 +68,80 @@ class YoyoTests(unittest.TestCase):
             )
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn("codex exec", stdout)
+        self.assertIn("codex --ask-for-approval never exec", stdout)
         self.assertIn("<file path=\"note.txt\">", stdout)
         self.assertIn("important context", stdout)
+
+    def test_ask_defaults_to_full_access_for_codex(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "codex", "--dry-run", "--cwd", str(ROOT), "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("codex --ask-for-approval never exec", stdout)
+        self.assertIn("--sandbox danger-full-access", stdout)
+        self.assertIn("--ask-for-approval never", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_defaults_to_full_access_for_claude(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "claude", "--dry-run", "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--permission-mode bypassPermissions", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_defaults_to_full_access_for_pi(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "pi", "--dry-run", "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--tools read,grep,find,ls,bash,edit,write", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_read_only_constrains_codex(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "codex", "--dry-run", "--read-only", "--cwd", str(ROOT), "Review it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--sandbox read-only", stdout)
+        self.assertNotIn("--ask-for-approval never", stdout)
+        self.assertIn("mode=read-only delegation", stdout)
+
+    def test_chat_builds_interactive_command(self):
+        code, stdout, stderr = self.run_cli(
+            ["chat", "claude", "--dry-run", "--model", "haiku", "Debug this."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("claude", stdout)
+        self.assertIn("--permission-mode bypassPermissions", stdout)
+        self.assertIn("--model haiku", stdout)
+        self.assertIn("'Debug this.'", stdout)
+
+    def test_chat_launches_interactive_subprocess_without_capture(self):
+        env = {"YOYO_AGENT_FAKE": "/usr/bin/env"}
+        with mock.patch.object(yoyo.subprocess, "call", return_value=7) as call:
+            code, stdout, stderr = self.run_cli(["chat", "fake", "hello"], env=env)
+
+        self.assertEqual(code, 7)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "")
+        call.assert_called_once()
+        self.assertEqual(call.call_args.args[0], ["/usr/bin/env", "hello"])
+        self.assertIn("cwd", call.call_args.kwargs)
+
+    def test_chat_joins_custom_agent_prompt_as_one_argument(self):
+        env = {"YOYO_AGENT_FAKE": "/usr/bin/env"}
+        with mock.patch.object(yoyo.subprocess, "call", return_value=0) as call:
+            code, stdout, stderr = self.run_cli(["chat", "fake", "hello", "world"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(call.call_args.args[0], ["/usr/bin/env", "hello world"])
 
     def test_missing_context_file_fails_loudly(self):
         code, stdout, stderr = self.run_cli(

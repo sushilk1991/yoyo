@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 ROLE_PROMPTS = {
@@ -38,7 +38,7 @@ Return findings first, ordered by severity. If you find no issues, say that dire
 """,
     "worker": """You are being called as a delegated worker by another agent.
 
-Stay inside the requested scope. Make the minimum change needed. If write access was not explicitly granted, do not edit files. If you do edit files, report exactly what changed and how you verified it.
+Stay inside the requested scope. Make the minimum change needed. You may edit files and run commands unless the prompt or yoyo mode says this is read-only. Report exactly what changed and how you verified it.
 
 Return concise sections:
 - Result
@@ -132,7 +132,7 @@ def build_prompt(args: argparse.Namespace) -> str:
     if args.role:
         prompt_parts.append(ROLE_PROMPTS[args.role].strip())
 
-    scope = "write access granted" if args.write else "read-only delegation"
+    scope = "read-only delegation" if args.read_only else "full-access delegation"
     prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}.")
 
     if args.prompt:
@@ -156,39 +156,71 @@ def command_for_agent(
     spec: AgentSpec,
     args: argparse.Namespace,
     codex_output_file: str | None = None,
+    *,
+    interactive: bool = False,
 ) -> list[str]:
     cmd = list(spec.command)
     cwd = str(Path(args.cwd).expanduser().resolve())
 
     if spec.name == "codex":
-        cmd.extend(["--skip-git-repo-check", "--ephemeral", "--color", "never", "-C", cwd])
-        cmd.extend(["--sandbox", "workspace-write" if args.write else "read-only"])
+        if interactive:
+            cmd = ["codex", "-C", cwd]
+            if args.read_only:
+                cmd.extend(["--sandbox", "read-only"])
+            else:
+                cmd.extend(["--sandbox", "danger-full-access", "--ask-for-approval", "never"])
+        else:
+            cmd = ["codex"]
+            if not args.read_only:
+                cmd.extend(["--ask-for-approval", "never"])
+            cmd.append("exec")
+            cmd.extend(["--skip-git-repo-check", "--ephemeral", "--color", "never", "-C", cwd])
+            if args.read_only:
+                cmd.extend(["--sandbox", "read-only"])
+            else:
+                cmd.extend(["--sandbox", "danger-full-access"])
         if codex_output_file:
             cmd.extend(["--output-last-message", codex_output_file])
         if args.model:
             cmd.extend(["--model", args.model])
         for extra in args.agent_arg or []:
             cmd.append(extra)
-        cmd.append("-")
-    elif spec.name == "claude":
-        if args.model:
-            cmd.extend(["--model", args.model])
-        if not args.write:
-            cmd.extend(["--tools", "Read,Grep,Glob,LS"])
-        for extra in args.agent_arg or []:
-            cmd.append(extra)
-    elif spec.name == "pi":
-        if args.model:
-            cmd.extend(["--model", args.model])
-        if args.write:
-            cmd.extend(["--tools", "read,grep,find,ls,bash,edit,write"])
+        if interactive:
+            if args.prompt:
+                cmd.append(" ".join(args.prompt).strip())
         else:
-            cmd.extend(["--tools", "read,grep,find,ls"])
+            cmd.append("-")
+    elif spec.name == "claude":
+        if interactive:
+            cmd = ["claude"]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        if args.read_only:
+            cmd.extend(["--tools", "Read,Grep,Glob,LS"])
+        else:
+            cmd.extend(["--permission-mode", "bypassPermissions"])
         for extra in args.agent_arg or []:
             cmd.append(extra)
+        if interactive and args.prompt:
+            cmd.append(" ".join(args.prompt).strip())
+    elif spec.name == "pi":
+        if interactive:
+            cmd = ["pi"]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        if args.read_only:
+            cmd.extend(["--tools", "read,grep,find,ls"])
+        else:
+            cmd.extend(["--tools", "read,grep,find,ls,bash,edit,write"])
+        for extra in args.agent_arg or []:
+            cmd.append(extra)
+        if interactive and args.prompt:
+            cmd.append(" ".join(args.prompt).strip())
     else:
         for extra in args.agent_arg or []:
             cmd.append(extra)
+        if interactive and args.prompt:
+            cmd.append(" ".join(args.prompt).strip())
     return cmd
 
 
@@ -262,6 +294,23 @@ def run_agent(args: argparse.Namespace) -> int:
     }
     emit_result(result, args.json)
     return proc.returncode
+
+
+def chat_agent(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    if args.agent not in agents:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+
+    cmd = command_for_agent(agents[args.agent], args, interactive=True)
+    if args.dry_run:
+        print(shlex.join(cmd))
+        return 0
+
+    try:
+        return subprocess.call(cmd, cwd=str(Path(args.cwd).expanduser().resolve()))
+    except FileNotFoundError as exc:
+        raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
 
 
 def emit_result(result: dict[str, Any], as_json: bool) -> None:
@@ -354,11 +403,22 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
     ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", "600")))
     ask.add_argument("--model", help="Pass a model name to agents that support --model")
-    ask.add_argument("--write", action="store_true", help="Grant write-capable mode where the target agent supports it")
+    ask.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
+    ask.add_argument("--write", action="store_false", dest="read_only", help=argparse.SUPPRESS)
     ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
     ask.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     ask.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
     ask.set_defaults(func=run_agent)
+
+    chat = sub.add_parser("chat", help="Open an interactive session with another agent")
+    chat.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
+    chat.add_argument("prompt", nargs="*", help="Optional initial prompt")
+    chat.add_argument("--cwd", default=os.getcwd())
+    chat.add_argument("--model", help="Pass a model name to agents that support --model")
+    chat.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
+    chat.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    chat.add_argument("--dry-run", action="store_true", help="Print command without launching the agent")
+    chat.set_defaults(func=chat_agent)
 
     agents = sub.add_parser("agents", help="List configured agents")
     agents.add_argument("--json", action="store_true")
