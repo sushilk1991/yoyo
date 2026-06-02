@@ -110,6 +110,12 @@ yoyo chat codex --cwd "$PWD" "Help me debug this repo."
 yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
 ```
 
+## Workflows
+
+`yoyo workflow` runs a saved multi-agent workflow from a JSON spec. Use it when one agent call is not enough: fan out research across files, ask different agents/models for independent audits, run an implementation phase followed by a review phase, or cross-check several findings before acting.
+
+Workflows are deliberately local and auditable. Yoyo does not add a daemon or hidden planner. It reads the spec, expands jobs, runs each phase in order, runs jobs inside a phase in parallel up to `max_concurrency`, and returns a JSON result with commands, trace IDs, exit codes, duration, stdout/stderr, and truncation flags.
+
 Run a reusable multi-agent workflow:
 
 ```bash
@@ -121,6 +127,8 @@ Dry-run a workflow before spending model calls:
 ```bash
 yoyo workflow ./workflow.json --input "audit auth routes" --dry-run --json
 ```
+
+Workflow jobs default to read-only mode. Set `read_only: false` only for tightly scoped worker jobs that should edit files.
 
 Minimal workflow spec:
 
@@ -167,6 +175,21 @@ Minimal workflow spec:
 }
 ```
 
+Common workflow fields:
+
+- `phases`: ordered groups of work. Later phases can include earlier results.
+- `jobs`: agent calls inside a phase. Jobs in the same phase may run in parallel.
+- `agent`: `codex`, `claude`, `pi`, or a configured custom agent.
+- `model`: model name passed through to agents that support `--model`.
+- `role`: `opinion`, `review`, or `worker`.
+- `files`: context files attached to the job prompt.
+- `for_each`: expands one job template into many jobs.
+- `include_previous`: includes all prior phase outputs in the job prompt.
+- `include_phases`: includes only named prior phases.
+- `max_concurrency`: caps parallel jobs.
+- `max_jobs`: caps expanded jobs before any agent call starts.
+- `context_bytes`: caps prior-output context injected into later jobs.
+
 Use `for_each` to fan out one job template:
 
 ```json
@@ -175,6 +198,22 @@ Use `for_each` to fan out one job template:
   "for_each": ["README.md", "bin/yoyo", "tests/test_yoyo.py"],
   "prompt": "Audit {item}.",
   "files": ["{item}"]
+}
+```
+
+Use `include_previous` for a review or synthesis phase:
+
+```json
+{
+  "name": "review",
+  "jobs": [
+    {
+      "id": "cross-check",
+      "role": "review",
+      "include_previous": true,
+      "prompt": "Cross-check the previous findings. Reject weak claims and list only concrete issues."
+    }
+  ]
 }
 ```
 
