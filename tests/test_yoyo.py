@@ -35,6 +35,12 @@ class YoyoTests(unittest.TestCase):
                     code = yoyo.main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_version_outputs_current_release(self):
+        code, stdout, stderr = self.run_cli(["--version"])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.strip(), "yoyo 0.4.0")
+
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
         code, stdout, stderr = self.run_cli(
