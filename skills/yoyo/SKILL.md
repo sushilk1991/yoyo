@@ -44,11 +44,33 @@ yoyo doctor
 yoyo agents
 ```
 
+Update the installed CLI and skills from the recorded source checkout:
+
+```bash
+yoyo update
+```
+
+Use `yoyo update --no-pull` to reinstall from the current recorded checkout without fetching.
+
+Run a reusable multi-agent workflow:
+
+```bash
+yoyo workflow ./workflow.json --input "audit this change" --json
+```
+
 Trace/debug a delegation:
 
 ```bash
 yoyo ask claude --trace-id "$USER-auth-review" --json "Review this plan."
 ```
+
+## Timeout Discipline
+
+Agent calls default to a one-hour timeout. The timeout exists only to prevent orphaned or truly hung subprocesses; it is not a progress budget for real agent work.
+
+Do not add short ad hoc timeouts to real reviews, audits, or worker delegations. A three-minute cap can turn a valid long-running review into a false failure. Use short `--timeout` values only for deterministic smoke tests with fake or trivial agents.
+
+Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational reason for a shorter or longer cap. If a real review times out, report it as an unavailable review, not as a passed or failed review.
 
 ## Coordination Protocol
 
@@ -60,8 +82,9 @@ yoyo ask claude --trace-id "$USER-auth-review" --json "Review this plan."
 3. Pass only the context needed. Prefer `--file` for exact artifacts and a short prompt for the ask.
 4. Use default full access for trusted automation or worker tasks. Use `--read-only` for reviews, second opinions, or untrusted prompts.
 5. Verify the result yourself. Run tests, inspect diffs, and reconcile disagreements before acting.
-6. For long or noisy tasks, set `--trace-id` and consider `--max-output-bytes` so failures are auditable and output cannot grow without bound.
+6. For long or noisy tasks, set `--trace-id` and consider `--max-output-bytes` so failures are auditable and output cannot grow without bound. Do not set short timeouts for real agent review.
 7. For large diffs or generated files, use `--max-input-bytes`; yoyo applies it as an aggregate cap across stdin and `--file` context.
+8. For many related agent calls, prefer `yoyo workflow` with a checked spec over ad hoc manual fan-out. Dry-run the workflow before spending tokens.
 
 ## Good Delegation Prompts
 
@@ -90,6 +113,7 @@ git diff -- src tests | yoyo ask pi --role review "Review this diff for correctn
 - Do not let a worker perform irreversible operations, releases, credential changes, or destructive git commands unless the human explicitly asked for that and you can verify every step.
 - Use `yoyo chat` only when a human or supervising agent is available to interact. Use `yoyo ask` for autonomous one-shot delegation.
 - Use `--read-only` for built-in agents when reviewing untrusted diffs/files. For custom agents, configure `read_only_args`; yoyo fails loudly if read-only cannot be enforced.
+- Workflow jobs default to read-only. Do not feed one agent's output into a write-capable workflow job or a job with raw `agent_args` unless the workflow explicitly sets `allow_untrusted_context: true` and the risk is justified.
 - Treat the full-access warning on stdin/`--file` as meaningful; switch to `--read-only` unless the input and task are trusted.
 - If agents disagree, identify the factual claim that would settle it, then inspect code, docs, tests, or live state.
 - If the target agent fails, times out, or lacks credentials, report that directly and continue with the best local verification path.

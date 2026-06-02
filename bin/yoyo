@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import shutil
@@ -20,8 +21,12 @@ from typing import Any
 
 
 VERSION = "0.3.0"
+DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
+DEFAULT_WORKFLOW_MAX_CONCURRENCY = 4
+DEFAULT_WORKFLOW_MAX_JOBS = 1000
+DEFAULT_WORKFLOW_CONTEXT_BYTES = 200_000
 
 
 ROLE_PROMPTS = {
@@ -80,6 +85,41 @@ def eprint(*parts: object, **kwargs: Any) -> None:
 
 def config_path() -> Path:
     return Path(os.environ.get("YOYO_CONFIG", "~/.config/yoyo/agents.json")).expanduser()
+
+
+def positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise YoyoError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise YoyoError(f"{name} must be at least 1")
+    return value
+
+
+def source_record_path() -> Path:
+    return Path(os.environ.get("YOYO_SOURCE_RECORD", "~/.config/yoyo/source")).expanduser()
+
+
+def read_recorded_source() -> Path:
+    override = os.environ.get("YOYO_SOURCE_ROOT")
+    if override:
+        source = Path(override).expanduser().resolve()
+    else:
+        path = source_record_path()
+        if not path.exists():
+            raise YoyoError(
+                f"No recorded yoyo source checkout at {path}. Run ./install.sh from a cloned checkout or set YOYO_SOURCE_ROOT."
+            )
+        source = Path(path.read_text(encoding="utf-8").strip()).expanduser().resolve()
+    if not source.exists():
+        raise YoyoError(f"Recorded yoyo source checkout does not exist: {source}")
+    if not (source / "install.sh").is_file():
+        raise YoyoError(f"Recorded yoyo source checkout has no install.sh: {source}")
+    return source
 
 
 def resolve_cwd(raw: str) -> Path:
@@ -246,7 +286,7 @@ def read_file_context(paths: list[str], base: Path, limit: int) -> str:
 
 def build_prompt(args: argparse.Namespace) -> str:
     cwd = resolve_cwd(args.cwd)
-    stdin_is_piped = not sys.stdin.isatty()
+    stdin_is_piped = bool(getattr(args, "use_stdin_context", True)) and not sys.stdin.isatty()
     stdin_context_used = False
     prompt_parts: list[str] = []
     if args.role:
@@ -369,19 +409,34 @@ def run_agent(args: argparse.Namespace) -> int:
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
 
-    cwd = resolve_cwd(args.cwd)
     prompt = build_prompt(args)
+    result = execute_agent_call(args.agent, args, prompt, agents)
+    if args.dry_run:
+        emit_dry_run_result(result, args.json)
+        return 0
+    emit_result(result, args.json)
+    return int(result["exit_code"])
+
+
+def execute_agent_call(
+    agent_name: str,
+    args: argparse.Namespace,
+    prompt: str,
+    agents: dict[str, AgentSpec],
+) -> dict[str, Any]:
+    if agent_name not in agents:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent {agent_name!r}. Known agents: {known}")
+    cwd = resolve_cwd(args.cwd)
     codex_output_file: str | None = None
     with tempfile.TemporaryDirectory(prefix="yoyo-") as tmp:
         tmpdir = Path(tmp)
-        if agents[args.agent].flavor == "codex" and not args.dry_run:
+        if agents[agent_name].flavor == "codex" and not args.dry_run:
             codex_output_file = str(tmpdir / "codex-last-message.txt")
 
-        cmd = command_for_agent(agents[args.agent], args, codex_output_file)
+        cmd = command_for_agent(agents[agent_name], args, codex_output_file)
         if args.dry_run:
-            payload = {"agent": args.agent, "command": cmd, "prompt": prompt, "trace_id": args.trace_id}
-            print(json.dumps(payload, indent=2) if args.json else shlex.join(cmd) + "\n\n" + prompt)
-            return 0
+            return {"agent": agent_name, "command": cmd, "prompt": prompt, "trace_id": args.trace_id, "exit_code": 0}
 
         started = time.monotonic()
         stdout_path = tmpdir / "stdout.txt"
@@ -397,8 +452,8 @@ def run_agent(args: argparse.Namespace) -> int:
             if stderr:
                 stderr += "\n"
             stderr += f"Timed out after {args.timeout}s"
-            result = {
-                "agent": args.agent,
+            return {
+                "agent": agent_name,
                 "command": cmd,
                 "exit_code": 124,
                 "duration_s": round(elapsed, 3),
@@ -409,8 +464,6 @@ def run_agent(args: argparse.Namespace) -> int:
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
             }
-            emit_result(result, args.json)
-            return 124
 
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
@@ -433,7 +486,7 @@ def run_agent(args: argparse.Namespace) -> int:
             stderr_plain = stderr
 
         result = {
-            "agent": args.agent,
+            "agent": agent_name,
             "command": cmd,
             "exit_code": proc.returncode,
             "duration_s": round(time.monotonic() - started, 3),
@@ -444,8 +497,471 @@ def run_agent(args: argparse.Namespace) -> int:
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }
-        emit_result(result, args.json)
-        return proc.returncode
+        return result
+
+
+def emit_dry_run_result(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return
+    print(shlex.join(result["command"]) + "\n\n" + result["prompt"])
+
+
+def load_workflow_spec(path: str) -> dict[str, Any]:
+    workflow_path = Path(path).expanduser()
+    if not workflow_path.exists():
+        raise YoyoError(f"Workflow spec not found: {workflow_path}")
+    if not workflow_path.is_file():
+        raise YoyoError(f"Workflow spec is not a file: {workflow_path}")
+    try:
+        data = json.loads(workflow_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise YoyoError(f"Could not read workflow spec {workflow_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise YoyoError(f"Invalid workflow JSON in {workflow_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise YoyoError("Workflow spec must be a JSON object")
+    return data
+
+
+def workflow_name(spec: dict[str, Any], spec_path: str) -> str:
+    name = spec.get("name")
+    if name is None:
+        return Path(spec_path).stem
+    if not isinstance(name, str) or not name.strip():
+        raise YoyoError("Workflow field 'name' must be a non-empty string")
+    return name.strip()
+
+
+def workflow_phases(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    phases = spec.get("phases")
+    if not isinstance(phases, list) or not phases:
+        raise YoyoError("Workflow field 'phases' must be a non-empty array")
+    normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for index, raw_phase in enumerate(phases):
+        if not isinstance(raw_phase, dict):
+            raise YoyoError(f"Workflow phase {index} must be an object")
+        name = raw_phase.get("name", f"phase-{index + 1}")
+        if not isinstance(name, str) or not name.strip():
+            raise YoyoError(f"Workflow phase {index} has an invalid name")
+        if name in seen_names:
+            raise YoyoError(f"Workflow phase name {name!r} is duplicated")
+        seen_names.add(name)
+        jobs = raw_phase.get("jobs")
+        if not isinstance(jobs, list) or not jobs:
+            raise YoyoError(f"Workflow phase {name!r} must have a non-empty jobs array")
+        normalized.append(raw_phase)
+    return normalized
+
+
+def template_string(text: str, values: dict[str, Any]) -> str:
+    rendered = text
+    for key, value in values.items():
+        if key == "item" and isinstance(value, dict):
+            for item_key, item_value in value.items():
+                rendered = rendered.replace("{" + f"item.{item_key}" + "}", str(item_value))
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+def template_value(value: Any, values: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return template_string(value, values)
+    if isinstance(value, list):
+        return [template_value(item, values) for item in value]
+    if isinstance(value, dict):
+        return {str(key): template_value(item, values) for key, item in value.items()}
+    return value
+
+
+def expand_workflow_jobs(phase: dict[str, Any], workflow_input: str) -> list[dict[str, Any]]:
+    expanded: list[dict[str, Any]] = []
+    for job_index, raw_job in enumerate(phase["jobs"]):
+        if not isinstance(raw_job, dict):
+            raise YoyoError(f"Job {job_index} in phase {phase.get('name')!r} must be an object")
+        items = raw_job.get("for_each")
+        if items is None:
+            values = {"input": workflow_input, "index": job_index, "item": ""}
+            expanded.append(template_value(raw_job, values))
+            continue
+        if not isinstance(items, list) or not items:
+            raise YoyoError(f"Job {raw_job.get('id', job_index)!r} has invalid for_each; expected a non-empty array")
+        for item_index, item in enumerate(items):
+            job = {key: value for key, value in raw_job.items() if key != "for_each"}
+            values = {"input": workflow_input, "index": item_index, "item": item}
+            expanded.append(template_value(job, values))
+    return expanded
+
+
+def coerce_bool(value: Any, *, default: bool, field: str) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise YoyoError(f"Workflow field {field!r} must be a boolean")
+
+
+def coerce_int(value: Any, *, default: int, field: str, minimum: int = 1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise YoyoError(f"Workflow field {field!r} must be an integer")
+    if value < minimum:
+        raise YoyoError(f"Workflow field {field!r} must be at least {minimum}")
+    return value
+
+
+def coerce_float(value: Any, *, default: float, field: str) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise YoyoError(f"Workflow field {field!r} must be a number")
+    if value <= 0:
+        raise YoyoError(f"Workflow field {field!r} must be greater than 0")
+    return float(value)
+
+
+def coerce_str_list(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise YoyoError(f"Workflow field {field!r} must be a string or array of strings")
+
+
+def workflow_defaults(spec: dict[str, Any]) -> dict[str, Any]:
+    defaults = spec.get("defaults", {})
+    if defaults is None:
+        return {}
+    if not isinstance(defaults, dict):
+        raise YoyoError("Workflow field 'defaults' must be an object")
+    return defaults
+
+
+def inherited_workflow_value(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any], field: str) -> Any:
+    defaults = workflow_defaults(spec)
+    return job.get(field, phase.get(field, defaults.get(field)))
+
+
+def workflow_include_previous(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> bool:
+    return coerce_bool(inherited_workflow_value(spec, phase, job, "include_previous"), default=False, field="include_previous")
+
+
+def workflow_include_phases(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> list[str]:
+    return coerce_str_list(inherited_workflow_value(spec, phase, job, "include_phases"), field="include_phases")
+
+
+def workflow_context(
+    spec: dict[str, Any],
+    phase: dict[str, Any],
+    results_by_phase: dict[str, list[dict[str, Any]]],
+    job: dict[str, Any],
+    limit: int,
+) -> str:
+    include_previous = workflow_include_previous(spec, phase, job)
+    include_phases = workflow_include_phases(spec, phase, job)
+    missing = [phase_name for phase_name in include_phases if phase_name not in results_by_phase]
+    if missing:
+        raise YoyoError(f"Workflow job {job.get('id')!r} requested unknown or future include_phases: {', '.join(missing)}")
+    selected: list[tuple[str, dict[str, Any]]] = []
+    for phase_name, results in results_by_phase.items():
+        if include_previous or phase_name in include_phases:
+            for result in results:
+                selected.append((phase_name, result))
+    if not selected:
+        return ""
+
+    blocks: list[str] = ["Previous workflow outputs:"]
+    remaining = limit
+    for phase_name, result in selected:
+        body = result.get("stdout", "")
+        if not body and result.get("stderr"):
+            body = result["stderr"]
+        text = str(body)
+        encoded = text.encode("utf-8", errors="replace")
+        truncated = False
+        if len(encoded) > remaining:
+            text = encoded[:remaining].decode("utf-8", errors="replace")
+            text += f"\n...[workflow context budget exhausted after {limit} bytes]\n"
+            truncated = True
+        remaining -= min(len(encoded), remaining)
+        blocks.append(
+            f"<workflow-result phase=\"{phase_name}\" job=\"{result.get('job_id')}\" "
+            f"agent=\"{result.get('agent')}\" exit_code=\"{result.get('exit_code')}\">\n"
+            f"{text.rstrip()}\n</workflow-result>"
+        )
+        if truncated or remaining <= 0:
+            break
+    return "\n\n".join(blocks)
+
+
+def build_workflow_agent_args(
+    cli_args: argparse.Namespace,
+    spec: dict[str, Any],
+    phase: dict[str, Any],
+    job: dict[str, Any],
+    agent: str,
+    trace_id: str,
+) -> argparse.Namespace:
+    defaults = workflow_defaults(spec)
+    cwd = str(resolve_cwd(str(job.get("cwd") or phase.get("cwd") or defaults.get("cwd") or cli_args.cwd)))
+    role = str(job.get("role") or phase.get("role") or defaults.get("role") or "opinion")
+    if role not in ROLE_PROMPTS:
+        raise YoyoError(f"Workflow job {job.get('id')!r} has invalid role {role!r}")
+    read_only = coerce_bool(
+        job.get("read_only", phase.get("read_only", defaults.get("read_only"))),
+        default=True,
+        field="read_only",
+    )
+    timeout = coerce_float(
+        job.get("timeout", phase.get("timeout", defaults.get("timeout", cli_args.timeout))),
+        default=cli_args.timeout,
+        field="timeout",
+    )
+    max_input_bytes = coerce_int(
+        job.get("max_input_bytes", phase.get("max_input_bytes", defaults.get("max_input_bytes", cli_args.max_input_bytes))),
+        default=cli_args.max_input_bytes,
+        field="max_input_bytes",
+    )
+    max_output_bytes = coerce_int(
+        job.get("max_output_bytes", phase.get("max_output_bytes", defaults.get("max_output_bytes", cli_args.max_output_bytes))),
+        default=cli_args.max_output_bytes,
+        field="max_output_bytes",
+    )
+    model = job.get("model", phase.get("model", defaults.get("model")))
+    if model is not None and not isinstance(model, str):
+        raise YoyoError(f"Workflow job {job.get('id')!r} field 'model' must be a string")
+    agent_args = coerce_str_list(job.get("agent_args", phase.get("agent_args", defaults.get("agent_args"))), field="agent_args")
+    return argparse.Namespace(
+        cwd=cwd,
+        agent=agent,
+        role=role,
+        read_only=read_only,
+        caller=cli_args.caller,
+        trace_id=trace_id,
+        timeout=timeout,
+        max_input_bytes=max_input_bytes,
+        max_output_bytes=max_output_bytes,
+        model=model,
+        agent_arg=agent_args,
+        dry_run=cli_args.dry_run,
+        json=cli_args.json,
+        prompt=[],
+        file=[],
+    )
+
+
+def build_workflow_prompt(
+    spec: dict[str, Any],
+    phase: dict[str, Any],
+    agent_args: argparse.Namespace,
+    job: dict[str, Any],
+    results_by_phase: dict[str, list[dict[str, Any]]],
+    workflow_input: str,
+    context_limit: int,
+) -> str:
+    prompt = job.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise YoyoError(f"Workflow job {job.get('id')!r} must have a non-empty prompt")
+    parts = [prompt.strip()]
+    if workflow_input:
+        parts.append("Workflow input:\n" + workflow_input.strip())
+    previous_context = workflow_context(spec, phase, results_by_phase, job, context_limit)
+    if previous_context:
+        parts.append(previous_context)
+
+    synthetic = argparse.Namespace(
+        cwd=agent_args.cwd,
+        role=agent_args.role,
+        read_only=agent_args.read_only,
+        caller=agent_args.caller,
+        trace_id=agent_args.trace_id,
+        prompt=["\n\n".join(parts)],
+        file=coerce_str_list(job.get("files", job.get("file")), field="files"),
+        max_input_bytes=agent_args.max_input_bytes,
+        use_stdin_context=False,
+    )
+    return build_prompt(synthetic)
+
+
+def workflow_allows_untrusted_context(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> bool:
+    defaults = workflow_defaults(spec)
+    value = job.get(
+        "allow_untrusted_context",
+        phase.get("allow_untrusted_context", defaults.get("allow_untrusted_context")),
+    )
+    return coerce_bool(value, default=False, field="allow_untrusted_context")
+
+
+def run_workflow_job(
+    cli_args: argparse.Namespace,
+    spec: dict[str, Any],
+    phase: dict[str, Any],
+    job: dict[str, Any],
+    results_by_phase: dict[str, list[dict[str, Any]]],
+    agents: dict[str, AgentSpec],
+    workflow_input: str,
+    trace_id: str,
+    context_limit: int,
+) -> dict[str, Any]:
+    defaults = workflow_defaults(spec)
+    agent = job.get("agent", phase.get("agent", defaults.get("agent", "claude")))
+    if not isinstance(agent, str) or not agent:
+        raise YoyoError(f"Workflow job {job.get('id')!r} has invalid agent")
+    agent_args = build_workflow_agent_args(cli_args, spec, phase, job, agent, trace_id)
+    uses_previous = bool(workflow_include_previous(spec, phase, job) or workflow_include_phases(spec, phase, job))
+    has_raw_agent_args = bool(agent_args.agent_arg)
+    if uses_previous and (not agent_args.read_only or has_raw_agent_args) and not workflow_allows_untrusted_context(spec, phase, job):
+        raise YoyoError(
+            f"Workflow job {job.get('id')!r} feeds previous agent output into a write-capable or raw-arg agent. "
+            "Set allow_untrusted_context=true to acknowledge that risk."
+        )
+
+    prompt = build_workflow_prompt(spec, phase, agent_args, job, results_by_phase, workflow_input, context_limit)
+    result = execute_agent_call(agent, agent_args, prompt, agents)
+    result.update(
+        {
+            "job_id": str(job.get("id") or uuid.uuid4().hex[:8]),
+            "role": agent_args.role,
+            "model": agent_args.model,
+            "read_only": agent_args.read_only,
+        }
+    )
+    if cli_args.dry_run:
+        result["prompt"] = prompt
+    return result
+
+
+def validate_unique_job_ids(phase_name: str, jobs: list[dict[str, Any]]) -> None:
+    seen: set[str] = set()
+    for index, job in enumerate(jobs):
+        job_id = str(job.get("id") or f"{phase_name}-{index + 1}")
+        if job_id in seen:
+            raise YoyoError(f"Workflow phase {phase_name!r} has duplicate job id {job_id!r}")
+        seen.add(job_id)
+
+
+def run_workflow(args: argparse.Namespace) -> int:
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    spec = load_workflow_spec(args.spec)
+    name = workflow_name(spec, args.spec)
+    phases = workflow_phases(spec)
+    agents = load_agents()
+    env_context_bytes = positive_env_int("YOYO_WORKFLOW_CONTEXT_BYTES", DEFAULT_WORKFLOW_CONTEXT_BYTES)
+    max_jobs = coerce_int(
+        args.max_jobs if args.max_jobs is not None else spec.get("max_jobs"),
+        default=DEFAULT_WORKFLOW_MAX_JOBS,
+        field="max_jobs",
+    )
+    max_concurrency = coerce_int(
+        args.max_concurrency if args.max_concurrency is not None else spec.get("max_concurrency"),
+        default=DEFAULT_WORKFLOW_MAX_CONCURRENCY,
+        field="max_concurrency",
+    )
+    context_limit = coerce_int(
+        args.context_bytes if args.context_bytes is not None else spec.get("context_bytes"),
+        default=env_context_bytes,
+        field="context_bytes",
+    )
+    workflow_input = args.input or ""
+    expanded_phases = [(phase, expand_workflow_jobs(phase, workflow_input)) for phase in phases]
+    for phase_index, (phase, jobs) in enumerate(expanded_phases):
+        validate_unique_job_ids(str(phase.get("name", f"phase-{phase_index + 1}")), jobs)
+    total_jobs = sum(len(jobs) for _, jobs in expanded_phases)
+    if total_jobs > max_jobs:
+        raise YoyoError(f"Workflow expands to {total_jobs} jobs, above max_jobs={max_jobs}")
+
+    run_trace_id = args.trace_id or uuid.uuid4().hex
+    results_by_phase: dict[str, list[dict[str, Any]]] = {}
+    output: dict[str, Any] = {
+        "workflow": name,
+        "trace_id": run_trace_id,
+        "spec": str(Path(args.spec).expanduser()),
+        "max_concurrency": max_concurrency,
+        "job_count": total_jobs,
+        "phases": [],
+    }
+    exit_code = 0
+
+    for phase_index, (phase, jobs) in enumerate(expanded_phases):
+        phase_name = str(phase.get("name", f"phase-{phase_index + 1}"))
+        phase_concurrency = coerce_int(
+            phase.get("max_concurrency"),
+            default=max_concurrency,
+            field="max_concurrency",
+        )
+        phase_concurrency = min(phase_concurrency, max_concurrency, len(jobs))
+        if not args.json:
+            eprint(f"workflow {name}: phase {phase_name} ({len(jobs)} jobs, concurrency {phase_concurrency})")
+
+        phase_results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=phase_concurrency) as pool:
+            future_to_index = {}
+            for job_index, job in enumerate(jobs):
+                job_id = str(job.get("id") or f"{phase_name}-{job_index + 1}")
+                job["id"] = job_id
+                job_trace_id = f"{run_trace_id}:{phase_name}:{job_id}"
+                future = pool.submit(
+                    run_workflow_job,
+                    args,
+                    spec,
+                    phase,
+                    job,
+                    results_by_phase,
+                    agents,
+                    workflow_input,
+                    job_trace_id,
+                    context_limit,
+                )
+                future_to_index[future] = job_index
+            indexed_results: dict[int, dict[str, Any]] = {}
+            for future in as_completed(future_to_index):
+                job_index = future_to_index[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "job_id": str(jobs[job_index].get("id") or f"{phase_name}-{job_index + 1}"),
+                        "agent": str(jobs[job_index].get("agent", workflow_defaults(spec).get("agent", "claude"))),
+                        "exit_code": 2,
+                        "trace_id": f"{run_trace_id}:{phase_name}:{jobs[job_index].get('id')}",
+                        "stdout": "",
+                        "stderr": str(exc),
+                        "stderr_plain": str(exc),
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                    }
+                indexed_results[job_index] = result
+                if not args.json:
+                    status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
+                    eprint(f"workflow {name}: {phase_name}/{result.get('job_id')} {status}")
+            for job_index in range(len(jobs)):
+                phase_results.append(indexed_results[job_index])
+
+        if exit_code == 0:
+            for result in phase_results:
+                if int(result.get("exit_code", 1)) != 0:
+                    exit_code = int(result.get("exit_code", 1))
+                    break
+        results_by_phase[phase_name] = phase_results
+        output["phases"].append({"name": phase_name, "jobs": phase_results})
+        if args.fail_fast and any(int(result.get("exit_code", 1)) != 0 for result in phase_results):
+            break
+
+    output["exit_code"] = exit_code
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False))
+    else:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    return exit_code
 
 
 def chat_agent(args: argparse.Namespace) -> int:
@@ -504,6 +1020,16 @@ def doctor(args: argparse.Namespace) -> int:
         print(f"{name}: ok ({found})")
     path = config_path()
     print(f"config: {path} ({'present' if path.exists() else 'not present'})")
+    source_path = source_record_path()
+    if os.environ.get("YOYO_SOURCE_ROOT") or source_path.exists():
+        try:
+            source = read_recorded_source()
+            print(f"source: {source} (present)")
+        except YoyoError as exc:
+            failed += 1
+            print(f"source: invalid ({exc})")
+    else:
+        print(f"source: {source_path} (not recorded)")
     return 1 if failed and args.strict else 0
 
 
@@ -512,20 +1038,79 @@ def install_skill(args: argparse.Namespace) -> int:
     if source_env:
         source = Path(source_env).expanduser()
     else:
-        source = Path(__file__).resolve().parents[1] / "skills" / "yoyo"
+        source = Path(__file__).resolve().parents[1] / "skills"
     if not source.exists():
         raise YoyoError(f"Bundled skill not found: {source}")
-    targets = [
-        Path("~/.codex/skills/yoyo").expanduser(),
-        Path("~/.claude/skills/yoyo").expanduser(),
-        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills" / "yoyo",
+
+    if (source / "SKILL.md").exists():
+        skill_sources = [source]
+    else:
+        skill_sources = [child for child in source.iterdir() if child.is_dir() and (child / "SKILL.md").exists()]
+    if not skill_sources:
+        raise YoyoError(f"No bundled skills found under: {source}")
+
+    target_roots = [
+        Path("~/.codex/skills").expanduser(),
+        Path("~/.claude/skills").expanduser(),
+        Path("~/.agents/skills").expanduser(),
+        Path("~/.config/opencode/skills").expanduser(),
+        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
     ]
-    for target in targets:
-        target.mkdir(parents=True, exist_ok=True)
-        for child in source.iterdir():
-            if child.is_file():
-                (target / child.name).write_text(child.read_text(encoding="utf-8"), encoding="utf-8")
-        print(f"installed skill: {target}")
+    for skill_source in skill_sources:
+        for target_root in target_roots:
+            target = target_root / skill_source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(skill_source, target, dirs_exist_ok=True)
+            print(f"installed skill: {target}")
+    return 0
+
+
+def run_checked(cmd: list[str], cwd: Path, *, env: dict[str, str] | None = None, dry_run: bool = False) -> None:
+    if dry_run:
+        print(shlex.join(cmd))
+        return
+    try:
+        subprocess.check_call(cmd, cwd=str(cwd), env=env)
+    except FileNotFoundError as exc:
+        raise YoyoError(f"Command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise YoyoError(f"Command failed with exit code {exc.returncode}: {shlex.join(cmd)}") from exc
+
+
+def git_current_branch(source: Path) -> str:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(source),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise YoyoError(f"Could not determine git branch in {source}: {proc.stderr.strip()}")
+    branch = proc.stdout.strip()
+    if not branch or branch == "HEAD":
+        return "main"
+    return branch
+
+
+def update_yoyo(args: argparse.Namespace) -> int:
+    source = read_recorded_source()
+    if not args.no_pull:
+        if not (source / ".git").exists():
+            raise YoyoError(f"Recorded yoyo source checkout is not a git repo: {source}")
+        branch = args.branch or ("<current-branch>" if args.dry_run else git_current_branch(source))
+        run_checked(["git", "fetch", "origin", branch], source, dry_run=args.dry_run)
+        run_checked(["git", "pull", "--ff-only", "origin", branch], source, dry_run=args.dry_run)
+
+    env = os.environ.copy()
+    if args.prefix:
+        env["PREFIX"] = args.prefix
+    run_checked(["/bin/sh", str(source / "install.sh")], source, env=env, dry_run=args.dry_run)
+    if not args.dry_run:
+        print(f"updated yoyo from {source}")
     return 0
 
 
@@ -541,7 +1126,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     ask.add_argument("--cwd", default=os.getcwd())
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
-    ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", "600")))
+    ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
     ask.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     ask.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     ask.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
@@ -551,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
     ask.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     ask.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
-    ask.set_defaults(func=run_agent)
+    ask.set_defaults(func=run_agent, collect_unknown_prompt=True)
 
     chat = sub.add_parser("chat", help="Open an interactive session with another agent")
     chat.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
@@ -561,7 +1146,24 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
     chat.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
     chat.add_argument("--dry-run", action="store_true", help="Print command without launching the agent")
-    chat.set_defaults(func=chat_agent)
+    chat.set_defaults(func=chat_agent, collect_unknown_prompt=True)
+
+    workflow = sub.add_parser("workflow", help="Run a multi-agent workflow from a JSON spec")
+    workflow.add_argument("spec", help="Path to a workflow JSON spec")
+    workflow.add_argument("--input", help="Optional workflow input text passed to jobs")
+    workflow.add_argument("--cwd", default=os.getcwd())
+    workflow.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    workflow.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID"))
+    workflow.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
+    workflow.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
+    workflow.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    workflow.add_argument("--context-bytes", type=int, default=None)
+    workflow.add_argument("--max-concurrency", type=int, default=None, help="Maximum parallel jobs per phase")
+    workflow.add_argument("--max-jobs", type=int, default=None)
+    workflow.add_argument("--fail-fast", action="store_true", help="Stop after the first phase with a failed job")
+    workflow.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
+    workflow.add_argument("--dry-run", action="store_true", help="Render planned agent calls without launching them")
+    workflow.set_defaults(func=run_workflow)
 
     agents = sub.add_parser("agents", help="List configured agents")
     agents.add_argument("--json", action="store_true")
@@ -573,13 +1175,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     skill = sub.add_parser("install-skill", help="Install the bundled yoyo coordination skill")
     skill.set_defaults(func=install_skill)
+
+    update = sub.add_parser("update", help="Update installed yoyo from the recorded source checkout")
+    update.add_argument("--branch", help="Git branch to pull before reinstalling. Defaults to the current source branch.")
+    update.add_argument("--no-pull", action="store_true", help="Reinstall from the recorded source checkout without pulling")
+    update.add_argument("--prefix", help="Install prefix to pass through to install.sh")
+    update.add_argument("--dry-run", action="store_true", help="Print update commands without running them")
+    update.set_defaults(func=update_yoyo)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
     try:
+        args, extras = parser.parse_known_args(argv)
+        if extras:
+            if getattr(args, "collect_unknown_prompt", False) and all(not item.startswith("-") for item in extras):
+                args.prompt.extend(extras)
+            else:
+                raise YoyoError("unrecognized arguments: " + " ".join(extras))
         return int(args.func(args))
     except BrokenPipeError:
         return 141

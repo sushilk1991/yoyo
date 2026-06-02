@@ -4,6 +4,8 @@
 
 The design is deliberately boring: one Python script, subprocess calls, explicit prompts, no daemon, no package manager requirement.
 
+It also includes `yoyo workflow`, a local multi-agent runner for reusable fan-out and audit workflows. A workflow is a JSON spec that runs phases in order, runs jobs within a phase in parallel, passes per-job agent/model/role settings to `yoyo ask`, and can feed previous phase results into later read-only review jobs.
+
 Requires Python 3.9+.
 
 ## Install
@@ -17,9 +19,22 @@ cd yoyo
 This installs:
 
 - `~/.local/bin/yoyo`
-- the bundled `yoyo` skill for Codex, Claude, and Pi when their standard skill directories are present or creatable
+- the bundled `yoyo` and `yoyo-workflow` skills for Codex, Claude, Pi, OpenCode, and agent-compatible skill directories when their standard directories are present or creatable
+- a source checkout pointer at `~/.config/yoyo/source`, used by `yoyo update`
 
 Make sure `~/.local/bin` is on `PATH`.
+
+Update the local install from the recorded checkout:
+
+```bash
+yoyo update
+```
+
+This runs `git fetch`, `git pull --ff-only`, then `install.sh`. Reinstall from the current checkout without pulling:
+
+```bash
+yoyo update --no-pull
+```
 
 ## Usage
 
@@ -29,6 +44,8 @@ Check available agents:
 yoyo doctor
 yoyo agents
 ```
+
+`yoyo doctor` also reports whether a source checkout has been recorded for `yoyo update`.
 
 Ask for a second opinion:
 
@@ -71,6 +88,8 @@ Trace a delegated call:
 yoyo ask claude --trace-id "auth-review-001" --json "Review this plan."
 ```
 
+Agent calls default to a one-hour timeout. The timeout is a hung-process guard, not a progress budget. Do not shorten it for real reviews, audits, or worker delegations; short caps are only for deterministic smoke tests with fake or trivial agents. Override with `--timeout` or `YOYO_TIMEOUT` only when you have an explicit operational reason.
+
 Limit captured output:
 
 ```bash
@@ -89,6 +108,74 @@ Open an interactive session:
 yoyo chat claude
 yoyo chat codex --cwd "$PWD" "Help me debug this repo."
 yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
+```
+
+Run a reusable multi-agent workflow:
+
+```bash
+yoyo workflow ./workflow.json --input "audit auth routes" --json
+```
+
+Dry-run a workflow before spending model calls:
+
+```bash
+yoyo workflow ./workflow.json --input "audit auth routes" --dry-run --json
+```
+
+Minimal workflow spec:
+
+```json
+{
+  "name": "review-and-cross-check",
+  "max_concurrency": 4,
+  "defaults": {
+    "agent": "claude",
+    "role": "opinion",
+    "read_only": true,
+    "model": "haiku"
+  },
+  "phases": [
+    {
+      "name": "fanout",
+      "jobs": [
+        {
+          "id": "readme",
+          "agent": "codex",
+          "model": "gpt-5",
+          "prompt": "Audit README.md for correctness gaps.",
+          "files": ["README.md"]
+        },
+        {
+          "id": "cli",
+          "prompt": "Audit bin/yoyo for correctness and safety issues.",
+          "files": ["bin/yoyo"]
+        }
+      ]
+    },
+    {
+      "name": "cross-check",
+      "jobs": [
+        {
+          "id": "reviewer",
+          "role": "review",
+          "include_previous": true,
+          "prompt": "Cross-check the previous findings. Reject weak claims and list only concrete issues."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Use `for_each` to fan out one job template:
+
+```json
+{
+  "id": "audit-{index}",
+  "for_each": ["README.md", "bin/yoyo", "tests/test_yoyo.py"],
+  "prompt": "Audit {item}.",
+  "files": ["{item}"]
+}
 ```
 
 ## Agents
@@ -154,6 +241,12 @@ Use `--read-only` when you want a bounded reviewer:
 
 This is intentionally powerful. Agent output is not truth; verify it with code, tests, docs, or live state before acting.
 
+## Workflow Safety
+
+Workflow jobs default to `read_only: true`. Feeding previous agent output into later prompts with `include_previous` or `include_phases` is useful for cross-checking, but that output is untrusted text. Yoyo blocks previous-output injection into a write-capable job or a job with raw `agent_args` unless the workflow explicitly sets `allow_untrusted_context: true`.
+
+Reviewer jobs never gate control flow by themselves. The supervising agent or human must inspect the result and verify claims with tests, code, docs, or live state.
+
 ## Durability
 
 - Each `ask` call carries a trace ID in the prompt metadata and JSON result.
@@ -164,6 +257,11 @@ This is intentionally powerful. Agent output is not truth; verify it with code, 
 - Temporary Codex output files live inside a per-call temporary directory and are cleaned up automatically.
 - `--cwd` is validated before launching the target agent.
 - Timeouts kill the target process group on POSIX systems.
+- `yoyo workflow` records a run trace ID, per-job trace IDs, agent commands, exit codes, durations, and truncation flags in its JSON result.
+- Agent and workflow jobs default to a one-hour timeout and fail loudly on timeout.
+- Workflows enforce `max_concurrency`, `max_jobs`, per-job timeouts, per-job output caps, and a bounded previous-output context size.
+
+If a real agent review times out, treat the review as unavailable and say so. Do not count a timed-out review as completed, and do not hide the timeout by summarizing local checks as an external review.
 
 ## Test
 
