@@ -22,7 +22,7 @@ yoyo ask claude --role opinion --caller codex "Challenge this plan. What can fai
 Code review with explicit context:
 
 ```bash
-yoyo ask codex --role review --file src/main.ts --caller claude "Review this change for bugs."
+yoyo ask codex --role review --cwd "$PWD" --file src/main.ts --caller claude "Review this change for bugs. Inspect the repo as needed."
 ```
 
 Scoped worker with write access:
@@ -103,7 +103,7 @@ yoyo ask codex --role worker --file tests/test_cli.py "Make this test pass with 
 Ask for review after edits:
 
 ```bash
-git diff -- src tests | yoyo ask pi --role review "Review this diff for correctness issues."
+git diff -- src tests | yoyo ask pi --role review --cwd "$PWD" "Review this diff for correctness issues. Use the current worktree as the source of truth."
 ```
 
 ## Guardrails
@@ -113,6 +113,8 @@ git diff -- src tests | yoyo ask pi --role review "Review this diff for correctn
 - Do not let a worker perform irreversible operations, releases, credential changes, or destructive git commands unless the human explicitly asked for that and you can verify every step.
 - Use `yoyo chat` only when a human or supervising agent is available to interact. Use `yoyo ask` for autonomous one-shot delegation.
 - Use `--read-only` for built-in agents when reviewing untrusted diffs/files. For custom agents, configure `read_only_args`; yoyo fails loudly if read-only cannot be enforced.
+- For repo review, pass `--cwd "$PWD"` and ask the subagent to inspect the current worktree. Pipe `git diff` only as supplemental focus, not as the only context.
+- Yoyo is intentionally powerful. Do not remove `--agent-arg` or full-access paths just to make misuse impossible; document and verify the actual capability being requested.
 - Workflow jobs default to read-only. Do not feed one agent's output into a write-capable workflow job or a job with raw `agent_args` unless the workflow explicitly sets `allow_untrusted_context: true` and the risk is justified.
 - Treat the full-access warning on stdin/`--file` as meaningful; switch to `--read-only` unless the input and task are trusted.
 - If agents disagree, identify the factual claim that would settle it, then inspect code, docs, tests, or live state.

@@ -61,7 +61,7 @@ When full-access mode includes piped stdin or `--file` context, `yoyo` prints a 
 Review a file:
 
 ```bash
-yoyo ask codex --role review --file bin/yoyo "Find correctness bugs and missing tests."
+yoyo ask codex --role review --cwd "$PWD" --file bin/yoyo "Find correctness bugs and missing tests. Inspect the repo as needed."
 ```
 
 Delegate scoped work:
@@ -73,8 +73,10 @@ yoyo ask pi --role worker --cwd "$PWD" "Fix the failing test. Do not touch unrel
 Pipe context:
 
 ```bash
-git diff | yoyo ask claude --role review "Review this diff."
+git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff. Use the current worktree as the source of truth."
 ```
+
+For repo review, the worktree is the primary context. A diff is useful focus, but diff-only review can miss callers, tests, config, generated behavior, and adjacent invariants. Prefer `--cwd "$PWD"` plus a diff or `--file` context.
 
 JSON output:
 
@@ -99,7 +101,7 @@ yoyo ask codex --max-output-bytes 200000 "Summarize this repo."
 Limit captured input:
 
 ```bash
-git diff | yoyo ask claude --max-input-bytes 200000 "Review this diff."
+git diff | yoyo ask claude --cwd "$PWD" --max-input-bytes 200000 "Review this diff. Inspect the worktree as needed."
 ```
 
 Open an interactive session:
@@ -263,6 +265,8 @@ yoyo ask echoer "hello"
 ```
 
 Custom agents receive the rendered prompt on stdin.
+
+`--agent-arg` is intentionally raw and powerful. It exists for provider-specific flags and advanced routing. If you use it with constrained modes such as `--read-only`, verify the final command with `--dry-run`; a raw argument may change the target agent's effective behavior.
 
 ## Access Model
 
