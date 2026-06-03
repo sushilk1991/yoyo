@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import select
 import shutil
 import signal
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,13 +23,14 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
 DEFAULT_WORKFLOW_MAX_CONCURRENCY = 4
 DEFAULT_WORKFLOW_MAX_JOBS = 1000
 DEFAULT_WORKFLOW_CONTEXT_BYTES = 200_000
+DEFAULT_HEARTBEAT_SECONDS = 20.0
 
 
 ROLE_PROMPTS = {
@@ -79,8 +83,159 @@ class YoyoError(Exception):
     pass
 
 
+class AgentIdleTimeout(Exception):
+    """Raised when a child agent produces no output for the idle window."""
+
+    def __init__(self, idle_seconds: float, captured_bytes: int) -> None:
+        super().__init__(f"No output for {idle_seconds}s")
+        self.idle_seconds = idle_seconds
+        self.captured_bytes = captured_bytes
+
+
 def eprint(*parts: object, **kwargs: Any) -> None:
     print(*parts, file=sys.stderr, **kwargs)
+
+
+# --- Child process lifecycle ------------------------------------------------
+# Active child process groups, so a yoyo that is itself signalled or exits does
+# not orphan the nested agents it launched (which keep burning tokens).
+_ACTIVE_PGIDS: set[int] = set()
+_ACTIVE_PGIDS_LOCK = threading.Lock()
+
+
+def _register_child(pgid: int) -> None:
+    with _ACTIVE_PGIDS_LOCK:
+        _ACTIVE_PGIDS.add(pgid)
+
+
+def _unregister_child(pgid: int) -> None:
+    with _ACTIVE_PGIDS_LOCK:
+        _ACTIVE_PGIDS.discard(pgid)
+
+
+def _kill_active_children(sig: int) -> None:
+    if os.name != "posix":
+        return
+    with _ACTIVE_PGIDS_LOCK:
+        pgids = list(_ACTIVE_PGIDS)
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            pass
+
+
+_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _install_signal_handlers() -> None:
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED or os.name != "posix":
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def handler(signum: int, _frame: Any) -> None:
+        _kill_active_children(signal.SIGKILL)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+    atexit.register(_kill_active_children, signal.SIGKILL)
+    _SIGNAL_HANDLERS_INSTALLED = True
+
+
+def _terminate_child(proc: subprocess.Popen, pgid: int | None) -> None:
+    if pgid is not None and os.name == "posix":
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _safe_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _stdin_isatty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (ValueError, OSError):
+        return False
+
+
+def _stdin_pending(grace: float) -> bool:
+    """Whether stdin has data ready, without blocking on an idle open pipe.
+
+    Returns True for in-memory streams that expose no real fd (e.g. test
+    harnesses) and when readiness cannot be probed, so explicit input is never
+    silently dropped; returns the actual readiness for real file descriptors so
+    an open-but-idle pipe (the agent-to-agent case) never hangs the caller.
+    """
+    stream = sys.stdin
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return True
+    try:
+        ready, _, _ = select.select([fd], [], [], max(0.0, grace))
+    except (OSError, ValueError):
+        return True
+    return bool(ready)
+
+
+def _stdin_wait_seconds(args: argparse.Namespace) -> float:
+    cli = getattr(args, "stdin_wait", None)
+    if cli is not None:
+        return max(0.0, float(cli))
+    raw = os.environ.get("YOYO_STDIN_WAIT")
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError as exc:
+            raise YoyoError("YOYO_STDIN_WAIT must be a number") from exc
+    return 0.0
+
+
+def resolve_heartbeat(args: argparse.Namespace) -> float | None:
+    if getattr(args, "quiet", False):
+        return None
+    raw = os.environ.get("YOYO_HEARTBEAT_SECS")
+    if raw is None:
+        return DEFAULT_HEARTBEAT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise YoyoError("YOYO_HEARTBEAT_SECS must be a number") from exc
+    return None if value <= 0 else value
+
+
+def resolve_idle_timeout(args: argparse.Namespace) -> float | None:
+    cli = getattr(args, "idle_timeout", None)
+    if cli is not None:
+        if cli <= 0:
+            raise YoyoError("--idle-timeout must be greater than 0")
+        return float(cli)
+    raw = os.environ.get("YOYO_IDLE_TIMEOUT")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise YoyoError("YOYO_IDLE_TIMEOUT must be a number") from exc
+    return None if value <= 0 else value
 
 
 def config_path() -> Path:
@@ -173,6 +328,27 @@ def read_limited_stdin(limit: int) -> tuple[str, bool, int]:
     return text, truncated, consumed
 
 
+def _feed_stdin(proc: subprocess.Popen, prompt: str) -> None:
+    """Write the prompt to the child off the main thread.
+
+    Running this on its own thread keeps a large prompt (which can exceed the OS
+    pipe buffer before the child starts reading) from blocking yoyo's own
+    timeout/heartbeat loop.
+    """
+    try:
+        if proc.stdin is not None:
+            proc.stdin.write(prompt)
+            proc.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+
 def run_to_files(
     cmd: list[str],
     prompt: str,
@@ -180,6 +356,10 @@ def run_to_files(
     stdout_path: Path,
     stderr_path: Path,
     timeout: float,
+    *,
+    idle_timeout: float | None = None,
+    heartbeat: float | None = None,
+    label: str = "",
 ) -> subprocess.CompletedProcess[str]:
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         proc = subprocess.Popen(
@@ -191,18 +371,60 @@ def run_to_files(
             cwd=str(cwd),
             start_new_session=os.name == "posix",
         )
+        pgid: int | None = None
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except OSError:
+                pgid = None
+        if pgid is not None:
+            _register_child(pgid)
+
+        feeder = threading.Thread(target=_feed_stdin, args=(proc, prompt), daemon=True)
+        feeder.start()
+
+        start = time.monotonic()
+        last_size = 0
+        last_activity = start
+        last_heartbeat = start
         try:
-            proc.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if os.name == "posix":
+            while True:
+                now = time.monotonic()
+                if timeout is not None and now - start >= timeout:
+                    _terminate_child(proc, pgid)
+                    proc.wait()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+
+                size = _safe_size(stdout_path) + _safe_size(stderr_path)
+                if size != last_size:
+                    last_size = size
+                    last_activity = now
+                if idle_timeout is not None and now - last_activity >= idle_timeout:
+                    _terminate_child(proc, pgid)
+                    proc.wait()
+                    raise AgentIdleTimeout(round(now - last_activity, 1), size)
+                if heartbeat is not None and now - last_heartbeat >= heartbeat:
+                    last_heartbeat = now
+                    tag = f"[{label}] " if label else ""
+                    eprint(f"yoyo: {tag}still running, {int(now - start)}s elapsed, {size} bytes captured")
+
+                deadlines = [0.5]
+                if timeout is not None:
+                    deadlines.append(timeout - (now - start))
+                if idle_timeout is not None:
+                    deadlines.append(idle_timeout - (now - last_activity))
+                if heartbeat is not None:
+                    deadlines.append(heartbeat - (now - last_heartbeat))
+                wait_slice = max(0.02, min(deadlines))
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-            else:
-                proc.kill()
-            proc.communicate()
-            raise
+                    proc.wait(timeout=wait_slice)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if pgid is not None:
+                _unregister_child(pgid)
+        feeder.join(timeout=1.0)
     return subprocess.CompletedProcess(cmd, proc.returncode)
 
 
@@ -286,7 +508,11 @@ def read_file_context(paths: list[str], base: Path, limit: int) -> str:
 
 def build_prompt(args: argparse.Namespace) -> str:
     cwd = resolve_cwd(args.cwd)
-    stdin_is_piped = bool(getattr(args, "use_stdin_context", True)) and not sys.stdin.isatty()
+    want_stdin = (
+        bool(getattr(args, "use_stdin_context", True))
+        and not getattr(args, "no_stdin", False)
+        and not _stdin_isatty()
+    )
     stdin_context_used = False
     prompt_parts: list[str] = []
     if args.role:
@@ -299,12 +525,12 @@ def build_prompt(args: argparse.Namespace) -> str:
         prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
 
     remaining_input = args.max_input_bytes
-    if stdin_is_piped:
-            stdin_text, _, consumed = read_limited_stdin(remaining_input)
-            remaining_input -= consumed
-            if stdin_text.strip():
-                stdin_context_used = True
-                prompt_parts.append("<stdin>\n" + stdin_text.rstrip() + "\n</stdin>")
+    if want_stdin and _stdin_pending(_stdin_wait_seconds(args)):
+        stdin_text, _, consumed = read_limited_stdin(remaining_input)
+        remaining_input -= consumed
+        if stdin_text.strip():
+            stdin_context_used = True
+            prompt_parts.append("<stdin>\n" + stdin_text.rstrip() + "\n</stdin>")
 
     if args.file:
         prompt_parts.append("Context files:\n" + read_file_context(args.file, cwd, remaining_input))
@@ -328,6 +554,9 @@ def command_for_agent(
     cmd = list(spec.command)
     cwd = str(resolve_cwd(args.cwd))
 
+    # Each branch only builds the flavor-specific flags. The shared tail
+    # (--model, raw --agent-arg passthrough, and the trailing prompt/stdin
+    # sentinel) is applied once below so a new agent cannot silently drop it.
     if spec.flavor == "codex":
         codex_bin = spec.command[0]
         if interactive:
@@ -348,41 +577,20 @@ def command_for_agent(
                 cmd.extend(["--sandbox", "danger-full-access"])
         if codex_output_file:
             cmd.extend(["--output-last-message", codex_output_file])
-        if args.model:
-            cmd.extend(["--model", args.model])
-        for extra in args.agent_arg or []:
-            cmd.append(extra)
-        if interactive:
-            if args.prompt:
-                cmd.append(" ".join(args.prompt).strip())
-        else:
-            cmd.append("-")
     elif spec.flavor == "claude":
         if interactive:
             cmd = [spec.command[0]]
-        if args.model:
-            cmd.extend(["--model", args.model])
         if args.read_only:
             cmd.extend(["--tools", "Read,Grep,Glob,LS"])
         else:
             cmd.extend(["--permission-mode", "bypassPermissions"])
-        for extra in args.agent_arg or []:
-            cmd.append(extra)
-        if interactive and args.prompt:
-            cmd.append(" ".join(args.prompt).strip())
     elif spec.flavor == "pi":
         if interactive:
             cmd = [spec.command[0]]
-        if args.model:
-            cmd.extend(["--model", args.model])
         if args.read_only:
             cmd.extend(["--tools", "read,grep,find,ls"])
         else:
             cmd.extend(["--tools", "read,grep,find,ls,bash,edit,write"])
-        for extra in args.agent_arg or []:
-            cmd.append(extra)
-        if interactive and args.prompt:
-            cmd.append(" ".join(args.prompt).strip())
     else:
         if args.read_only and not spec.read_only_args:
             raise YoyoError(f"Agent {spec.name!r} has no configured read_only_args, so --read-only cannot be enforced")
@@ -390,10 +598,15 @@ def command_for_agent(
             cmd.extend(spec.read_only_args or [])
         else:
             cmd.extend(spec.full_access_args or [])
-        for extra in args.agent_arg or []:
-            cmd.append(extra)
-        if interactive and args.prompt:
+
+    if spec.flavor in ("codex", "claude", "pi") and args.model:
+        cmd.extend(["--model", args.model])
+    cmd.extend(args.agent_arg or [])
+    if interactive:
+        if args.prompt:
             cmd.append(" ".join(args.prompt).strip())
+    elif spec.flavor == "codex":
+        cmd.append("-")
     return cmd
 
 
@@ -416,6 +629,35 @@ def run_agent(args: argparse.Namespace) -> int:
         return 0
     emit_result(result, args.json)
     return int(result["exit_code"])
+
+
+def _timeout_result(
+    agent_name: str,
+    cmd: list[str],
+    args: argparse.Namespace,
+    started: float,
+    stdout_path: Path,
+    stderr_path: Path,
+    suffix: str,
+) -> dict[str, Any]:
+    elapsed = time.monotonic() - started
+    stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+    stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+    if stderr:
+        stderr += "\n"
+    stderr += suffix
+    return {
+        "agent": agent_name,
+        "command": cmd,
+        "exit_code": 124,
+        "duration_s": round(elapsed, 3),
+        "trace_id": args.trace_id,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stderr_plain": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
 
 
 def execute_agent_call(
@@ -441,29 +683,34 @@ def execute_agent_call(
         started = time.monotonic()
         stdout_path = tmpdir / "stdout.txt"
         stderr_path = tmpdir / "stderr.txt"
+        heartbeat = resolve_heartbeat(args)
+        idle_timeout = resolve_idle_timeout(args)
+        label = f"{agent_name} {args.trace_id}".strip()
         try:
-            proc = run_to_files(cmd, prompt, cwd, stdout_path, stderr_path, args.timeout)
+            proc = run_to_files(
+                cmd,
+                prompt,
+                cwd,
+                stdout_path,
+                stderr_path,
+                args.timeout,
+                idle_timeout=idle_timeout,
+                heartbeat=heartbeat,
+                label=label,
+            )
         except FileNotFoundError as exc:
             raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
         except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - started
-            stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
-            stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
-            if stderr:
-                stderr += "\n"
-            stderr += f"Timed out after {args.timeout}s"
-            return {
-                "agent": agent_name,
-                "command": cmd,
-                "exit_code": 124,
-                "duration_s": round(elapsed, 3),
-                "trace_id": args.trace_id,
-                "stdout": stdout,
-                "stderr": stderr,
-                "stderr_plain": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-            }
+            return _timeout_result(
+                agent_name, cmd, args, started, stdout_path, stderr_path,
+                f"Timed out after {args.timeout}s",
+            )
+        except AgentIdleTimeout as exc:
+            return _timeout_result(
+                agent_name, cmd, args, started, stdout_path, stderr_path,
+                f"Idle timeout after {exc.idle_seconds}s with no output "
+                f"({exc.captured_bytes} bytes captured before the stall)",
+            )
 
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
@@ -1130,6 +1377,10 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     ask.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     ask.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    ask.add_argument("--idle-timeout", type=float, default=None, help="Kill the agent if it emits no output for this many seconds (hang guard)")
+    ask.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
+    ask.add_argument("--stdin-wait", type=float, default=None, help="Seconds to wait for piped stdin before giving up (default 0: read only if already available)")
+    ask.add_argument("--no-stdin", action="store_true", help="Never read stdin as context, even when piped")
     ask.add_argument("--model", help="Pass a model name to agents that support --model")
     ask.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
     ask.add_argument("--write", action="store_false", dest="read_only", help=argparse.SUPPRESS)
@@ -1186,6 +1437,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _install_signal_handlers()
     parser = build_parser()
     try:
         try:

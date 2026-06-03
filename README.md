@@ -92,6 +92,8 @@ yoyo ask claude --trace-id "auth-review-001" --json "Review this plan."
 
 Agent calls default to a one-hour timeout. The timeout is a hung-process guard, not a progress budget. Do not shorten it for real reviews, audits, or worker delegations; short caps are only for deterministic smoke tests with fake or trivial agents. Override with `--timeout` or `YOYO_TIMEOUT` only when you have an explicit operational reason.
 
+Long calls print a periodic progress heartbeat to stderr so a working agent is not mistaken for a hung one (`--quiet` or `YOYO_HEARTBEAT_SECS=0` disables it; `YOYO_HEARTBEAT_SECS` sets the interval). For a stricter hang guard on agents that stream output, add `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) to terminate an agent that goes silent. yoyo reads stdin as context only when input is actually available, so an open-but-idle stdin can no longer block the call before the agent starts; use `--stdin-wait <seconds>` to wait for a slow producer or `--no-stdin` to ignore stdin entirely.
+
 Limit captured output:
 
 ```bash
@@ -227,6 +229,8 @@ Built-in agents:
 - `claude`: runs `claude -p --no-session-persistence`
 - `pi`: runs `pi -p --no-session --mode text`
 
+Built-in agents depend on specific flags of the underlying CLIs: codex's `exec`, `--sandbox`, `--ask-for-approval`, `--output-last-message`, `-C`, `--skip-git-repo-check`, `--ephemeral`; claude's `-p`, `--permission-mode`, `--tools`, `--model`; pi's `-p`, `--no-session`, `--mode`, `--tools`, `--model`. yoyo does not detect CLI versions, so if one of these tools renames or changes a flag, the call will fail as a confusing agent error rather than a yoyo error. If a built-in agent suddenly breaks after a CLI upgrade, check its flags here first. To pin an exact path or adjust flags without code changes, override the command via `~/.config/yoyo/agents.json` (use `kind` to keep built-in flag behavior, or define `read_only_args`/`full_access_args` for a fully custom command).
+
 Custom agents can be added with `~/.config/yoyo/agents.json`:
 
 ```json
@@ -282,6 +286,8 @@ Use `--read-only` when you want a bounded reviewer:
 - Claude receives read-oriented tools only
 - Pi receives read-oriented tools only
 
+`--read-only` is enforced by the target agent's own mechanism, not by yoyo, and the strength varies: Codex applies an actual filesystem sandbox, while Claude and Pi apply tool allowlists. yoyo guarantees the constraining flags are passed (and fails loudly for custom agents that have no `read_only_args`), not that the downstream CLI honors them perfectly. Treat read-only as a strong default, not an airtight sandbox.
+
 This is intentionally powerful. Agent output is not truth; verify it with code, tests, docs, or live state before acting.
 
 ## Workflow Safety
@@ -299,7 +305,10 @@ Reviewer jobs never gate control flow by themselves. The supervising agent or hu
 - Stdin and `--file` context share an aggregate cap from `--max-input-bytes` or `YOYO_MAX_INPUT_BYTES`.
 - Temporary Codex output files live inside a per-call temporary directory and are cleaned up automatically.
 - `--cwd` is validated before launching the target agent.
+- stdin is read only when input is actually available, so an open-but-idle stdin cannot hang the call before the agent starts (`--stdin-wait` waits for slow producers; `--no-stdin` ignores stdin).
+- Long calls emit a periodic progress heartbeat on stderr; `--idle-timeout`/`YOYO_IDLE_TIMEOUT` adds an optional no-output hang guard.
 - Timeouts kill the target process group on POSIX systems.
+- SIGINT/SIGTERM/SIGHUP and normal exit terminate any in-flight agent process groups, so an interrupted or killed yoyo does not orphan nested agents.
 - `yoyo workflow` records a run trace ID, per-job trace IDs, agent commands, exit codes, durations, and truncation flags in its JSON result.
 - Agent and workflow jobs default to a one-hour timeout and fail loudly on timeout.
 - Workflows enforce `max_concurrency`, `max_jobs`, per-job timeouts, per-job output caps, and a bounded previous-output context size.

@@ -28,6 +28,8 @@ Workflow jobs inherit Yoyo's one-hour default timeout unless the spec, `--timeou
 
 The timeout is a hung-process guard, not a progress budget. Do not shorten it for real workflow reviews or audits. Use short caps only for deterministic smoke tests with fake or trivial agents.
 
+Each running job prints a progress heartbeat to stderr (tagged with the job's trace id). Set `YOYO_HEARTBEAT_SECS=0` to silence it or `YOYO_IDLE_TIMEOUT=<seconds>` to add a no-output hang guard across jobs. An interrupted workflow terminates its in-flight agent process groups instead of orphaning them.
+
 ## Spec Format
 
 Create a JSON file with sequential `phases`. Jobs in one phase run in parallel up to `max_concurrency`; the next phase starts after the current phase finishes.

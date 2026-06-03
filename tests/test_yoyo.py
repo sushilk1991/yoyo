@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import importlib.machinery
 import io
@@ -39,7 +40,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.4.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.5.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -374,7 +375,7 @@ class YoyoTests(unittest.TestCase):
         self.assertIn("cat --write", stdout)
 
     def test_codex_last_message_replaces_stdout_and_keeps_raw_stderr_in_json(self):
-        def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout):
+        def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout, **kwargs):
             output_index = cmd.index("--output-last-message") + 1
             Path(cmd[output_index]).write_text("final answer", encoding="utf-8")
             stdout_path.write_text("codex transcript", encoding="utf-8")
@@ -1329,6 +1330,110 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         review_stdout = json.loads(stdout)["phases"][1]["jobs"][0]["stdout"]
         self.assertIn("workflow context budget exhausted after 10 bytes", review_stdout)
+
+
+    def test_open_idle_stdin_pipe_does_not_block_or_inject(self):
+        # A prompt arg plus an open-but-idle stdin pipe (the agent-to-agent case)
+        # previously blocked forever in build_prompt before launching the agent.
+        env = {"YOYO_AGENT_ECHO": "cat"}
+        read_fd, write_fd = os.pipe()  # writer never writes: never ready, never EOF
+        reader = os.fdopen(read_fd, "r")
+        merged_env = os.environ.copy()
+        merged_env.update(env)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with mock.patch.dict(os.environ, merged_env, clear=True):
+                with mock.patch("sys.stdin", reader):
+                    with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                        code = yoyo.main(["ask", "echo", "--json", "prompt-only"])
+            self.assertEqual(code, 0, stderr.getvalue())
+            payload = json.loads(stdout.getvalue())
+            self.assertNotIn("<stdin>", payload["stdout"])
+            self.assertIn("Task:\nprompt-only", payload["stdout"])
+        finally:
+            try:
+                reader.close()
+            except OSError:
+                pass
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+
+    def test_no_stdin_flag_excludes_stdin_context(self):
+        env = {"YOYO_AGENT_ECHO": "cat"}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "echo", "--json", "--no-stdin", "prompt"],
+            stdin="SHOULD-NOT-APPEAR",
+            env=env,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertNotIn("SHOULD-NOT-APPEAR", payload["stdout"])
+        self.assertNotIn("<stdin>", payload["stdout"])
+
+    def test_idle_timeout_returns_124_with_idle_message(self):
+        env = {"YOYO_AGENT_SLEEP": "python3 -c \"import time; time.sleep(5)\""}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "sleep", "--json", "--idle-timeout", "0.3", "hello"],
+            env=env,
+        )
+
+        self.assertEqual(code, 124)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["exit_code"], 124)
+        self.assertIn("Idle timeout", payload["stderr"])
+        self.assertIn("Idle timeout", payload["stderr_plain"])
+
+    def test_invalid_idle_timeout_fails_loudly(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "codex", "--idle-timeout", "0", "hello"],
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("--idle-timeout must be greater than 0", stderr)
+
+    def test_resolve_heartbeat_and_idle_timeout_from_env(self):
+        ns = argparse.Namespace(quiet=False, idle_timeout=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(yoyo.resolve_heartbeat(ns), yoyo.DEFAULT_HEARTBEAT_SECONDS)
+            self.assertIsNone(yoyo.resolve_idle_timeout(ns))
+        with mock.patch.dict(os.environ, {"YOYO_HEARTBEAT_SECS": "0"}, clear=True):
+            self.assertIsNone(yoyo.resolve_heartbeat(ns))
+        with mock.patch.dict(os.environ, {"YOYO_HEARTBEAT_SECS": "5"}, clear=True):
+            self.assertEqual(yoyo.resolve_heartbeat(ns), 5.0)
+        with mock.patch.dict(os.environ, {"YOYO_IDLE_TIMEOUT": "7"}, clear=True):
+            self.assertEqual(yoyo.resolve_idle_timeout(ns), 7.0)
+        with mock.patch.dict(os.environ, {"YOYO_HEARTBEAT_SECS": "nope"}, clear=True):
+            with self.assertRaises(yoyo.YoyoError):
+                yoyo.resolve_heartbeat(ns)
+
+    def test_quiet_suppresses_heartbeat(self):
+        ns = argparse.Namespace(quiet=True, idle_timeout=None)
+        with mock.patch.dict(os.environ, {"YOYO_HEARTBEAT_SECS": "1"}, clear=True):
+            self.assertIsNone(yoyo.resolve_heartbeat(ns))
+
+    def test_kill_active_children_terminates_registered_group(self):
+        if os.name != "posix":
+            self.skipTest("posix process-group cleanup")
+        proc = yoyo.subprocess.Popen(
+            ["python3", "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        pgid = os.getpgid(proc.pid)
+        yoyo._register_child(pgid)
+        try:
+            yoyo._kill_active_children(yoyo.signal.SIGKILL)
+            proc.wait(timeout=5)
+            self.assertIsNotNone(proc.returncode)
+        finally:
+            yoyo._unregister_child(pgid)
+            if proc.returncode is None:
+                proc.kill()
+                proc.wait()
 
 
 if __name__ == "__main__":

@@ -66,11 +66,19 @@ yoyo ask claude --trace-id "$USER-auth-review" --json "Review this plan."
 
 ## Timeout Discipline
 
-Agent calls default to a one-hour timeout. The timeout exists only to prevent orphaned or truly hung subprocesses; it is not a progress budget for real agent work.
+Agent calls default to a one-hour wall-clock timeout. It exists only to prevent orphaned or truly hung subprocesses; it is not a progress budget for real agent work.
 
 Do not add short ad hoc timeouts to real reviews, audits, or worker delegations. A three-minute cap can turn a valid long-running review into a false failure. Use short `--timeout` values only for deterministic smoke tests with fake or trivial agents.
 
 Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational reason for a shorter or longer cap. If a real review times out, report it as an unavailable review, not as a passed or failed review.
+
+### Liveness, hangs, and "stuck" calls
+
+- **Progress heartbeat.** Long calls print a periodic `yoyo: still running, Ns elapsed, M bytes captured` line to stderr so a working agent is not mistaken for a hung one. Disable with `--quiet` or `YOYO_HEARTBEAT_SECS=0`; change the interval with `YOYO_HEARTBEAT_SECS=<seconds>`.
+- **Idle-timeout hang guard.** `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) kills the agent if it produces no output for that long. This is a better "truly hung" detector than the wall-clock cap, but only enable it for agents that stream output incrementally; an agent that buffers all output until the end would be killed falsely.
+- **stdin never blocks the caller.** yoyo reads stdin as context only when data is actually available, so an open-but-idle stdin (common when one agent shells out to another) can no longer hang the call before the agent starts. For a slow producer you genuinely want to pipe, use `--stdin-wait <seconds>`. Use `--no-stdin` to ignore stdin entirely.
+- **No orphans.** If yoyo is interrupted or killed (SIGINT/SIGTERM/SIGHUP), it terminates the nested agent's process group instead of leaving it running and burning tokens.
+- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your own shell/tool budget is shorter than the review needs, run yoyo in the background (e.g. your harness's background-process mode) and poll its output, rather than raising `--timeout` and blocking. If a real review is cut off, report it as unavailable — never as passed.
 
 ## Coordination Protocol
 
