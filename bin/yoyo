@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -2142,6 +2142,157 @@ def prune_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+IMAGE_MAGIC: dict[str, bytes] = {
+    ".png": b"\x89PNG\r\n\x1a\n",
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+    ".webp": b"RIFF",
+}
+IMAGE_SIZE_RE = re.compile(r"^\d{2,4}x\d{2,4}$")
+MIN_IMAGE_BYTES = 1024
+
+
+def image_fingerprint(path: Path) -> tuple[bool, int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (False, 0, 0)
+    return (True, stat.st_size, stat.st_mtime_ns)
+
+
+def resolve_imagegen_out(args: argparse.Namespace) -> Path:
+    out = Path(args.out).expanduser()
+    if not out.is_absolute():
+        out = resolve_cwd(args.cwd) / out
+    suffix = out.suffix.lower()
+    if suffix not in IMAGE_MAGIC:
+        supported = ", ".join(sorted(set(IMAGE_MAGIC)))
+        raise YoyoError(f"Unsupported image extension {suffix!r} for --out; use one of: {supported}")
+    if not out.parent.is_dir():
+        raise YoyoError(f"Output directory does not exist: {out.parent}")
+    return out
+
+
+def build_imagegen_prompt(args: argparse.Namespace, out: Path, edit_path: Path | None) -> str:
+    parts = [
+        "You are being called as an image-generation worker.",
+        "Generate the requested image with your image-generation skill (for codex: the imagegen skill backed by the built-in image_gen tool).",
+        "Hard constraints:",
+        "- Do NOT draw or render the image with code. No PIL/Pillow, no matplotlib, no SVG, no HTML/canvas, no ASCII art. "
+        "A programmatically drawn image is a failure.",
+        "- If no real image-generation tool is available, create nothing, state that clearly, and exit non-zero.",
+        f"- Save the single final image to exactly this path: {out}",
+        "- After saving, verify the file exists at that path and report its byte size and dimensions.",
+    ]
+    if edit_path is not None:
+        parts.append(f"Edit the existing image at {edit_path} (use your tool's edit mode with it as the reference input).")
+    spec = [f"Image prompt:\n{args.prompt_text}"]
+    if args.size:
+        spec.append(f"Size: {args.size}.")
+    if args.quality:
+        spec.append(f"Quality: {args.quality}.")
+    return "\n".join(parts) + "\n\n" + "\n".join(spec) + "\n"
+
+
+def verify_image_output(out: Path, before: tuple[bool, int, int]) -> int:
+    exists, _, _ = image_fingerprint(out)
+    if not exists:
+        raise YoyoError(f"Image not created: {out}")
+    after = image_fingerprint(out)
+    if before[0] and after == before:
+        raise YoyoError(f"Image at {out} is unchanged from before the call; treating the run as failed")
+    size = after[1]
+    if size < MIN_IMAGE_BYTES:
+        raise YoyoError(f"Image at {out} is implausibly small ({size} bytes)")
+    magic = IMAGE_MAGIC[out.suffix.lower()]
+    try:
+        with out.open("rb") as handle:
+            header = handle.read(16)
+    except OSError as exc:
+        raise YoyoError(f"Could not read generated image {out}: {exc}") from exc
+    if not header.startswith(magic):
+        raise YoyoError(f"File at {out} is not a valid {out.suffix.lower()} image (wrong magic bytes); was it drawn with code?")
+    if out.suffix.lower() == ".webp" and header[8:12] != b"WEBP":
+        raise YoyoError(f"File at {out} is not a valid .webp image")
+    return size
+
+
+def imagegen_exec_args(args: argparse.Namespace, out: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        cwd=str(out.parent),
+        agent=args.agent,
+        role=None,
+        read_only=False,
+        caller=args.caller,
+        trace_id=args.trace_id,
+        timeout=args.timeout,
+        max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
+        max_output_bytes=args.max_output_bytes,
+        model=args.model,
+        agent_arg=args.agent_arg or [],
+        session=None,
+        session_info=None,
+        dry_run=args.dry_run,
+        json=args.json,
+        quiet=args.quiet,
+        idle_timeout=None,
+        prompt=[],
+        file=[],
+        skill=[],
+    )
+
+
+def cmd_imagegen(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    if args.agent not in agents:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    if not args.prompt_text or not args.prompt_text.strip():
+        raise YoyoError("imagegen requires a non-empty image prompt")
+    if args.size and not IMAGE_SIZE_RE.fullmatch(args.size):
+        raise YoyoError(f"Invalid --size {args.size!r}; use WIDTHxHEIGHT, e.g. 1536x1024")
+
+    out = resolve_imagegen_out(args)
+    edit_path: Path | None = None
+    if args.edit:
+        edit_path = Path(args.edit).expanduser()
+        if not edit_path.is_absolute():
+            edit_path = resolve_cwd(args.cwd) / edit_path
+        if not edit_path.is_file():
+            raise YoyoError(f"Edit reference image not found: {edit_path}")
+
+    prompt = build_imagegen_prompt(args, out, edit_path)
+    exec_args = imagegen_exec_args(args, out)
+    before = image_fingerprint(out)
+
+    result = execute_agent_call(args.agent, exec_args, prompt, agents)
+    if args.dry_run:
+        emit_dry_run_result(result, args.json)
+        return 0
+
+    exit_code = int(result.get("exit_code", 1))
+    if exit_code != 0:
+        emit_result(result, args.json)
+        return exit_code
+
+    size = verify_image_output(out, before)
+    if args.json:
+        payload = dict(result)
+        payload.update({"out": str(out), "bytes": size, "verified": True})
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        stdout = str(result.get("stdout", ""))
+        if stdout.strip():
+            print(stdout.rstrip())
+        print(f"image: {out} ({size} bytes)")
+        eprint(f"trace_id={result.get('trace_id')}")
+    return 0
+
+
 def wait_run(args: argparse.Namespace) -> int:
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
@@ -2470,6 +2621,18 @@ def install_skill(args: argparse.Namespace) -> int:
     if not skill_sources:
         raise YoyoError(f"No bundled skills found under: {source}")
 
+    # Some bundled skills only make sense when the agent that powers them is
+    # actually installed.
+    skill_requirements = {"yoyo-imagegen": "codex"}
+    kept: list[Path] = []
+    for skill_source in skill_sources:
+        required = skill_requirements.get(skill_source.name)
+        if required and not shutil.which(required):
+            print(f"skipped skill: {skill_source.name} (requires {required} on PATH)")
+            continue
+        kept.append(skill_source)
+    skill_sources = kept
+
     target_roots = [
         Path("~/.codex/skills").expanduser(),
         Path("~/.claude/skills").expanduser(),
@@ -2594,6 +2757,25 @@ def build_parser() -> argparse.ArgumentParser:
     workflow.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     workflow.add_argument("--dry-run", action="store_true", help="Render planned agent calls without launching them")
     workflow.set_defaults(func=run_workflow)
+
+    imagegen = sub.add_parser("imagegen", help="Generate an image via an agent's native image-generation skill")
+    imagegen.add_argument("prompt_text", help="Image prompt (quote it)")
+    imagegen.add_argument("--out", required=True, help="Output image path (.png, .jpg, .jpeg, or .webp)")
+    imagegen.add_argument("--agent", default="codex", help="Agent to delegate to (default: codex, which has the native image_gen tool)")
+    imagegen.add_argument("--size", help="Image size as WIDTHxHEIGHT, e.g. 1536x1024")
+    imagegen.add_argument("--quality", choices=["low", "medium", "high", "auto"], help="Generation quality hint")
+    imagegen.add_argument("--edit", help="Existing image to edit instead of generating from scratch")
+    imagegen.add_argument("--cwd", default=os.getcwd())
+    imagegen.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    imagegen.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
+    imagegen.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
+    imagegen.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    imagegen.add_argument("--model", help="Pass a model name to agents that support --model")
+    imagegen.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    imagegen.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
+    imagegen.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
+    imagegen.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
+    imagegen.set_defaults(func=cmd_imagegen)
 
     runs = sub.add_parser("runs", help="List, show, and prune background run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")

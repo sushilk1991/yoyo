@@ -21,6 +21,7 @@ This installs:
 - `~/.local/bin/yoyo`
 - the bundled `yoyo` and `yoyo-workflow` skills for Codex, Claude, Pi, OpenCode, and agent-compatible skill directories when their standard directories are present or creatable
 - bundled workflow templates at `~/.config/yoyo/workflows/`
+- the `yoyo-imagegen` skill (only when codex is on PATH)
 - a source checkout pointer at `~/.config/yoyo/source`, used by `yoyo update`
 
 Make sure `~/.local/bin` is on `PATH`.
@@ -158,6 +159,22 @@ yoyo sessions rm codex:auth-review
 Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. Custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
 
 `--session` also works with `chat` for interactive follow-ups (codex chat can only resume an existing recorded session).
+
+## Image Generation
+
+`yoyo imagegen` generates a real raster image by delegating to an agent with a native image-generation tool. The default agent is codex, whose bundled `imagegen` skill uses the built-in `image_gen` tool (GPT-image models, no API key needed):
+
+```bash
+yoyo imagegen "Hand-drawn flowchart in black marker on white, four boxes labeled 'SPEC', 'BUILD', 'GATE', 'REVIEW', bold arrows. No other text." --out flow.png --size 1536x1024 --quality high
+yoyo imagegen "make the background white" --edit flow.png --out flow-v2.png
+yoyo imagegen "..." --out hero.png --json
+```
+
+The delegated prompt forbids code-drawn output (no PIL, no SVG, no matplotlib) and instructs the agent to fail rather than fake it. Yoyo then verifies the artifact deterministically: the file must exist at `--out`, have changed since before the call, start with the correct magic bytes for its extension (`.png`, `.jpg`, `.jpeg`, `.webp`), and have a plausible size. A renamed SVG or a stale leftover file fails the run loudly.
+
+`--size WIDTHxHEIGHT` and `--quality low|medium|high|auto` pass through as hints; `--edit existing.png` switches to edit mode with that image as the reference. Use `--quality low` to iterate on composition, then regenerate the final at `high`.
+
+The bundled `yoyo-imagegen` skill teaches calling agents when to reach for images (flow diagrams in plans, whimsical explainer notes, architecture sketches) and how to write prompts that produce document-quality results. It installs only when codex is on PATH, since codex provides the default image tool.
 
 ## Live Doctor
 

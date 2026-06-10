@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.7.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.8.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -2349,6 +2349,146 @@ class YoyoTests(unittest.TestCase):
                 jobs = yoyo.expand_workflow_jobs(phase, "input")
                 for job in jobs:
                     self.assertTrue(str(job.get("prompt", "")).strip())
+
+
+    def _imagegen_agent_config(self, tmp, script):
+        config = Path(tmp) / "agents.json"
+        config.write_text(
+            json.dumps({"agents": {"fakegen": {"command": ["python3", "-c", script], "read_only_args": ["--safe"]}}}),
+            encoding="utf-8",
+        )
+        return config
+
+    IMAGEGEN_WRITER = (
+        "import re, sys\n"
+        "prompt = sys.stdin.read()\n"
+        "match = re.search(r'exactly this path: (\\S+)', prompt)\n"
+        "path = match.group(1)\n"
+        "open(path, 'wb').write(b'\\x89PNG\\r\\n\\x1a\\n' + b'0' * 4096)\n"
+        "print('generated', path)\n"
+    )
+
+    def test_imagegen_generates_and_verifies_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, self.IMAGEGEN_WRITER)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertTrue(payload["verified"])
+        self.assertEqual(payload["out"], str(out))
+        self.assertGreater(payload["bytes"], 1024)
+
+    def test_imagegen_fails_loudly_when_no_image_is_created(self):
+        script = "import sys; sys.stdin.read(); print('done, honest')"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, script)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out)],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("Image not created", stderr)
+
+    def test_imagegen_rejects_non_image_bytes(self):
+        script = (
+            "import re, sys\n"
+            "prompt = sys.stdin.read()\n"
+            "path = re.search(r'exactly this path: (\\S+)', prompt).group(1)\n"
+            "open(path, 'w').write('<svg>fake</svg>' * 200)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, script)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out)],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("not a valid .png image", stderr)
+
+    def test_imagegen_rejects_stale_unchanged_output(self):
+        script = "import sys; sys.stdin.read(); print('pretended to work')"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, script)
+            out = Path(tmp) / "art.png"
+            out.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 4096)
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out)],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("unchanged", stderr)
+
+    def test_imagegen_validates_extension_size_and_edit_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, self.IMAGEGEN_WRITER)
+            env = {"YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["imagegen", "x", "--agent", "fakegen", "--out", str(Path(tmp) / "a.gif")], env=env
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Unsupported image extension", stderr)
+
+            code, _, stderr = self.run_cli(
+                ["imagegen", "x", "--agent", "fakegen", "--out", str(Path(tmp) / "a.png"), "--size", "huge"], env=env
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Invalid --size", stderr)
+
+            code, _, stderr = self.run_cli(
+                ["imagegen", "x", "--agent", "fakegen", "--out", str(Path(tmp) / "a.png"), "--edit", str(Path(tmp) / "no.png")],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Edit reference image not found", stderr)
+
+    def test_imagegen_dry_run_renders_prompt_without_generating(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, self.IMAGEGEN_WRITER)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out), "--dry-run"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("Do NOT draw or render the image with code", stdout)
+        self.assertIn(str(out), stdout)
+        self.assertFalse(out.exists())
+
+    def test_install_skill_skips_imagegen_skill_without_codex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(home / ".pi/agent")}
+            real_which = yoyo.shutil.which
+            with mock.patch.object(yoyo.shutil, "which", side_effect=lambda name: None if name == "codex" else real_which(name)):
+                code, stdout, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skipped skill: yoyo-imagegen (requires codex on PATH)", stdout)
+            self.assertFalse((home / ".claude/skills/yoyo-imagegen").exists())
+            self.assertTrue((home / ".claude/skills/yoyo").exists())
+
+    def test_install_skill_installs_imagegen_skill_with_codex_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(home / ".pi/agent")}
+            with mock.patch.object(yoyo.shutil, "which", return_value="/usr/bin/fake"):
+                code, stdout, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((home / ".claude/skills/yoyo-imagegen/SKILL.md").exists())
 
 
 if __name__ == "__main__":

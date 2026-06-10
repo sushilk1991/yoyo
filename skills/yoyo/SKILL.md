@@ -63,6 +63,14 @@ Interactive session:
 yoyo chat claude --cwd "$PWD" "Help me debug this repo."
 ```
 
+Generate a real image (diagrams for plans, explainer illustrations) via codex's native GPT-image tool:
+
+```bash
+yoyo imagegen "Hand-drawn flowchart, boxes labeled 'PLAN', 'BUILD', 'REVIEW', white background. No other text." --out flow.png --size 1536x1024 --quality high
+```
+
+Yoyo verifies the output is a real image file (magic bytes, size, freshness) and the prompt forbids code-drawn fakes. See the `yoyo-imagegen` skill for prompt recipes.
+
 Inspect setup:
 
 ```bash
