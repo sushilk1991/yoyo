@@ -20,6 +20,7 @@ This installs:
 
 - `~/.local/bin/yoyo`
 - the bundled `yoyo` and `yoyo-workflow` skills for Codex, Claude, Pi, OpenCode, and agent-compatible skill directories when their standard directories are present or creatable
+- bundled workflow templates at `~/.config/yoyo/workflows/`
 - a source checkout pointer at `~/.config/yoyo/source`, used by `yoyo update`
 
 Make sure `~/.local/bin` is on `PATH`.
@@ -78,6 +79,21 @@ git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff. Use the
 
 For repo review, the worktree is the primary context. A diff is useful focus, but diff-only review can miss callers, tests, config, generated behavior, and adjacent invariants. Prefer `--cwd "$PWD"` plus a diff or `--file` context.
 
+Steer the target agent with a skill:
+
+```bash
+yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design "Build the settings page. Keep the change minimal."
+```
+
+`--skill <name>` (repeatable) injects a named `SKILL.md` into the delegated prompt as guidance. This is the main lever for making an otherwise unpredictable agent produce consistent results: the skill constrains *how* the work is done while the prompt states *what* to do. Skills are resolved by directory name from `YOYO_SKILL_PATH` (colon-separated), then `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, and the Pi skills directory. First match wins; a missing skill fails loudly before the agent is launched. Per-skill content is capped by `YOYO_SKILL_MAX_BYTES` (default 100000).
+
+List discoverable skills:
+
+```bash
+yoyo skills
+yoyo skills --json
+```
+
 JSON output:
 
 ```bash
@@ -125,6 +141,19 @@ Run a reusable multi-agent workflow:
 ```bash
 yoyo workflow ./workflow.json --input "audit auth routes" --json
 ```
+
+Run a bundled template by name:
+
+```bash
+yoyo workflow --list
+yoyo workflow cross-review --input "review the current branch diff" --json
+```
+
+A bare name (no path, no `.json`) is resolved against `YOYO_WORKFLOW_PATH` (colon-separated dirs), then `~/.config/yoyo/workflows/` (populated by `install.sh`), then the source checkout's `workflows/` directory. Bundled templates:
+
+- `cross-review`: Codex and Claude review independently in parallel, then a synthesis judge verifies each finding against the code and rejects weak claims.
+- `adversarial-audit`: three parallel single-lens audits (correctness, security, maintainability), then an adversarial verifier that tries to refute every finding and keeps only survivors.
+- `frontend-impl-review`: a Codex worker implements a frontend task with the `frontend-design` skill injected, then an independent read-only review checks the result against the same skill. Requires a `frontend-design` skill to be discoverable.
 
 Dry-run a workflow before spending model calls:
 
@@ -193,6 +222,37 @@ Common workflow fields:
 - `max_concurrency`: caps parallel jobs.
 - `max_jobs`: caps expanded jobs before any agent call starts.
 - `context_bytes`: caps prior-output context injected into later jobs.
+- `skill`: skill name(s) injected into the job prompt as guidance (job, phase, or defaults level).
+- `retries`: re-run a job up to N extra times when it fails its exit code or `expect` contract.
+- `expect`: deterministic output contract (`contains` and/or `regex`) checked against job stdout.
+- `gates` (phase level): deterministic shell commands run after the phase's jobs.
+
+## Deterministic Control Flow
+
+Agent output is nondeterministic; workflow control flow does not have to be. Three mechanisms keep a workflow's pass/fail decisions in code instead of in a model's judgment:
+
+**Gates** are shell commands attached to a phase. They run after all the phase's jobs succeed, in order, from the workflow `cwd` (or a gate-level `cwd`). The first failing gate stops the entire workflow with that gate's exit code, regardless of `--fail-fast`. If any job in the phase failed, gates are recorded as skipped. Use gates to verify agent work with real evidence — tests, linters, builds — before later phases consume it:
+
+```json
+{
+  "name": "implement",
+  "jobs": [{"id": "fix", "role": "worker", "read_only": false, "prompt": "Fix the failing test."}],
+  "gates": [
+    {"name": "tests", "run": "python3 -m pytest -q"},
+    "ruff check ."
+  ]
+}
+```
+
+**`expect`** is a per-job output contract. If the agent exits 0 but its stdout is missing a required `contains` string or does not match `regex`, the job fails with exit code 3 and `output contract not met` in stderr. Pair it with a prompt that demands a fixed marker (for example "end with VERDICT: PASS or VERDICT: FAIL") to turn free-text agent output into something checkable:
+
+```json
+{"id": "verdict", "prompt": "... End with a line VERDICT: PASS or VERDICT: FAIL.", "expect": {"regex": "VERDICT: (PASS|FAIL)"}}
+```
+
+**`retries`** re-runs a job (same prompt) when it fails its exit code or `expect` contract, up to N extra attempts. The JSON result records `attempts` per job. Retries make transient agent flakiness invisible to the rest of the workflow without weakening the contract.
+
+Misconfigured jobs — unknown skills, invalid `expect`, invalid gates — fail loudly when the spec is validated, before any agent call spends tokens.
 
 Use `for_each` to fan out one job template:
 

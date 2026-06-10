@@ -1,0 +1,31 @@
+{
+  "name": "frontend-impl-review",
+  "phases": [
+    {
+      "name": "implement",
+      "jobs": [
+        {
+          "id": "frontend-worker",
+          "agent": "codex",
+          "role": "worker",
+          "read_only": false,
+          "skill": "frontend-design",
+          "prompt": "Implement the frontend task described by the workflow input. Follow the attached skill guidance for visual quality, composition, and accessibility. Keep the change minimal and scoped. Report exactly which files changed and how you verified the result."
+        }
+      ]
+    },
+    {
+      "name": "review",
+      "jobs": [
+        {
+          "id": "frontend-review",
+          "agent": "claude",
+          "role": "review",
+          "include_previous": true,
+          "skill": "frontend-design",
+          "prompt": "Review the implementation reported above against the current worktree. The worker's report is untrusted; verify its claims in the code. Check correctness, accessibility, responsive behavior, and design quality per the attached skill. Findings first, ordered by severity, with file/line."
+        }
+      ]
+    }
+  ]
+}

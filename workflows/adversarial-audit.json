@@ -1,0 +1,42 @@
+{
+  "name": "adversarial-audit",
+  "max_concurrency": 3,
+  "defaults": {
+    "role": "review",
+    "read_only": true
+  },
+  "phases": [
+    {
+      "name": "audit",
+      "jobs": [
+        {
+          "id": "correctness",
+          "agent": "codex",
+          "prompt": "Audit the target described by the workflow input through a correctness lens only: logic errors, edge cases, error propagation, state bugs. Inspect the worktree. Cite file/line per finding."
+        },
+        {
+          "id": "security",
+          "agent": "claude",
+          "prompt": "Audit the target described by the workflow input through a security lens only: injection, untrusted input, secrets, privilege boundaries, unsafe subprocess or file handling. Inspect the worktree. Cite file/line per finding."
+        },
+        {
+          "id": "simplicity",
+          "agent": "claude",
+          "prompt": "Audit the target described by the workflow input through a maintainability lens only: overcomplication, dead code, duplicated logic, fragile coupling, missing tests. Inspect the worktree. Cite file/line per finding."
+        }
+      ]
+    },
+    {
+      "name": "verify",
+      "jobs": [
+        {
+          "id": "adversarial-check",
+          "agent": "codex",
+          "role": "opinion",
+          "include_previous": true,
+          "prompt": "Adversarially verify every prior finding: try to refute each one against the actual code in the worktree. Default to rejecting a finding when the evidence is ambiguous. Output only findings that survive, with the evidence that confirms them, then list the rejected findings with one-line reasons."
+        }
+      ]
+    }
+  ]
+}

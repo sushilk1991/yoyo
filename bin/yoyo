@@ -8,6 +8,7 @@ import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -31,6 +32,8 @@ DEFAULT_WORKFLOW_MAX_CONCURRENCY = 4
 DEFAULT_WORKFLOW_MAX_JOBS = 1000
 DEFAULT_WORKFLOW_CONTEXT_BYTES = 200_000
 DEFAULT_HEARTBEAT_SECONDS = 20.0
+DEFAULT_SKILL_MAX_BYTES = 100_000
+DEFAULT_GATE_OUTPUT_BYTES = 65_536
 
 
 ROLE_PROMPTS = {
@@ -506,6 +509,72 @@ def read_file_context(paths: list[str], base: Path, limit: int) -> str:
     return "\n\n".join(blocks)
 
 
+def skill_search_roots() -> list[Path]:
+    roots: list[Path] = []
+    raw = os.environ.get("YOYO_SKILL_PATH")
+    if raw:
+        roots.extend(Path(part).expanduser() for part in raw.split(os.pathsep) if part.strip())
+    roots.extend(
+        [
+            Path("~/.claude/skills").expanduser(),
+            Path("~/.codex/skills").expanduser(),
+            Path("~/.agents/skills").expanduser(),
+            Path("~/.config/opencode/skills").expanduser(),
+            Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
+        ]
+    )
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            ordered.append(root)
+    return ordered
+
+
+def resolve_skill(name: str) -> Path:
+    if not name or os.sep in name or "/" in name or name.startswith("."):
+        raise YoyoError(f"Invalid skill name {name!r}; use a bare skill directory name")
+    roots = skill_search_roots()
+    for root in roots:
+        candidate = root / name / "SKILL.md"
+        if candidate.is_file():
+            return candidate
+    searched = ", ".join(str(root) for root in roots)
+    raise YoyoError(f"Skill not found: {name!r}. Searched: {searched}")
+
+
+def discover_skills() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for root in skill_search_roots():
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.name in seen or not (child / "SKILL.md").is_file():
+                continue
+            seen.add(child.name)
+            rows.append({"name": child.name, "path": str(child)})
+    return rows
+
+
+def skill_prompt_block(names: list[str]) -> str:
+    limit = positive_env_int("YOYO_SKILL_MAX_BYTES", DEFAULT_SKILL_MAX_BYTES)
+    blocks: list[str] = []
+    for name in names:
+        path = resolve_skill(name)
+        text, _ = read_limited_text(path, limit)
+        blocks.append(f"<skill name=\"{name}\">\n{text.rstrip()}\n</skill>")
+    return (
+        "Skill guidance: follow the practices in these skill documents while doing the task. "
+        "They constrain how the work should be done, not what the task is.\n\n" + "\n\n".join(blocks)
+    )
+
+
 def build_prompt(args: argparse.Namespace) -> str:
     cwd = resolve_cwd(args.cwd)
     want_stdin = (
@@ -520,6 +589,10 @@ def build_prompt(args: argparse.Namespace) -> str:
 
     scope = "read-only delegation" if args.read_only else "full-access delegation"
     prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
+
+    skills = getattr(args, "skill", None) or []
+    if skills:
+        prompt_parts.append(skill_prompt_block(list(skills)))
 
     if args.prompt:
         prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
@@ -754,12 +827,58 @@ def emit_dry_run_result(result: dict[str, Any], as_json: bool) -> None:
     print(shlex.join(result["command"]) + "\n\n" + result["prompt"])
 
 
+def workflow_template_roots() -> list[Path]:
+    roots: list[Path] = []
+    raw = os.environ.get("YOYO_WORKFLOW_PATH")
+    if raw:
+        roots.extend(Path(part).expanduser() for part in raw.split(os.pathsep) if part.strip())
+    roots.append(Path("~/.config/yoyo/workflows").expanduser())
+    roots.append(Path(__file__).resolve().parents[1] / "workflows")
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            ordered.append(root)
+    return ordered
+
+
+def discover_workflow_templates() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for root in workflow_template_roots():
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.glob("*.json"))
+        except OSError:
+            continue
+        for child in children:
+            if child.stem in seen:
+                continue
+            seen.add(child.stem)
+            rows.append({"name": child.stem, "path": str(child)})
+    return rows
+
+
+def resolve_workflow_spec_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if path.exists():
+        if not path.is_file():
+            raise YoyoError(f"Workflow spec is not a file: {path}")
+        return path
+    looks_like_name = os.sep not in raw and "/" not in raw and not raw.endswith(".json")
+    if looks_like_name:
+        for root in workflow_template_roots():
+            candidate = root / f"{raw}.json"
+            if candidate.is_file():
+                return candidate
+    searched = ", ".join(str(root) for root in workflow_template_roots())
+    raise YoyoError(f"Workflow spec not found: {raw}. Pass a JSON path or a template name (searched: {searched})")
+
+
 def load_workflow_spec(path: str) -> dict[str, Any]:
-    workflow_path = Path(path).expanduser()
-    if not workflow_path.exists():
-        raise YoyoError(f"Workflow spec not found: {workflow_path}")
-    if not workflow_path.is_file():
-        raise YoyoError(f"Workflow spec is not a file: {workflow_path}")
+    workflow_path = resolve_workflow_spec_path(path)
     try:
         data = json.loads(workflow_path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -1028,6 +1147,7 @@ def build_workflow_prompt(
         trace_id=agent_args.trace_id,
         prompt=["\n\n".join(parts)],
         file=coerce_str_list(job.get("files", job.get("file")), field="files"),
+        skill=workflow_job_skills(spec, phase, job),
         max_input_bytes=agent_args.max_input_bytes,
         use_stdin_context=False,
     )
@@ -1041,6 +1161,125 @@ def workflow_allows_untrusted_context(spec: dict[str, Any], phase: dict[str, Any
         phase.get("allow_untrusted_context", defaults.get("allow_untrusted_context")),
     )
     return coerce_bool(value, default=False, field="allow_untrusted_context")
+
+
+def normalize_phase_gates(phase: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = phase.get("gates")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise YoyoError(f"Workflow phase {phase.get('name')!r} field 'gates' must be an array")
+    gates: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, str):
+            item = {"run": item}
+        if not isinstance(item, dict) or not isinstance(item.get("run"), str) or not item["run"].strip():
+            raise YoyoError(
+                f"Workflow phase {phase.get('name')!r} gate {index} must be a command string or an object with 'run'"
+            )
+        name = item.get("name", f"gate-{index + 1}")
+        if not isinstance(name, str) or not name.strip():
+            raise YoyoError(f"Workflow phase {phase.get('name')!r} gate {index} has an invalid name")
+        cwd = item.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise YoyoError(f"Workflow gate {name!r} field 'cwd' must be a string")
+        gates.append({"name": name, "run": item["run"], "cwd": cwd, "timeout": item.get("timeout")})
+    return gates
+
+
+def run_phase_gates(
+    gates: list[dict[str, Any]],
+    cli_args: argparse.Namespace,
+    spec: dict[str, Any],
+    phase: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Run deterministic shell gates after a phase. The first failing gate stops the workflow."""
+    defaults = workflow_defaults(spec)
+    results: list[dict[str, Any]] = []
+    for gate in gates:
+        cwd = resolve_cwd(str(gate["cwd"] or phase.get("cwd") or defaults.get("cwd") or cli_args.cwd))
+        timeout = coerce_float(gate["timeout"], default=cli_args.timeout, field="gate timeout")
+        if cli_args.dry_run:
+            results.append({"name": gate["name"], "command": gate["run"], "cwd": str(cwd), "dry_run": True})
+            continue
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["/bin/sh", "-c", gate["run"]],
+                cwd=str(cwd),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            exit_code = proc.returncode
+            stdout, stderr = proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            exit_code = 124
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = f"gate timed out after {timeout}s"
+        except FileNotFoundError as exc:
+            raise YoyoError(f"Gate shell not found: {exc}") from exc
+        results.append(
+            {
+                "name": gate["name"],
+                "command": gate["run"],
+                "cwd": str(cwd),
+                "exit_code": exit_code,
+                "duration_s": round(time.monotonic() - started, 3),
+                "stdout": stdout[-DEFAULT_GATE_OUTPUT_BYTES:],
+                "stderr": stderr[-DEFAULT_GATE_OUTPUT_BYTES:],
+            }
+        )
+        if exit_code != 0:
+            return results, exit_code
+    return results, 0
+
+
+def workflow_job_expect(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> dict[str, Any] | None:
+    expect = inherited_workflow_value(spec, phase, job, "expect")
+    if expect is None:
+        return None
+    if not isinstance(expect, dict):
+        raise YoyoError(f"Workflow job {job.get('id')!r} field 'expect' must be an object")
+    unknown = set(expect) - {"contains", "regex"}
+    if unknown:
+        raise YoyoError(f"Workflow job {job.get('id')!r} 'expect' has unknown keys: {', '.join(sorted(unknown))}")
+    contains = coerce_str_list(expect.get("contains"), field="expect.contains")
+    regex = expect.get("regex")
+    if regex is not None:
+        if not isinstance(regex, str) or not regex:
+            raise YoyoError(f"Workflow job {job.get('id')!r} field 'expect.regex' must be a non-empty string")
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            raise YoyoError(f"Workflow job {job.get('id')!r} has invalid 'expect.regex': {exc}") from exc
+    if not contains and regex is None:
+        raise YoyoError(f"Workflow job {job.get('id')!r} 'expect' must set 'contains' and/or 'regex'")
+    return {"contains": contains, "regex": regex}
+
+
+def expect_failure(stdout: str, expect: dict[str, Any] | None) -> str | None:
+    if expect is None:
+        return None
+    for needle in expect["contains"]:
+        if needle not in stdout:
+            return f"missing required text {needle!r}"
+    if expect["regex"] is not None and not re.search(expect["regex"], stdout):
+        return f"output did not match regex {expect['regex']!r}"
+    return None
+
+
+def workflow_job_retries(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> int:
+    return coerce_int(
+        inherited_workflow_value(spec, phase, job, "retries"),
+        default=0,
+        field="retries",
+        minimum=0,
+    )
+
+
+def workflow_job_skills(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> list[str]:
+    return coerce_str_list(inherited_workflow_value(spec, phase, job, "skill"), field="skill")
 
 
 def run_workflow_job(
@@ -1068,13 +1307,34 @@ def run_workflow_job(
         )
 
     prompt = build_workflow_prompt(spec, phase, agent_args, job, results_by_phase, workflow_input, context_limit)
-    result = execute_agent_call(agent, agent_args, prompt, agents)
+    retries = workflow_job_retries(spec, phase, job)
+    expect = workflow_job_expect(spec, phase, job)
+
+    attempts = 0
+    while True:
+        attempts += 1
+        result = execute_agent_call(agent, agent_args, prompt, agents)
+        if cli_args.dry_run:
+            break
+        contract_failure = expect_failure(str(result.get("stdout", "")), expect)
+        if int(result.get("exit_code", 1)) == 0 and contract_failure is None:
+            break
+        if attempts > retries:
+            if int(result.get("exit_code", 1)) == 0 and contract_failure is not None:
+                result["exit_code"] = 3
+                note = f"output contract not met: {contract_failure}"
+                for key in ("stderr", "stderr_plain"):
+                    existing = str(result.get(key, ""))
+                    result[key] = (existing + "\n" + note).strip()
+            break
+
     result.update(
         {
             "job_id": str(job.get("id") or uuid.uuid4().hex[:8]),
             "role": agent_args.role,
             "model": agent_args.model,
             "read_only": agent_args.read_only,
+            "attempts": attempts,
         }
     )
     if cli_args.dry_run:
@@ -1091,7 +1351,25 @@ def validate_unique_job_ids(phase_name: str, jobs: list[dict[str, Any]]) -> None
         seen.add(job_id)
 
 
+def list_workflow_templates(as_json: bool) -> int:
+    rows = discover_workflow_templates()
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no workflow templates found")
+        return 0
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        print(f"{row['name']:<{width}}  {row['path']}")
+    return 0
+
+
 def run_workflow(args: argparse.Namespace) -> int:
+    if getattr(args, "list_templates", False):
+        return list_workflow_templates(args.json)
+    if not args.spec:
+        raise YoyoError("Pass a workflow spec path or template name, or use --list")
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
     if args.max_output_bytes < 1:
@@ -1120,8 +1398,17 @@ def run_workflow(args: argparse.Namespace) -> int:
     )
     workflow_input = args.input or ""
     expanded_phases = [(phase, expand_workflow_jobs(phase, workflow_input)) for phase in phases]
+    phase_gates: dict[str, list[dict[str, Any]]] = {}
     for phase_index, (phase, jobs) in enumerate(expanded_phases):
-        validate_unique_job_ids(str(phase.get("name", f"phase-{phase_index + 1}")), jobs)
+        phase_name = str(phase.get("name", f"phase-{phase_index + 1}"))
+        validate_unique_job_ids(phase_name, jobs)
+        phase_gates[phase_name] = normalize_phase_gates(phase)
+        # Fail loudly on misconfigured jobs before any tokens are spent.
+        for job in jobs:
+            workflow_job_retries(spec, phase, job)
+            workflow_job_expect(spec, phase, job)
+            for skill_name in workflow_job_skills(spec, phase, job):
+                resolve_skill(skill_name)
     total_jobs = sum(len(jobs) for _, jobs in expanded_phases)
     if total_jobs > max_jobs:
         raise YoyoError(f"Workflow expands to {total_jobs} jobs, above max_jobs={max_jobs}")
@@ -1131,7 +1418,7 @@ def run_workflow(args: argparse.Namespace) -> int:
     output: dict[str, Any] = {
         "workflow": name,
         "trace_id": run_trace_id,
-        "spec": str(Path(args.spec).expanduser()),
+        "spec": str(resolve_workflow_spec_path(args.spec)),
         "max_concurrency": max_concurrency,
         "job_count": total_jobs,
         "phases": [],
@@ -1199,7 +1486,31 @@ def run_workflow(args: argparse.Namespace) -> int:
                     exit_code = int(result.get("exit_code", 1))
                     break
         results_by_phase[phase_name] = phase_results
-        output["phases"].append({"name": phase_name, "jobs": phase_results})
+        phase_entry: dict[str, Any] = {"name": phase_name, "jobs": phase_results}
+        output["phases"].append(phase_entry)
+
+        gates = phase_gates.get(phase_name, [])
+        if gates:
+            jobs_ok = all(int(result.get("exit_code", 1)) == 0 for result in phase_results)
+            if jobs_ok or args.dry_run:
+                gate_results, gate_exit = run_phase_gates(gates, args, spec, phase)
+                phase_entry["gates"] = gate_results
+                if not args.json:
+                    for gate_result in gate_results:
+                        if "exit_code" in gate_result:
+                            status = "ok" if gate_result["exit_code"] == 0 else f"exit {gate_result['exit_code']}"
+                            eprint(f"workflow {name}: {phase_name}/gate {gate_result['name']} {status}")
+                if gate_exit != 0:
+                    if exit_code == 0:
+                        exit_code = gate_exit
+                    if not args.json:
+                        eprint(f"workflow {name}: stopping, gate failed in phase {phase_name}")
+                    break
+            else:
+                phase_entry["gates"] = [
+                    {"name": gate["name"], "command": gate["run"], "skipped": "phase jobs failed"} for gate in gates
+                ]
+
         if args.fail_fast and any(int(result.get("exit_code", 1)) != 0 for result in phase_results):
             break
 
@@ -1255,6 +1566,22 @@ def list_agents(args: argparse.Namespace) -> int:
         status = "ok" if row["found"] else "missing"
         print(f"{row['name']:<{width}}  {status:7}  {shlex.join(row['command'])}")
     return 0
+
+
+def list_skills(args: argparse.Namespace) -> int:
+    rows = discover_skills()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no skills found; set YOYO_SKILL_PATH or install skills under ~/.claude/skills etc.")
+        return 0
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        print(f"{row['name']:<{width}}  {row['path']}")
+    return 0
+
+
 def doctor(args: argparse.Namespace) -> int:
     agents = load_agents()
     failed = 0
@@ -1373,6 +1700,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     ask.add_argument("--cwd", default=os.getcwd())
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
+    ask.add_argument("--skill", action="append", default=[], help="Inject a named skill (SKILL.md) as guidance for the target agent; repeatable")
     ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
     ask.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     ask.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
@@ -1399,8 +1727,9 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--dry-run", action="store_true", help="Print command without launching the agent")
     chat.set_defaults(func=chat_agent, collect_unknown_prompt=True)
 
-    workflow = sub.add_parser("workflow", help="Run a multi-agent workflow from a JSON spec")
-    workflow.add_argument("spec", help="Path to a workflow JSON spec")
+    workflow = sub.add_parser("workflow", help="Run a multi-agent workflow from a JSON spec or template name")
+    workflow.add_argument("spec", nargs="?", help="Path to a workflow JSON spec, or a template name (see --list)")
+    workflow.add_argument("--list", action="store_true", dest="list_templates", help="List available workflow templates")
     workflow.add_argument("--input", help="Optional workflow input text passed to jobs")
     workflow.add_argument("--cwd", default=os.getcwd())
     workflow.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
@@ -1419,6 +1748,10 @@ def build_parser() -> argparse.ArgumentParser:
     agents = sub.add_parser("agents", help="List configured agents")
     agents.add_argument("--json", action="store_true")
     agents.set_defaults(func=list_agents)
+
+    skills = sub.add_parser("skills", help="List skills discoverable for --skill injection")
+    skills.add_argument("--json", action="store_true")
+    skills.set_defaults(func=list_skills)
 
     diag = sub.add_parser("doctor", help="Check whether configured agent commands exist")
     diag.add_argument("--strict", action="store_true", help="Exit non-zero if any configured agent is missing")

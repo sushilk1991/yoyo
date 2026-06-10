@@ -40,7 +40,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.5.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.6.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -1434,6 +1434,437 @@ class YoyoTests(unittest.TestCase):
             if proc.returncode is None:
                 proc.kill()
                 proc.wait()
+
+
+    def _echo_agent_config(self, tmp):
+        config = Path(tmp) / "agents.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "agents": {
+                        "echo": {
+                            "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
+                            "read_only_args": ["--safe"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    def _write_skill(self, root, name, body="Use 8px spacing. Avoid generic gradients."):
+        skill_dir = Path(root) / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(f"# {name}\n\n{body}\n", encoding="utf-8")
+        return skill_dir
+
+    def test_ask_skill_is_injected_into_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_skill(Path(tmp) / "skills", "frontend")
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--skill", "frontend", "--dry-run", "Build the page."],
+                env={
+                    "YOYO_AGENT_ECHO": "true",
+                    "YOYO_SKILL_PATH": str(Path(tmp) / "skills"),
+                },
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('<skill name="frontend">', stdout)
+        self.assertIn("Use 8px spacing", stdout)
+        self.assertIn("Task:\nBuild the page.", stdout)
+
+    def test_ask_missing_skill_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--skill", "does-not-exist", "--dry-run", "Build."],
+                env={
+                    "YOYO_AGENT_ECHO": "true",
+                    "YOYO_SKILL_PATH": str(Path(tmp)),
+                },
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("Skill not found", stderr)
+
+    def test_ask_rejects_path_like_skill_names(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "echo", "--skill", "../evil", "--dry-run", "Build."],
+            env={"YOYO_AGENT_ECHO": "true"},
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("Invalid skill name", stderr)
+
+    def test_skills_command_lists_discovered_skills_first_root_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = Path(tmp) / "a"
+            root_b = Path(tmp) / "b"
+            self._write_skill(root_a, "alpha", body="from-a")
+            self._write_skill(root_b, "alpha", body="from-b")
+            self._write_skill(root_b, "beta")
+            code, stdout, stderr = self.run_cli(
+                ["skills", "--json"],
+                env={"YOYO_SKILL_PATH": f"{root_a}{os.pathsep}{root_b}"},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        rows = {row["name"]: row["path"] for row in json.loads(stdout)}
+        self.assertEqual(rows["alpha"], str(root_a / "alpha"))
+        self.assertEqual(rows["beta"], str(root_b / "beta"))
+
+    def test_workflow_template_resolves_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            templates = Path(tmp) / "templates"
+            templates.mkdir()
+            (templates / "smoke.json").write_text(
+                json.dumps(
+                    {
+                        "name": "smoke",
+                        "defaults": {"agent": "echo"},
+                        "phases": [{"name": "one", "jobs": [{"id": "j1", "prompt": "Say hi"}]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", "smoke", "--json"],
+                env={"YOYO_CONFIG": str(config), "YOYO_WORKFLOW_PATH": str(templates)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["workflow"], "smoke")
+        self.assertEqual(payload["spec"], str(templates / "smoke.json"))
+
+    def test_workflow_list_templates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            templates = Path(tmp) / "templates"
+            templates.mkdir()
+            (templates / "yoyo-test-wf.json").write_text("{}", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["workflow", "--list", "--json"],
+                env={"YOYO_WORKFLOW_PATH": str(templates)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        names = [row["name"] for row in json.loads(stdout)]
+        self.assertIn("yoyo-test-wf", names)
+
+    def test_workflow_without_spec_or_list_fails_loudly(self):
+        code, stdout, stderr = self.run_cli(["workflow"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("Pass a workflow spec path or template name", stderr)
+
+    def test_workflow_gate_failure_stops_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "gated",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [{"id": "j1", "prompt": "First"}],
+                                "gates": [{"name": "must-fail", "run": "echo gate-stdout; exit 7"}],
+                            },
+                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Never runs"}]},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 7, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(len(payload["phases"]), 1)
+        gate = payload["phases"][0]["gates"][0]
+        self.assertEqual(gate["exit_code"], 7)
+        self.assertIn("gate-stdout", gate["stdout"])
+
+    def test_workflow_gate_success_lets_next_phase_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "gated-ok",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [{"id": "j1", "prompt": "First"}],
+                                "gates": ["true"],
+                            },
+                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Second"}]},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(len(payload["phases"]), 2)
+        self.assertEqual(payload["phases"][0]["gates"][0]["exit_code"], 0)
+
+    def test_workflow_gates_are_skipped_when_phase_jobs_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "boom": {
+                                "command": ["python3", "-c", "import sys; sys.stdin.read(); sys.exit(5)"],
+                                "read_only_args": ["--safe"],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "gated-fail",
+                        "defaults": {"agent": "boom"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [{"id": "j1", "prompt": "First"}],
+                                "gates": ["echo should-not-run"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 5, stderr)
+        payload = json.loads(stdout)
+        gate = payload["phases"][0]["gates"][0]
+        self.assertEqual(gate["skipped"], "phase jobs failed")
+
+    def test_workflow_expect_contract_failure_sets_exit_3(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "contract",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [
+                                    {
+                                        "id": "j1",
+                                        "prompt": "First",
+                                        "expect": {"contains": "TEXT_THAT_NEVER_APPEARS"},
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 3, stderr)
+        payload = json.loads(stdout)
+        job = payload["phases"][0]["jobs"][0]
+        self.assertEqual(job["exit_code"], 3)
+        self.assertEqual(job["attempts"], 1)
+        self.assertIn("output contract not met", job["stderr"])
+
+    def test_workflow_expect_pass_keeps_exit_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "contract-ok",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [
+                                    {
+                                        "id": "j1",
+                                        "prompt": "MARKER_ABC",
+                                        "expect": {"contains": ["MARKER_ABC"], "regex": "Task:"},
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["phases"][0]["jobs"][0]["attempts"], 1)
+
+    def test_workflow_retries_until_success_and_records_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "counter"
+            agent_code = (
+                "import sys, os\n"
+                "path = sys.argv[1]\n"
+                "n = int(open(path).read()) if os.path.exists(path) else 0\n"
+                "open(path, 'w').write(str(n + 1))\n"
+                "sys.stdin.read()\n"
+                "if n == 0:\n"
+                "    sys.exit(1)\n"
+                "print('recovered')\n"
+            )
+            config = Path(tmp) / "agents.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "flaky": {
+                                "command": ["python3", "-c", agent_code, str(counter)],
+                                "read_only_args": ["--safe"],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "flaky-retry",
+                        "defaults": {"agent": "flaky"},
+                        "phases": [
+                            {
+                                "name": "one",
+                                "jobs": [{"id": "j1", "prompt": "Go", "retries": 2}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        job = payload["phases"][0]["jobs"][0]
+        self.assertEqual(job["exit_code"], 0)
+        self.assertEqual(job["attempts"], 2)
+        self.assertIn("recovered", job["stdout"])
+
+    def test_workflow_job_skill_is_injected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            self._write_skill(Path(tmp) / "skills", "myskill", body="WORKFLOW_SKILL_BODY")
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "skilled",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {"name": "one", "jobs": [{"id": "j1", "prompt": "Do it", "skill": "myskill"}]}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={
+                    "YOYO_CONFIG": str(config),
+                    "YOYO_SKILL_PATH": str(Path(tmp) / "skills"),
+                },
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        job_stdout = payload["phases"][0]["jobs"][0]["stdout"]
+        self.assertIn('<skill name="myskill">', job_stdout)
+        self.assertIn("WORKFLOW_SKILL_BODY", job_stdout)
+
+    def test_workflow_missing_skill_fails_before_any_job_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "skilled-missing",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {"name": "one", "jobs": [{"id": "j1", "prompt": "Do it"}]},
+                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Do it", "skill": "nope"}]},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["workflow", str(spec), "--json"],
+                env={
+                    "YOYO_CONFIG": str(config),
+                    "YOYO_SKILL_PATH": str(Path(tmp) / "empty-skills"),
+                },
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("Skill not found", stderr)
+        self.assertEqual(stdout.strip(), "")
+
+    def test_bundled_workflow_templates_are_valid_specs(self):
+        bundled = ROOT / "workflows"
+        templates = sorted(bundled.glob("*.json"))
+        self.assertTrue(templates, "no bundled workflow templates found")
+        for template in templates:
+            spec = json.loads(template.read_text(encoding="utf-8"))
+            phases = yoyo.workflow_phases(spec)
+            self.assertTrue(phases)
+            for phase in phases:
+                yoyo.normalize_phase_gates(phase)
+                jobs = yoyo.expand_workflow_jobs(phase, "input")
+                for job in jobs:
+                    self.assertTrue(str(job.get("prompt", "")).strip())
 
 
 if __name__ == "__main__":

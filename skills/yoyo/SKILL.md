@@ -31,6 +31,14 @@ Scoped worker with write access:
 yoyo ask pi --role worker --cwd "$PWD" --caller codex "Fix the failing test in tests/foo_test.py. Do not touch unrelated files."
 ```
 
+Steered worker (skill injection):
+
+```bash
+yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design --caller claude "Build the settings page. Keep the change minimal."
+```
+
+`--skill <name>` (repeatable) injects a named `SKILL.md` into the delegated prompt. Use it whenever the target agent's raw output is too unpredictable for the task: the skill pins down conventions, quality bars, and output shape while your prompt states the task. Discover names with `yoyo skills`. Skills resolve from `YOYO_SKILL_PATH`, then the standard agent skill directories (`~/.claude/skills`, `~/.codex/skills`, ...); a missing skill fails loudly before any tokens are spent.
+
 Interactive session:
 
 ```bash
@@ -42,6 +50,7 @@ Inspect setup:
 ```bash
 yoyo doctor
 yoyo agents
+yoyo skills
 ```
 
 Update the installed CLI and skills from the recorded source checkout:
@@ -52,9 +61,11 @@ yoyo update
 
 Use `yoyo update --no-pull` to reinstall from the current recorded checkout without fetching.
 
-Run a reusable multi-agent workflow:
+Run a reusable multi-agent workflow (path or bundled template name):
 
 ```bash
+yoyo workflow --list
+yoyo workflow cross-review --input "review the current branch diff" --json
 yoyo workflow ./workflow.json --input "audit this change" --json
 ```
 
@@ -88,6 +99,7 @@ Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational
    - `review`: find concrete bugs and missing tests.
    - `worker`: do a bounded implementation task.
 3. Pass only the context needed. Prefer `--file` for exact artifacts and a short prompt for the ask.
+   For quality-sensitive work (frontend, design, testing conventions), add `--skill <name>` so the worker follows a known playbook instead of improvising.
 4. Use default full access for trusted automation or worker tasks. Use `--read-only` for reviews, second opinions, or untrusted prompts.
 5. Verify the result yourself. Run tests, inspect diffs, and reconcile disagreements before acting.
 6. For long or noisy tasks, set `--trace-id` and consider `--max-output-bytes` so failures are auditable and output cannot grow without bound. Do not set short timeouts for real agent review.

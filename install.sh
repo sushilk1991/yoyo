@@ -13,6 +13,11 @@ chmod +x "$BIN_DIR/yoyo"
 mkdir -p "$CONFIG_DIR"
 printf '%s\n' "$ROOT" > "$CONFIG_DIR/source"
 
+if [ -d "$ROOT/workflows" ]; then
+  mkdir -p "$CONFIG_DIR/workflows"
+  cp "$ROOT"/workflows/*.json "$CONFIG_DIR/workflows/"
+fi
+
 YOYO_SKILL_SOURCE="$ROOT/skills" "$BIN_DIR/yoyo" install-skill
 
 printf 'installed yoyo: %s\n' "$BIN_DIR/yoyo"

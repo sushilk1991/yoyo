@@ -1,0 +1,37 @@
+{
+  "name": "cross-review",
+  "max_concurrency": 2,
+  "defaults": {
+    "role": "review",
+    "read_only": true
+  },
+  "phases": [
+    {
+      "name": "review",
+      "jobs": [
+        {
+          "id": "codex-review",
+          "agent": "codex",
+          "prompt": "Independently review the change described by the workflow input. Inspect the current worktree as the source of truth. Prioritize concrete bugs, security issues, behavioral regressions, and missing tests. Cite file/line for every finding."
+        },
+        {
+          "id": "claude-review",
+          "agent": "claude",
+          "prompt": "Independently review the change described by the workflow input. Inspect the current worktree as the source of truth. Prioritize concrete bugs, security issues, behavioral regressions, and missing tests. Cite file/line for every finding."
+        }
+      ]
+    },
+    {
+      "name": "cross-check",
+      "jobs": [
+        {
+          "id": "synthesis",
+          "agent": "claude",
+          "role": "opinion",
+          "include_previous": true,
+          "prompt": "You are the synthesis judge for the two prior independent reviews. Verify each finding against the actual code in the worktree. Reject weak, duplicate, or unverifiable claims. Output one ordered findings list with severity, file/line, and a confidence level per finding, then a short list of rejected claims with the reason."
+        }
+      ]
+    }
+  ]
+}
