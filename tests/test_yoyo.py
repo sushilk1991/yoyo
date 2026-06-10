@@ -4,6 +4,7 @@ import importlib.machinery
 import io
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -40,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.6.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.7.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -78,6 +79,324 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(payload["trace_id"], "trace-123")
         self.assertFalse(payload["stdout_truncated"])
         self.assertFalse(payload["stderr_truncated"])
+
+    def test_background_ask_wait_and_runs_show_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"import sys; print('agent-output:' + sys.stdin.read())\"",
+            }
+            code, stdout, stderr = self.run_cli(["ask", "echo", "--background", "hello"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+            self.assertIn("run dir:", stderr)
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "3", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("agent-output:", stdout)
+            self.assertIn("hello", stdout)
+
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id, "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["run_id"], run_id)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["agent"], "echo")
+            self.assertEqual(payload["exit_code"], 0)
+            self.assertIn("hello", payload["stdout"])
+
+    def test_background_run_writes_meta_and_result_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "--trace-id", "trace-bg", "hello"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            code, _, stderr = self.run_cli(["wait", run_id, "--timeout", "3", "--poll", "0.01"], env=env)
+            self.assertEqual(code, 0, stderr)
+
+            run_dir = Path(tmp) / "runs" / run_id
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["agent"], "echo")
+            self.assertIsInstance(meta["pid"], int)
+            self.assertEqual(meta["trace_id"], "trace-bg")
+            self.assertEqual(result["agent"], "echo")
+            self.assertEqual(result["exit_code"], 0)
+            self.assertIn("duration_s", result)
+
+    def test_background_ask_passes_piped_stdin_to_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\"",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "hello"],
+                stdin="PIPE-CONTEXT",
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "3", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("<stdin>\nPIPE-CONTEXT\n</stdin>", stdout)
+
+    def test_runs_list_json_reports_done_runs_and_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
+            }
+            run_ids = []
+            for prompt in ("one", "two"):
+                code, stdout, stderr = self.run_cli(["ask", "echo", "--background", prompt], env=env)
+                self.assertEqual(code, 0, stderr)
+                run_id = stdout.strip()
+                run_ids.append(run_id)
+                code, _, stderr = self.run_cli(["wait", run_id, "--timeout", "3", "--poll", "0.01"], env=env)
+                self.assertEqual(code, 0, stderr)
+
+            code, stdout, stderr = self.run_cli(["runs", "list", "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            rows = json.loads(stdout)
+            self.assertTrue(any(row["run_id"] == run_ids[0] and row["status"] == "done" for row in rows))
+
+            code, stdout, stderr = self.run_cli(["runs", "list", "--json", "--limit", "1"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(len(json.loads(stdout)), 1)
+
+    def test_runs_show_rejects_unknown_and_path_separator_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            code, stdout, stderr = self.run_cli(["runs", "show", "missing-run"], env=env)
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("Unknown run_id", stderr)
+
+            code, stdout, stderr = self.run_cli(["runs", "show", "../escape"], env=env)
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("Invalid run_id", stderr)
+
+    def test_dead_run_show_and_wait_exit_four(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-deadbeef"
+            self._write_run_meta(tmp, run_id, pid=99999999)
+
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id], env=env)
+            self.assertEqual(code, 4)
+            self.assertEqual(stdout, "")
+            self.assertIn("status: dead", stderr)
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "1", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 4)
+            self.assertEqual(stdout, "")
+            self.assertIn("status: dead", stderr)
+
+    def test_wait_timeout_for_running_run_exits_124(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-00000001"
+            self._write_run_meta(tmp, run_id, pid=os.getpid())
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "0.05", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 124)
+            self.assertEqual(stdout, "")
+            self.assertIn("timed out waiting", stderr)
+
+    def test_runs_prune_dry_run_lists_old_run_and_prune_deletes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-feedface"
+            run_dir = self._write_run_meta(tmp, run_id, pid=99999999, started_at="2000-01-01T00:00:00Z")
+            os.utime(run_dir, (946684800, 946684800))
+
+            code, stdout, stderr = self.run_cli(["runs", "prune", "--dry-run", "--days", "7"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn(run_id, stdout)
+            self.assertTrue(run_dir.exists())
+
+            code, stdout, stderr = self.run_cli(["runs", "prune", "--days", "7"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("1 run dirs deleted", stdout)
+            self.assertFalse(run_dir.exists())
+
+    def test_background_dry_run_stays_foreground_and_creates_no_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--background", "--dry-run", "hello"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("codex --ask-for-approval never exec", stdout)
+            self.assertIn("Task:\nhello", stdout)
+            self.assertFalse((Path(tmp) / "runs").exists())
+
+    def test_claude_session_first_call_records_uuid_and_followup_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
+            code, stdout, stderr = self.run_cli(
+                ["ask", "claude", "--session", "foo", "--dry-run", "--json", "hello"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            command = payload["command"]
+            self.assertIn("--session-id", command)
+            self.assertNotIn("--no-session-persistence", command)
+            backend_id = command[command.index("--session-id") + 1]
+            self.assertRegex(backend_id, r"^[0-9a-f-]{36}$")
+
+            sessions = json.loads((Path(tmp) / "sessions.json").read_text(encoding="utf-8"))["sessions"]
+            self.assertEqual(sessions["claude:foo"]["backend_id"], backend_id)
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "claude", "--session", "foo", "--dry-run", "--json", "again"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            command = json.loads(stdout)["command"]
+            self.assertIn("--resume", command)
+            self.assertEqual(command[command.index("--resume") + 1], backend_id)
+            self.assertNotIn("--no-session-persistence", command)
+
+    def test_pi_session_uses_same_session_id_for_first_and_followup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
+            code, stdout, stderr = self.run_cli(
+                ["ask", "pi", "--session", "foo", "--dry-run", "--json", "hello"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            first_command = json.loads(stdout)["command"]
+            self.assertIn("--session-id", first_command)
+            self.assertNotIn("--no-session", first_command)
+            backend_id = first_command[first_command.index("--session-id") + 1]
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "pi", "--session", "foo", "--dry-run", "--json", "again"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            second_command = json.loads(stdout)["command"]
+            self.assertIn("--session-id", second_command)
+            self.assertEqual(second_command[second_command.index("--session-id") + 1], backend_id)
+            self.assertNotIn("--no-session", second_command)
+
+    def test_codex_session_dry_run_omits_ephemeral_and_followup_inserts_resume(self):
+        fixed_id = "11111111-1111-4111-8111-111111111111"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--session", "foo", "--dry-run", "--json", "hello"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            first_command = json.loads(stdout)["command"]
+            self.assertNotIn("--ephemeral", first_command)
+
+            self._write_session_record(tmp, "codex", "foo", fixed_id)
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--session", "foo", "--dry-run", "--json", "again"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            command = json.loads(stdout)["command"]
+            self.assertNotIn("--ephemeral", command)
+            self.assertEqual(command[command.index("exec") + 1], "resume")
+            self.assertEqual(command[command.index("resume") + 1], fixed_id)
+            self.assertNotIn("-C", command)
+            self.assertNotIn("--color", command)
+            self.assertNotIn("--sandbox", command)
+            self.assertIn('sandbox_mode="danger-full-access"', command)
+            self.assertIn("--skip-git-repo-check", command)
+
+    def test_codex_first_session_call_parses_stderr_and_records_session(self):
+        fixed_id = "22222222-2222-4222-8222-222222222222"
+        script = f"import sys; print('session id: {fixed_id}', file=sys.stderr); print('OK')"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            config.write_text(
+                json.dumps({"agents": {"codex-kind": {"kind": "codex", "command": ["python3", "-c", script]}}}),
+                encoding="utf-8",
+            )
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex-kind", "--session", "foo", "--json", "hello"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["stdout"], "OK\n")
+            self.assertEqual(payload["session"], {"name": "foo", "backend_id": fixed_id})
+            sessions = json.loads((Path(tmp) / "sessions.json").read_text(encoding="utf-8"))["sessions"]
+            self.assertEqual(sessions["codex-kind:foo"]["backend_id"], fixed_id)
+
+    def test_custom_agent_session_fails_loudly(self):
+        env = {"YOYO_AGENT_ECHO": "cat"}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "echo", "--session", "foo", "--dry-run", "hello"],
+            env=env,
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("agent echo does not support --session", stderr)
+
+    def test_invalid_session_name_fails_loudly(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "claude", "--session", "foo/bar", "--dry-run", "hello"],
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("Invalid session name", stderr)
+
+    def test_sessions_list_json_and_rm(self):
+        fixed_id = "33333333-3333-4333-8333-333333333333"
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session_record(tmp, "claude", "foo", fixed_id)
+            env = {"YOYO_STATE_DIR": tmp}
+
+            code, stdout, stderr = self.run_cli(["sessions", "list", "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            rows = json.loads(stdout)
+            self.assertEqual(rows[0]["key"], "claude:foo")
+            self.assertEqual(rows[0]["backend_id"], fixed_id)
+
+            code, stdout, stderr = self.run_cli(["sessions", "rm", "claude:foo"], env=env)
+            self.assertEqual(code, 0, stderr)
+            sessions = json.loads((Path(tmp) / "sessions.json").read_text(encoding="utf-8"))["sessions"]
+            self.assertEqual(sessions, {})
+
+            code, stdout, stderr = self.run_cli(["sessions", "rm", "claude:missing"], env=env)
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("Unknown session", stderr)
 
     def test_output_is_truncated_at_configured_limit(self):
         env = {"YOYO_AGENT_BIG": "python3 -c \"print('abcdef')\""}
@@ -307,6 +626,41 @@ class YoyoTests(unittest.TestCase):
         self.assertIn("--sandbox read-only", stdout)
         self.assertNotIn("--ask-for-approval never", stdout)
 
+    def test_chat_claude_session_creates_and_resumes_named_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
+            code, stdout, stderr = self.run_cli(
+                ["chat", "claude", "--session", "foo", "--dry-run", "Debug this."],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            first_command = shlex.split(stdout.strip())
+            self.assertIn("--session-id", first_command)
+            backend_id = first_command[first_command.index("--session-id") + 1]
+
+            code, stdout, stderr = self.run_cli(
+                ["chat", "claude", "--session", "foo", "--dry-run", "Debug more."],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            second_command = shlex.split(stdout.strip())
+            self.assertIn("--resume", second_command)
+            self.assertEqual(second_command[second_command.index("--resume") + 1], backend_id)
+
+    def test_chat_codex_session_resumes_recorded_session(self):
+        fixed_id = "44444444-4444-4444-8444-444444444444"
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session_record(tmp, "codex", "foo", fixed_id)
+            code, stdout, stderr = self.run_cli(
+                ["chat", "codex", "--session", "foo", "--dry-run", "Debug this."],
+                env={"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        command = shlex.split(stdout.strip())
+        self.assertEqual(command[0:2], ["codex", "resume"])
+        self.assertEqual(command[-2:], [fixed_id, "Debug this."])
+
     def test_chat_launches_interactive_subprocess_without_capture(self):
         env = {"YOYO_AGENT_FAKE": "/usr/bin/env"}
         with mock.patch.object(yoyo.subprocess, "call", return_value=7) as call:
@@ -487,6 +841,93 @@ class YoyoTests(unittest.TestCase):
 
         self.assertEqual(code, 0, stderr)
         self.assertIn(f"source: {source.resolve()} (present)", stdout)
+
+    def test_doctor_live_reports_fake_agent_modes_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._doctor_agent_config(
+                tmp,
+                "probe",
+                [
+                    "python3",
+                    "-c",
+                    "import sys; data = sys.stdin.read(); "
+                    "print('OK') if data == 'Reply with exactly: OK' else sys.exit(9)",
+                ],
+                read_only_args=["--safe"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "probe"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr, "")
+        self.assertIn("probe: read-only ok", stdout)
+        self.assertIn("probe: full-access ok", stdout)
+
+    def test_doctor_live_strict_exits_one_when_probe_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._doctor_agent_config(
+                tmp,
+                "fail",
+                ["python3", "-c", "import sys; print('unknown option', file=sys.stderr); sys.exit(7)"],
+                read_only_args=["--safe"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "fail", "--strict"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("fail: read-only FAIL exit 7", stdout)
+        self.assertIn("unknown option", stdout)
+
+    def test_doctor_live_unknown_agent_fails_loudly(self):
+        code, stdout, stderr = self.run_cli(["doctor", "--live", "--agent", "unknown-name"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("Unknown agent 'unknown-name'", stderr)
+
+    def test_doctor_live_skips_custom_read_only_without_configured_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._doctor_agent_config(
+                tmp,
+                "writeonly",
+                ["python3", "-c", "print('OK')"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "writeonly"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("writeonly: read-only skipped: no read_only_args", stdout)
+        self.assertIn("writeonly: full-access ok", stdout)
+
+    def test_doctor_live_json_reports_probe_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._doctor_agent_config(
+                tmp,
+                "probe",
+                ["python3", "-c", "print('OK')"],
+                read_only_args=["--safe"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "probe", "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual([row["mode"] for row in payload], ["read-only", "full-access"])
+        for row in payload:
+            self.assertEqual(row["agent"], "probe")
+            self.assertTrue(row["ok"])
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["exit_code"], 0)
+            self.assertIsInstance(row["duration_s"], float)
+            self.assertIn("stderr_snippet", row)
 
     def test_install_skill_installs_all_bundled_skill_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1452,6 +1893,49 @@ class YoyoTests(unittest.TestCase):
             encoding="utf-8",
         )
         return config
+
+    def _doctor_agent_config(self, tmp, name, command, *, read_only_args=None):
+        raw = {"command": command}
+        if read_only_args is not None:
+            raw["read_only_args"] = read_only_args
+        config = Path(tmp) / "agents.json"
+        config.write_text(json.dumps({"agents": {name: raw}}), encoding="utf-8")
+        return config
+
+    def _write_run_meta(self, state_dir, run_id, *, pid, started_at="2024-01-01T00:00:00Z"):
+        run_dir = Path(state_dir) / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "run_id": run_id,
+            "agent": "echo",
+            "role": "opinion",
+            "cwd": str(ROOT),
+            "trace_id": "trace-test",
+            "caller": "test",
+            "argv": ["python3", str(YOYO_PATH), "ask", "echo", "--json", "hello"],
+            "pid": pid,
+            "started_at": started_at,
+        }
+        (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return run_dir
+
+    def _write_session_record(self, state_dir, agent, name, backend_id):
+        state_path = Path(state_dir)
+        state_path.mkdir(parents=True, exist_ok=True)
+        key = f"{agent}:{name}"
+        payload = {
+            "sessions": {
+                key: {
+                    "agent": agent,
+                    "name": name,
+                    "backend_id": backend_id,
+                    "created_at": "2026-06-10T00:00:00Z",
+                    "last_used": "2026-06-10T00:00:00Z",
+                }
+            }
+        }
+        (state_path / "sessions.json").write_text(json.dumps(payload), encoding="utf-8")
+        return key
 
     def _write_skill(self, root, name, body="Use 8px spacing. Avoid generic gradients."):
         skill_dir = Path(root) / name

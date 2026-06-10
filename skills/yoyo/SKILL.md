@@ -39,6 +39,24 @@ yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design --caller claud
 
 `--skill <name>` (repeatable) injects a named `SKILL.md` into the delegated prompt. Use it whenever the target agent's raw output is too unpredictable for the task: the skill pins down conventions, quality bars, and output shape while your prompt states the task. Discover names with `yoyo skills`. Skills resolve from `YOYO_SKILL_PATH`, then the standard agent skill directories (`~/.claude/skills`, `~/.codex/skills`, ...); a missing skill fails loudly before any tokens are spent.
 
+Background delegation (when your own tool budget is shorter than the task):
+
+```bash
+run_id=$(yoyo ask codex --role review --cwd "$PWD" --background "Audit the auth module.")
+yoyo wait "$run_id"        # or poll later: yoyo runs show "$run_id" --json
+```
+
+Prefer `--background` + `yoyo wait`/`yoyo runs show` over raising `--timeout` and blocking, and over abandoning a long review. The run ledger (`yoyo runs list`) keeps every background result auditable after the fact.
+
+Follow-up session (continue a prior delegation with full context):
+
+```bash
+yoyo ask codex --session auth-review --role review --cwd "$PWD" "Review the auth changes."
+yoyo ask codex --session auth-review "Is the middleware.py issue you flagged fixed now?"
+```
+
+Use `--session <name>` whenever you expect to ask the same agent follow-up questions; it avoids re-sending context and the target agent keeps its prior reasoning. `yoyo sessions list` shows recorded sessions.
+
 Interactive session:
 
 ```bash
@@ -49,6 +67,7 @@ Inspect setup:
 
 ```bash
 yoyo doctor
+yoyo doctor --live   # real probes through every agent's read-only and full-access flag paths; run after CLI upgrades
 yoyo agents
 yoyo skills
 ```
@@ -89,7 +108,7 @@ Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational
 - **Idle-timeout hang guard.** `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) kills the agent if it produces no output for that long. This is a better "truly hung" detector than the wall-clock cap, but only enable it for agents that stream output incrementally; an agent that buffers all output until the end would be killed falsely.
 - **stdin never blocks the caller.** yoyo reads stdin as context only when data is actually available, so an open-but-idle stdin (common when one agent shells out to another) can no longer hang the call before the agent starts. For a slow producer you genuinely want to pipe, use `--stdin-wait <seconds>`. Use `--no-stdin` to ignore stdin entirely.
 - **No orphans.** If yoyo is interrupted or killed (SIGINT/SIGTERM/SIGHUP), it terminates the nested agent's process group instead of leaving it running and burning tokens.
-- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your own shell/tool budget is shorter than the review needs, run yoyo in the background (e.g. your harness's background-process mode) and poll its output, rather than raising `--timeout` and blocking. If a real review is cut off, report it as unavailable — never as passed.
+- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your own shell/tool budget is shorter than the review needs, use `yoyo ask --background` and collect the result with `yoyo wait <run_id>` or `yoyo runs show <run_id>`, rather than raising `--timeout` and blocking. If a real review is cut off, report it as unavailable — never as passed.
 
 ## Coordination Protocol
 

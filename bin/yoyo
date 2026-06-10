@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -34,6 +35,9 @@ DEFAULT_WORKFLOW_CONTEXT_BYTES = 200_000
 DEFAULT_HEARTBEAT_SECONDS = 20.0
 DEFAULT_SKILL_MAX_BYTES = 100_000
 DEFAULT_GATE_OUTPUT_BYTES = 65_536
+DEFAULT_STATE_DIR = "~/.local/state/yoyo"
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+CODEX_SESSION_ID_RE = re.compile(r"session id:\s*([0-9a-f-]{36})")
 
 
 ROLE_PROMPTS = {
@@ -626,6 +630,10 @@ def command_for_agent(
 ) -> list[str]:
     cmd = list(spec.command)
     cwd = str(resolve_cwd(args.cwd))
+    session_info = getattr(args, "session_info", None)
+    session_mode = session_info.get("mode") if isinstance(session_info, dict) else None
+    session_backend_id = session_info.get("backend_id") if isinstance(session_info, dict) else None
+    codex_exec_command = len(spec.command) >= 2 and spec.command[1] == "exec"
 
     # Each branch only builds the flavor-specific flags. The shared tail
     # (--model, raw --agent-arg passthrough, and the trailing prompt/stdin
@@ -633,33 +641,58 @@ def command_for_agent(
     if spec.flavor == "codex":
         codex_bin = spec.command[0]
         if interactive:
-            cmd = [codex_bin, "-C", cwd]
+            cmd = [codex_bin, "resume", "-C", cwd] if session_info and session_mode == "resume" else [codex_bin, "-C", cwd]
             if args.read_only:
                 cmd.extend(["--sandbox", "read-only"])
             else:
                 cmd.extend(["--sandbox", "danger-full-access", "--ask-for-approval", "never"])
         else:
-            cmd = [codex_bin]
+            cmd = [codex_bin] if codex_exec_command else list(spec.command)
+            if session_info:
+                cmd = [part for part in cmd if part != "--ephemeral"]
             if not args.read_only:
                 cmd.extend(["--ask-for-approval", "never"])
             cmd.append("exec")
-            cmd.extend(["--skip-git-repo-check", "--ephemeral", "--color", "never", "-C", cwd])
-            if args.read_only:
-                cmd.extend(["--sandbox", "read-only"])
+            if session_info and session_mode == "resume":
+                # `codex exec resume` rejects --color/-C/--sandbox; the process
+                # cwd is already set by yoyo and the sandbox goes through -c.
+                sandbox_mode = "read-only" if args.read_only else "danger-full-access"
+                cmd.extend(["resume", str(session_backend_id), "--skip-git-repo-check"])
+                cmd.extend(["-c", f'sandbox_mode="{sandbox_mode}"'])
             else:
-                cmd.extend(["--sandbox", "danger-full-access"])
+                if codex_exec_command and len(spec.command) > 2:
+                    cmd.extend(part for part in spec.command[2:] if part != "--ephemeral")
+                cmd.extend(["--skip-git-repo-check"])
+                if not session_info:
+                    cmd.append("--ephemeral")
+                cmd.extend(["--color", "never", "-C", cwd])
+                if args.read_only:
+                    cmd.extend(["--sandbox", "read-only"])
+                else:
+                    cmd.extend(["--sandbox", "danger-full-access"])
         if codex_output_file:
             cmd.extend(["--output-last-message", codex_output_file])
     elif spec.flavor == "claude":
+        if session_info:
+            cmd = [part for part in cmd if part != "--no-session-persistence"]
         if interactive:
             cmd = [spec.command[0]]
+        if session_info:
+            if session_mode == "resume":
+                cmd.extend(["--resume", str(session_backend_id)])
+            else:
+                cmd.extend(["--session-id", str(session_backend_id)])
         if args.read_only:
             cmd.extend(["--tools", "Read,Grep,Glob,LS"])
         else:
             cmd.extend(["--permission-mode", "bypassPermissions"])
     elif spec.flavor == "pi":
+        if session_info:
+            cmd = [part for part in cmd if part != "--no-session"]
         if interactive:
             cmd = [spec.command[0]]
+        if session_info:
+            cmd.extend(["--session-id", str(session_backend_id)])
         if args.read_only:
             cmd.extend(["--tools", "read,grep,find,ls"])
         else:
@@ -676,6 +709,8 @@ def command_for_agent(
         cmd.extend(["--model", args.model])
     cmd.extend(args.agent_arg or [])
     if interactive:
+        if spec.flavor == "codex" and session_info and session_mode == "resume":
+            cmd.append(str(session_backend_id))
         if args.prompt:
             cmd.append(" ".join(args.prompt).strip())
     elif spec.flavor == "codex":
@@ -683,7 +718,7 @@ def command_for_agent(
     return cmd
 
 
-def run_agent(args: argparse.Namespace) -> int:
+def validate_ask_args(args: argparse.Namespace) -> dict[str, AgentSpec]:
     agents = load_agents()
     if args.agent not in agents:
         known = ", ".join(sorted(agents))
@@ -694,6 +729,431 @@ def run_agent(args: argparse.Namespace) -> int:
         raise YoyoError("--max-input-bytes must be at least 1")
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
+    validate_session_request(args, agents[args.agent])
+    cwd = resolve_cwd(args.cwd)
+    for item in args.file:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        if not path.exists():
+            raise YoyoError(f"Context file not found: {path}")
+        if not path.is_file():
+            raise YoyoError(f"Context path is not a file: {path}")
+    for skill_name in getattr(args, "skill", None) or []:
+        resolve_skill(skill_name)
+    command_for_agent(agents[args.agent], args)
+    return agents
+
+
+def ask_wants_stdin(args: argparse.Namespace) -> bool:
+    return (
+        bool(getattr(args, "use_stdin_context", True))
+        and not getattr(args, "no_stdin", False)
+        and not _stdin_isatty()
+    )
+
+
+def read_background_stdin(args: argparse.Namespace) -> bytes | None:
+    if not ask_wants_stdin(args) or not _stdin_pending(_stdin_wait_seconds(args)):
+        return None
+
+    limit = args.max_input_bytes
+    stream = sys.stdin
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        size = min(65536, limit - total)
+        try:
+            if hasattr(stream, "buffer"):
+                raw = stream.buffer.read(size)
+            else:
+                text = stream.read(size)
+                raw = text.encode("utf-8", errors="replace")
+        except (OSError, ValueError):
+            break
+        if not raw:
+            break
+        if len(raw) > size:
+            raw = raw[:size]
+        chunks.append(raw)
+        total += len(raw)
+    return b"".join(chunks)
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("YOYO_STATE_DIR", DEFAULT_STATE_DIR)).expanduser()
+
+
+def sessions_path() -> Path:
+    return state_dir() / "sessions.json"
+
+
+def session_key(agent: str, name: str) -> str:
+    return f"{agent}:{name}"
+
+
+def validate_session_name(name: str) -> None:
+    if not SESSION_NAME_RE.fullmatch(name):
+        raise YoyoError(f"Invalid session name {name!r}; use [A-Za-z0-9._-]+")
+
+
+def read_session_registry() -> dict[str, Any]:
+    path = sessions_path()
+    if not path.exists():
+        return {"sessions": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise YoyoError(f"Could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise YoyoError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):
+        raise YoyoError(f"Invalid session registry in {path}; expected a sessions object")
+    return data
+
+
+def write_session_registry(registry: dict[str, Any]) -> None:
+    # Simple read-modify-write is intentional: concurrent first calls for the
+    # same agent/name can race, and the last writer wins.
+    path = sessions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def validate_session_request(args: argparse.Namespace, spec: AgentSpec) -> None:
+    name = getattr(args, "session", None)
+    if not name:
+        return
+    validate_session_name(str(name))
+    if spec.flavor not in ("codex", "claude", "pi"):
+        raise YoyoError(f"agent {args.agent} does not support --session")
+
+
+def prepare_session(args: argparse.Namespace, spec: AgentSpec, *, interactive: bool = False) -> None:
+    args.session_info = None
+    name = getattr(args, "session", None)
+    if not name:
+        return
+    validate_session_request(args, spec)
+
+    key = session_key(args.agent, str(name))
+    now = iso_utc(utc_now())
+    registry = read_session_registry()
+    sessions = registry["sessions"]
+    existing = sessions.get(key)
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise YoyoError(f"Invalid session record for {key}")
+        backend_id = existing.get("backend_id")
+        if not backend_id:
+            raise YoyoError(f"session {key} has no recorded backend_id")
+        existing["last_used"] = now
+        sessions[key] = existing
+        write_session_registry(registry)
+        args.session_info = {
+            "key": key,
+            "name": str(name),
+            "backend_id": str(backend_id),
+            "mode": "resume",
+            "created_at": existing.get("created_at") or now,
+        }
+        return
+
+    if spec.flavor == "codex":
+        if interactive:
+            raise YoyoError("codex chat --session requires an existing recorded session")
+        args.session_info = {
+            "key": key,
+            "name": str(name),
+            "backend_id": None,
+            "mode": "create",
+            "created_at": now,
+        }
+        return
+
+    backend_id = str(uuid.uuid4())
+    record = {
+        "agent": args.agent,
+        "name": str(name),
+        "backend_id": backend_id,
+        "created_at": now,
+        "last_used": now,
+    }
+    sessions[key] = record
+    write_session_registry(registry)
+    args.session_info = {
+        "key": key,
+        "name": str(name),
+        "backend_id": backend_id,
+        "mode": "create",
+        "created_at": now,
+    }
+
+
+def record_codex_session(args: argparse.Namespace, backend_id: str) -> None:
+    session_info = getattr(args, "session_info", None)
+    if not isinstance(session_info, dict):
+        return
+    name = str(session_info["name"])
+    key = str(session_info["key"])
+    created_at = str(session_info.get("created_at") or iso_utc(utc_now()))
+    now = iso_utc(utc_now())
+    registry = read_session_registry()
+    registry["sessions"][key] = {
+        "agent": args.agent,
+        "name": name,
+        "backend_id": backend_id,
+        "created_at": created_at,
+        "last_used": now,
+    }
+    write_session_registry(registry)
+    session_info["backend_id"] = backend_id
+
+
+def result_session(args: argparse.Namespace) -> dict[str, Any] | None:
+    session_info = getattr(args, "session_info", None)
+    if not isinstance(session_info, dict):
+        return None
+    return {
+        "name": session_info.get("name"),
+        "backend_id": session_info.get("backend_id"),
+    }
+
+
+def attach_session_result(args: argparse.Namespace, spec: AgentSpec, result: dict[str, Any]) -> None:
+    session = result_session(args)
+    if session is None:
+        return
+    session_info = getattr(args, "session_info", None) or {}
+    if spec.flavor == "codex" and session_info.get("mode") == "create":
+        match = CODEX_SESSION_ID_RE.search(str(result.get("stderr", "")))
+        if match:
+            record_codex_session(args, match.group(1))
+            session = result_session(args)
+        else:
+            eprint("session not recorded for codex; follow-up calls will fail")
+    result["session"] = session
+
+
+def runs_root() -> Path:
+    return state_dir() / "runs"
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso_utc(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def generate_run_id() -> str:
+    return utc_now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+
+def validate_run_id(run_id: str) -> None:
+    if not run_id or run_id in (".", "..") or "/" in run_id or "\\" in run_id or os.sep in run_id:
+        raise YoyoError(f"Invalid run_id: {run_id!r}")
+
+
+def run_dir_for(run_id: str) -> Path:
+    validate_run_id(run_id)
+    path = runs_root() / run_id
+    if not path.is_dir():
+        raise YoyoError(f"Unknown run_id: {run_id}")
+    return path
+
+
+def load_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_meta(run_dir: Path) -> dict[str, Any] | None:
+    return load_json_file(run_dir / "meta.json")
+
+
+def run_result(run_dir: Path) -> dict[str, Any] | None:
+    return load_json_file(run_dir / "result.json")
+
+
+def pid_is_running(pid: Any) -> bool:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def run_status(run_dir: Path) -> str:
+    meta = run_meta(run_dir)
+    if meta is None:
+        return "unknown"
+    if run_result(run_dir) is not None:
+        return "done"
+    return "running" if pid_is_running(meta.get("pid")) else "dead"
+
+
+def run_started_at(meta: dict[str, Any] | None, run_dir: Path) -> datetime | None:
+    parsed = parse_iso_utc((meta or {}).get("started_at"))
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.fromtimestamp(run_dir.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
+
+
+def run_duration_seconds(status: str, meta: dict[str, Any] | None, result: dict[str, Any] | None, run_dir: Path) -> float | None:
+    if status == "done" and result is not None:
+        try:
+            return float(result.get("duration_s"))
+        except (TypeError, ValueError):
+            return None
+    started = run_started_at(meta, run_dir)
+    if started is None:
+        return None
+    return max(0.0, (utc_now() - started).total_seconds())
+
+
+def run_summary(run_dir: Path) -> dict[str, Any]:
+    meta = run_meta(run_dir)
+    result = run_result(run_dir)
+    status = run_status(run_dir)
+    started = run_started_at(meta, run_dir)
+    duration = run_duration_seconds(status, meta, result, run_dir)
+    return {
+        "run_id": run_dir.name,
+        "agent": (meta or {}).get("agent"),
+        "status": status,
+        "started_at": iso_utc(started) if started is not None else None,
+        "duration": round(duration, 3) if duration is not None else None,
+        "trace_id": (meta or {}).get("trace_id"),
+        "exit_code": result.get("exit_code") if status == "done" and result is not None else None,
+    }
+
+
+def background_child_argv(args: argparse.Namespace) -> list[str]:
+    raw = list(getattr(args, "_raw_argv", sys.argv[1:]))
+    filtered: list[str] = []
+    skip_next = False
+    for item in raw:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--background":
+            continue
+        # The child runs from the resolved run cwd, so a relative --cwd must be
+        # rewritten to its absolute form or it would resolve a second time.
+        if item == "--cwd":
+            skip_next = True
+            continue
+        if item.startswith("--cwd="):
+            continue
+        filtered.append(item)
+    filtered.extend(["--cwd", str(resolve_cwd(args.cwd))])
+    if "--json" not in filtered:
+        filtered.append("--json")
+    has_trace = any(item == "--trace-id" or item.startswith("--trace-id=") for item in filtered)
+    if not has_trace:
+        filtered.extend(["--trace-id", args.trace_id])
+    return [sys.executable, str(Path(__file__).resolve())] + filtered
+
+
+def start_background_run(args: argparse.Namespace) -> int:
+    stdin_bytes = read_background_stdin(args)
+    if (
+        not args.prompt
+        and not args.file
+        and not (getattr(args, "skill", None) or [])
+        and not (stdin_bytes and stdin_bytes.strip())
+    ):
+        raise YoyoError("No prompt provided. Pass text, pipe stdin, or use --file.")
+
+    started = utc_now()
+    root = runs_root()
+    root.mkdir(parents=True, exist_ok=True)
+    run_id = generate_run_id()
+    run_dir = root / run_id
+    run_dir.mkdir(mode=0o700)
+
+    stdin_path: Path | None = None
+    if stdin_bytes:
+        stdin_path = run_dir / "stdin.txt"
+        stdin_path.write_bytes(stdin_bytes)
+
+    child_argv = background_child_argv(args)
+    meta = {
+        "run_id": run_id,
+        "agent": args.agent,
+        "role": args.role,
+        "cwd": str(resolve_cwd(args.cwd)),
+        "trace_id": args.trace_id,
+        "caller": args.caller,
+        "argv": child_argv,
+        "pid": None,
+        "started_at": iso_utc(started),
+    }
+    meta_path = run_dir / "meta.json"
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result_path = run_dir / "result.json"
+    log_path = run_dir / "log.txt"
+    stdin_file = stdin_path.open("rb") if stdin_path is not None else subprocess.DEVNULL
+    try:
+        with result_path.open("wb") as stdout_file, log_path.open("wb") as stderr_file:
+            proc = subprocess.Popen(
+                child_argv,
+                stdin=stdin_file,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=str(resolve_cwd(args.cwd)),
+                start_new_session=os.name == "posix",
+            )
+    except Exception:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+    finally:
+        if stdin_path is not None and hasattr(stdin_file, "close"):
+            stdin_file.close()
+
+    meta["pid"] = proc.pid
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if args.json:
+        print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "pid": proc.pid, "trace_id": args.trace_id}))
+    else:
+        print(run_id)
+        eprint(f"run dir: {run_dir}")
+    return 0
+
+
+def run_agent(args: argparse.Namespace) -> int:
+    agents = validate_ask_args(args)
+    if getattr(args, "background", False) and not args.dry_run:
+        return start_background_run(args)
 
     prompt = build_prompt(args)
     result = execute_agent_call(args.agent, args, prompt, agents)
@@ -743,6 +1203,7 @@ def execute_agent_call(
         known = ", ".join(sorted(agents))
         raise YoyoError(f"Unknown agent {agent_name!r}. Known agents: {known}")
     cwd = resolve_cwd(args.cwd)
+    prepare_session(args, agents[agent_name])
     codex_output_file: str | None = None
     with tempfile.TemporaryDirectory(prefix="yoyo-") as tmp:
         tmpdir = Path(tmp)
@@ -751,7 +1212,11 @@ def execute_agent_call(
 
         cmd = command_for_agent(agents[agent_name], args, codex_output_file)
         if args.dry_run:
-            return {"agent": agent_name, "command": cmd, "prompt": prompt, "trace_id": args.trace_id, "exit_code": 0}
+            result = {"agent": agent_name, "command": cmd, "prompt": prompt, "trace_id": args.trace_id, "exit_code": 0}
+            session = result_session(args)
+            if session is not None:
+                result["session"] = session
+            return result
 
         started = time.monotonic()
         stdout_path = tmpdir / "stdout.txt"
@@ -774,16 +1239,20 @@ def execute_agent_call(
         except FileNotFoundError as exc:
             raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
         except subprocess.TimeoutExpired:
-            return _timeout_result(
+            result = _timeout_result(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Timed out after {args.timeout}s",
             )
+            attach_session_result(args, agents[agent_name], result)
+            return result
         except AgentIdleTimeout as exc:
-            return _timeout_result(
+            result = _timeout_result(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Idle timeout after {exc.idle_seconds}s with no output "
                 f"({exc.captured_bytes} bytes captured before the stall)",
             )
+            attach_session_result(args, agents[agent_name], result)
+            return result
 
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
@@ -817,6 +1286,7 @@ def execute_agent_call(
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }
+        attach_session_result(args, agents[agent_name], result)
         return result
 
 
@@ -1113,6 +1583,8 @@ def build_workflow_agent_args(
         max_output_bytes=max_output_bytes,
         model=model,
         agent_arg=agent_args,
+        session=None,
+        session_info=None,
         dry_run=cli_args.dry_run,
         json=cli_args.json,
         prompt=[],
@@ -1148,6 +1620,8 @@ def build_workflow_prompt(
         prompt=["\n\n".join(parts)],
         file=coerce_str_list(job.get("files", job.get("file")), field="files"),
         skill=workflow_job_skills(spec, phase, job),
+        session=None,
+        session_info=None,
         max_input_bytes=agent_args.max_input_bytes,
         use_stdin_context=False,
     )
@@ -1456,8 +1930,7 @@ def run_workflow(args: argparse.Namespace) -> int:
             field="max_concurrency",
         )
         phase_concurrency = min(phase_concurrency, max_concurrency, len(jobs))
-        if not args.json:
-            eprint(f"workflow {name}: phase {phase_name} ({len(jobs)} jobs, concurrency {phase_concurrency})")
+        eprint(f"workflow {name}: phase {phase_name} ({len(jobs)} jobs, concurrency {phase_concurrency})")
 
         phase_results: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=phase_concurrency) as pool:
@@ -1497,9 +1970,8 @@ def run_workflow(args: argparse.Namespace) -> int:
                         "stderr_truncated": False,
                     }
                 indexed_results[job_index] = result
-                if not args.json:
-                    status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
-                    eprint(f"workflow {name}: {phase_name}/{result.get('job_id')} {status}")
+                status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
+                eprint(f"workflow {name}: {phase_name}/{result.get('job_id')} {status}")
             for job_index in range(len(jobs)):
                 phase_results.append(indexed_results[job_index])
 
@@ -1518,16 +1990,14 @@ def run_workflow(args: argparse.Namespace) -> int:
             if jobs_ok or args.dry_run:
                 gate_results, gate_exit = run_phase_gates(gates, args, spec, phase)
                 phase_entry["gates"] = gate_results
-                if not args.json:
-                    for gate_result in gate_results:
-                        if "exit_code" in gate_result:
-                            status = "ok" if gate_result["exit_code"] == 0 else f"exit {gate_result['exit_code']}"
-                            eprint(f"workflow {name}: {phase_name}/gate {gate_result['name']} {status}")
+                for gate_result in gate_results:
+                    if "exit_code" in gate_result:
+                        status = "ok" if gate_result["exit_code"] == 0 else f"exit {gate_result['exit_code']}"
+                        eprint(f"workflow {name}: {phase_name}/gate {gate_result['name']} {status}")
                 if gate_exit != 0:
                     if exit_code == 0:
                         exit_code = gate_exit
-                    if not args.json:
-                        eprint(f"workflow {name}: stopping, gate failed in phase {phase_name}")
+                    eprint(f"workflow {name}: stopping, gate failed in phase {phase_name}")
                     break
             else:
                 phase_entry["gates"] = [
@@ -1550,6 +2020,8 @@ def chat_agent(args: argparse.Namespace) -> int:
     if args.agent not in agents:
         known = ", ".join(sorted(agents))
         raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+    validate_session_request(args, agents[args.agent])
+    prepare_session(args, agents[args.agent], interactive=True)
 
     cwd = resolve_cwd(args.cwd)
     cmd = command_for_agent(agents[args.agent], args, interactive=True)
@@ -1574,6 +2046,192 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
         eprint(stderr, end="" if stderr.endswith("\n") else "\n")
     if result.get("trace_id"):
         eprint(f"trace_id={result['trace_id']}")
+
+
+def show_run(run_id: str, as_json: bool, *, exit_with_result: bool = False) -> int:
+    run_dir = run_dir_for(run_id)
+    meta = run_meta(run_dir)
+    result = run_result(run_dir)
+    status = run_status(run_dir)
+    if status == "done" and result is not None:
+        payload = dict(result)
+        payload.update({"run_id": run_id, "status": status})
+        emit_result(payload, as_json)
+        if not exit_with_result:
+            return 0
+        try:
+            return int(payload.get("exit_code", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    if as_json:
+        print(json.dumps({"run_id": run_id, "status": status, "meta": meta}, ensure_ascii=False))
+    else:
+        eprint(f"run {run_id} status: {status}")
+    return 3 if status == "running" else 4
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    action = args.runs_action
+    if action == "show":
+        if not args.run_id:
+            raise YoyoError("runs show requires a run_id")
+        return show_run(args.run_id, args.json)
+    if action == "prune":
+        if args.run_id:
+            raise YoyoError("runs prune does not accept a run_id")
+        return prune_runs(args)
+    if action != "list":
+        raise YoyoError(f"Unknown runs action: {action}")
+    if args.run_id:
+        raise YoyoError("runs list does not accept a run_id")
+    return list_runs(args)
+
+
+def list_runs(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        raise YoyoError("--limit must be at least 1")
+    root = runs_root()
+    dirs = sorted([path for path in root.iterdir() if path.is_dir()], key=lambda path: path.name, reverse=True) if root.is_dir() else []
+    rows = [run_summary(path) for path in dirs[:args.limit]]
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no runs found")
+        return 0
+    print(f"{'run_id':<24}  {'agent':<12}  {'status':<8}  {'started_at':<20}  duration")
+    for row in rows:
+        duration = "" if row["duration"] is None else f"{float(row['duration']):.1f}s"
+        print(
+            f"{row['run_id']:<24}  {str(row['agent'] or ''):<12}  {row['status']:<8}  "
+            f"{str(row['started_at'] or ''):<20}  {duration}"
+        )
+    return 0
+
+
+def prune_runs(args: argparse.Namespace) -> int:
+    if args.days < 0:
+        raise YoyoError("--days must be at least 0")
+    cutoff = utc_now().timestamp() - (args.days * 86400)
+    root = runs_root()
+    selected: list[Path] = []
+    if root.is_dir():
+        for path in sorted([item for item in root.iterdir() if item.is_dir()], key=lambda item: item.name):
+            if run_status(path) in ("running", "unknown"):
+                continue
+            meta = run_meta(path)
+            started = run_started_at(meta, path)
+            if started is not None:
+                timestamp = started.timestamp()
+            else:
+                try:
+                    timestamp = path.stat().st_mtime
+                except OSError:
+                    continue
+            if timestamp < cutoff:
+                selected.append(path)
+
+    for path in selected:
+        if args.dry_run:
+            print(path.name)
+        else:
+            shutil.rmtree(path)
+    action = "would delete" if args.dry_run else "deleted"
+    print(f"{len(selected)} run dirs {action}")
+    return 0
+
+
+def wait_run(args: argparse.Namespace) -> int:
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.poll <= 0:
+        raise YoyoError("--poll must be greater than 0")
+    validate_run_id(args.run_id)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        run_dir = run_dir_for(args.run_id)
+        status = run_status(run_dir)
+        if status == "done":
+            return show_run(args.run_id, args.json, exit_with_result=True)
+        if status in ("dead", "unknown"):
+            if args.json:
+                meta = run_meta(run_dir)
+                print(json.dumps({"run_id": args.run_id, "status": status, "meta": meta}, ensure_ascii=False))
+            else:
+                eprint(f"run {args.run_id} status: {status}")
+            return 4
+        now = time.monotonic()
+        if now >= deadline:
+            if args.json:
+                print(json.dumps({"run_id": args.run_id, "status": "timeout"}, ensure_ascii=False))
+            else:
+                eprint(f"timed out waiting for run {args.run_id}")
+            return 124
+        time.sleep(min(args.poll, max(0.0, deadline - now)))
+
+
+def session_rows() -> list[dict[str, Any]]:
+    registry = read_session_registry()
+    rows: list[dict[str, Any]] = []
+    for key, record in registry["sessions"].items():
+        if not isinstance(record, dict):
+            continue
+        row = dict(record)
+        row["key"] = key
+        rows.append(row)
+    return sorted(rows, key=lambda row: (str(row.get("agent", "")), str(row.get("name", ""))))
+
+
+def list_sessions(args: argparse.Namespace) -> int:
+    rows = session_rows()
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no sessions found")
+        return 0
+    print(f"{'name':<24}  {'agent':<12}  {'backend_id':<36}  {'created_at':<20}  last_used")
+    for row in rows:
+        print(
+            f"{str(row.get('name') or ''):<24}  {str(row.get('agent') or ''):<12}  "
+            f"{str(row.get('backend_id') or ''):<36}  {str(row.get('created_at') or ''):<20}  "
+            f"{str(row.get('last_used') or '')}"
+        )
+    return 0
+
+
+def remove_session(args: argparse.Namespace) -> int:
+    if args.all and args.sessions_target:
+        raise YoyoError("sessions rm accepts either a key or --all, not both")
+    registry = read_session_registry()
+    if args.all:
+        registry["sessions"] = {}
+        write_session_registry(registry)
+        return 0
+    if not args.sessions_target:
+        raise YoyoError("sessions rm requires <agent>:<name> or --all")
+    key = args.sessions_target
+    if key not in registry["sessions"]:
+        raise YoyoError(f"Unknown session: {key}")
+    del registry["sessions"][key]
+    write_session_registry(registry)
+    return 0
+
+
+def cmd_sessions(args: argparse.Namespace) -> int:
+    action = args.sessions_action
+    if action == "list":
+        if args.sessions_target:
+            raise YoyoError("sessions list does not accept a session key")
+        if args.all:
+            raise YoyoError("sessions list does not accept --all")
+        return list_sessions(args)
+    if action == "rm":
+        if args.json:
+            raise YoyoError("sessions rm does not accept --json")
+        return remove_session(args)
+    raise YoyoError(f"Unknown sessions action: {action}")
 
 
 def list_agents(args: argparse.Namespace) -> int:
@@ -1606,6 +2264,11 @@ def list_skills(args: argparse.Namespace) -> int:
 
 
 def doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "live", False):
+        return doctor_live(args)
+    if args.agent or args.json or args.timeout is not None:
+        raise YoyoError("--agent, --json, and --timeout require doctor --live")
+
     agents = load_agents()
     failed = 0
     for name, spec in sorted(agents.items()):
@@ -1627,6 +2290,167 @@ def doctor(args: argparse.Namespace) -> int:
             print(f"source: invalid ({exc})")
     else:
         print(f"source: {source_path} (not recorded)")
+    return 1 if failed and args.strict else 0
+
+
+def doctor_agent_names(agents: dict[str, AgentSpec], requested: list[str] | None) -> list[str]:
+    if not requested:
+        return sorted(agents)
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for name in requested:
+        if name not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown agent {name!r}. Known agents: {known}")
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def doctor_supports_read_only(spec: AgentSpec) -> bool:
+    return spec.flavor in ("codex", "claude", "pi") or bool(spec.read_only_args)
+
+
+def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) -> argparse.Namespace:
+    mode = "read-only" if read_only else "full-access"
+    return argparse.Namespace(
+        cwd=str(cwd),
+        agent=agent,
+        read_only=read_only,
+        timeout=timeout,
+        max_output_bytes=DEFAULT_GATE_OUTPUT_BYTES,
+        model=None,
+        agent_arg=[],
+        session=None,
+        session_info=None,
+        dry_run=False,
+        json=False,
+        trace_id=f"doctor-{agent}-{mode}",
+        quiet=True,
+        idle_timeout=None,
+    )
+
+
+def doctor_missing_result(name: str, command: str) -> dict[str, Any]:
+    return {
+        "agent": name,
+        "mode": "missing",
+        "status": "missing",
+        "ok": False,
+        "exit_code": None,
+        "duration_s": 0.0,
+        "stderr_snippet": "",
+        "command": command,
+    }
+
+
+def doctor_skipped_result(name: str) -> dict[str, Any]:
+    return {
+        "agent": name,
+        "mode": "skipped",
+        "status": "skipped",
+        "ok": False,
+        "exit_code": None,
+        "duration_s": 0.0,
+        "stderr_snippet": "",
+        "reason": "no read_only_args",
+    }
+
+
+def doctor_run_probe(
+    name: str,
+    mode: str,
+    timeout: float,
+    agents: dict[str, AgentSpec],
+) -> dict[str, Any]:
+    read_only = mode == "read-only"
+    with tempfile.TemporaryDirectory(prefix="yoyo-doctor-") as tmp:
+        probe_args = doctor_probe_args(name, Path(tmp), timeout, read_only)
+        result = execute_agent_call(name, probe_args, "Reply with exactly: OK", agents)
+
+    stdout = str(result.get("stdout", ""))
+    ok = int(result["exit_code"]) == 0 and bool(stdout)
+    stderr = str(result.get("stderr", ""))
+    return {
+        "agent": name,
+        "mode": mode,
+        "status": "ok" if ok else "failed",
+        "ok": ok,
+        "exit_code": int(result["exit_code"]),
+        "duration_s": result["duration_s"],
+        "stderr_snippet": "" if ok else stderr[-500:],
+    }
+
+
+def doctor_probe_agent(name: str, spec: AgentSpec, timeout: float, agents: dict[str, AgentSpec]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if doctor_supports_read_only(spec):
+        rows.append(doctor_run_probe(name, "read-only", timeout, agents))
+    else:
+        rows.append(doctor_skipped_result(name))
+    rows.append(doctor_run_probe(name, "full-access", timeout, agents))
+    return rows
+
+
+def doctor_format_duration(value: float) -> str:
+    return f"{value:.1f}s"
+
+
+def doctor_print_live_report(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        status = row["status"]
+        if status == "missing":
+            print(f"{row['agent']}: missing ({row['command']})")
+        elif status == "skipped":
+            print(f"{row['agent']}: read-only skipped: {row['reason']}")
+        elif status == "ok":
+            print(f"{row['agent']}: {row['mode']} ok ({doctor_format_duration(float(row['duration_s']))})")
+        else:
+            line = (
+                f"{row['agent']}: {row['mode']} FAIL exit {row['exit_code']} "
+                f"({doctor_format_duration(float(row['duration_s']))})"
+            )
+            if row["stderr_snippet"]:
+                line += f": {row['stderr_snippet']}"
+            print(line)
+
+
+def doctor_live(args: argparse.Namespace) -> int:
+    timeout = 120.0 if args.timeout is None else args.timeout
+    if timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    args.timeout = timeout
+
+    agents = load_agents()
+    names = doctor_agent_names(agents, args.agent)
+    by_agent: dict[str, list[dict[str, Any]]] = {}
+    probe_names: list[str] = []
+    for name in names:
+        spec = agents[name]
+        if not shutil.which(spec.command[0]):
+            by_agent[name] = [doctor_missing_result(name, spec.command[0])]
+        else:
+            probe_names.append(name)
+
+    if probe_names:
+        max_workers = min(4, len(probe_names))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(doctor_probe_agent, name, agents[name], args.timeout, agents): name
+                for name in probe_names
+            }
+            for future in as_completed(futures):
+                by_agent[futures[future]] = future.result()
+
+    rows = [row for name in names for row in by_agent[name]]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        doctor_print_live_report(rows)
+
+    failed = any(row["status"] in ("failed", "missing") for row in rows)
     return 1 if failed and args.strict else 0
 
 
@@ -1736,8 +2560,10 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
     ask.add_argument("--write", action="store_false", dest="read_only", help=argparse.SUPPRESS)
     ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    ask.add_argument("--session", help="Use or create a named durable backend session")
     ask.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     ask.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
+    ask.add_argument("--background", action="store_true", help="Detach the ask run and record it in the run ledger")
     ask.set_defaults(func=run_agent, collect_unknown_prompt=True)
 
     chat = sub.add_parser("chat", help="Open an interactive session with another agent")
@@ -1747,6 +2573,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--model", help="Pass a model name to agents that support --model")
     chat.add_argument("--read-only", action="store_true", help="Constrain the target agent to read-only mode where supported")
     chat.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    chat.add_argument("--session", help="Use or create a named durable backend session")
     chat.add_argument("--dry-run", action="store_true", help="Print command without launching the agent")
     chat.set_defaults(func=chat_agent, collect_unknown_prompt=True)
 
@@ -1768,6 +2595,29 @@ def build_parser() -> argparse.ArgumentParser:
     workflow.add_argument("--dry-run", action="store_true", help="Render planned agent calls without launching them")
     workflow.set_defaults(func=run_workflow)
 
+    runs = sub.add_parser("runs", help="List, show, and prune background run records")
+    runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")
+    runs.add_argument("run_id", nargs="?")
+    runs.add_argument("--json", action="store_true")
+    runs.add_argument("--limit", type=int, default=20)
+    runs.add_argument("--days", type=int, default=7)
+    runs.add_argument("--dry-run", action="store_true")
+    runs.set_defaults(func=cmd_runs)
+
+    wait = sub.add_parser("wait", help="Wait for a background run to finish")
+    wait.add_argument("run_id")
+    wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    wait.add_argument("--poll", type=float, default=2.0)
+    wait.add_argument("--json", action="store_true")
+    wait.set_defaults(func=wait_run)
+
+    sessions = sub.add_parser("sessions", help="List and remove named backend session mappings")
+    sessions.add_argument("sessions_action", nargs="?", choices=["list", "rm"], default="list")
+    sessions.add_argument("sessions_target", nargs="?")
+    sessions.add_argument("--json", action="store_true")
+    sessions.add_argument("--all", action="store_true", help="Remove all recorded session mappings")
+    sessions.set_defaults(func=cmd_sessions)
+
     agents = sub.add_parser("agents", help="List configured agents")
     agents.add_argument("--json", action="store_true")
     agents.set_defaults(func=list_agents)
@@ -1778,6 +2628,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     diag = sub.add_parser("doctor", help="Check whether configured agent commands exist")
     diag.add_argument("--strict", action="store_true", help="Exit non-zero if any configured agent is missing")
+    diag.add_argument("--live", action="store_true", help="Run live smoke probes through found agent commands")
+    diag.add_argument("--agent", action="append", help="Probe only the named agent; repeatable")
+    diag.add_argument("--timeout", type=float, default=None, help="Per-probe timeout in seconds for --live (default 120)")
+    diag.add_argument("--json", action="store_true", help="Emit a JSON live doctor report")
     diag.set_defaults(func=doctor)
 
     skill = sub.add_parser("install-skill", help="Install the bundled yoyo coordination skill")
@@ -1795,9 +2649,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     parser = build_parser()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
         try:
-            args, extras = parser.parse_known_args(argv)
+            args, extras = parser.parse_known_args(raw_argv)
         except SystemExit as exc:
             return int(exc.code or 0) if isinstance(exc.code, int) else 2
         if extras:
@@ -1805,6 +2660,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.prompt.extend(extras)
             else:
                 raise YoyoError("unrecognized arguments: " + " ".join(extras))
+        args._raw_argv = raw_argv
         return int(args.func(args))
     except BrokenPipeError:
         return 141

@@ -130,6 +130,47 @@ yoyo chat codex --cwd "$PWD" "Help me debug this repo."
 yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
 ```
 
+## Background Runs
+
+A real review or worker task can outlive the calling agent's own tool budget. `--background` detaches the run and records it in a durable run ledger, so the caller returns immediately and collects the result later:
+
+```bash
+run_id=$(yoyo ask codex --role review --cwd "$PWD" --background "Audit the auth module.")
+yoyo runs list
+yoyo wait "$run_id"            # blocks until done, exits with the run's exit code
+yoyo runs show "$run_id" --json
+yoyo runs prune --days 7       # delete old finished runs
+```
+
+Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`): `meta.json` (agent, pid, trace id, argv), `result.json` (the standard JSON envelope), `log.txt` (stderr/heartbeats), and `stdin.txt` when context was piped. Status is derived, never stored: `done` (result.json parses), `running` (pid alive), `dead` (pid gone, no result). Argument validation still happens before detaching, so a bad agent name or cwd fails loudly in the foreground. One caveat inherent to pid-based liveness: if the OS recycles a dead child's pid, a crashed run can read as `running` until the impostor pid exits; `wait` then times out rather than reporting `dead`.
+
+## Sessions
+
+`yoyo ask` is one-shot by default. `--session <name>` gives a named durable conversation with the target agent — the first call creates it, later calls continue it with full context:
+
+```bash
+yoyo ask codex --session auth-review --role review --cwd "$PWD" "Review the auth changes."
+yoyo ask codex --session auth-review "Is the issue you flagged in middleware.py fixed by the latest commit?"
+yoyo sessions list
+yoyo sessions rm codex:auth-review
+```
+
+Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. Custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
+
+`--session` also works with `chat` for interactive follow-ups (codex chat can only resume an existing recorded session).
+
+## Live Doctor
+
+`yoyo doctor` checks that agent binaries exist. `yoyo doctor --live` goes further: it fires a real one-line probe through each found agent in both read-only and full-access mode, exercising the exact hardcoded flag paths yoyo depends on. Run it after upgrading claude/codex/pi to catch flag drift before it surfaces as a confusing mid-task failure:
+
+```bash
+yoyo doctor --live
+yoyo doctor --live --agent codex --timeout 60 --json
+yoyo doctor --live --strict   # exit 1 on any failed probe or missing agent
+```
+
+Probes run from a temporary directory, cost a few tokens each, and run in parallel across agents. Custom agents without `read_only_args` get their read-only probe skipped and reported as such.
+
 ## Workflows
 
 `yoyo workflow` runs a saved multi-agent workflow from a JSON spec. Use it when one agent call is not enough: fan out research across files, ask different agents/models for independent audits, run an implementation phase followed by a review phase, or cross-check several findings before acting.
