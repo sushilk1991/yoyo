@@ -224,35 +224,28 @@ Common workflow fields:
 - `context_bytes`: caps prior-output context injected into later jobs.
 - `skill`: skill name(s) injected into the job prompt as guidance (job, phase, or defaults level).
 - `retries`: re-run a job up to N extra times when it fails its exit code or `expect` contract.
-- `expect`: deterministic output contract (`contains` and/or `regex`) checked against job stdout.
-- `gates` (phase level): deterministic shell commands run after the phase's jobs.
+- `expect`: optional output marker check (`contains` and/or `regex`) against job stdout.
+- `gates` (phase level): optional shell commands run after the phase's jobs.
 
-## Deterministic Control Flow
+## Verification Hooks (opt-in)
 
-Agent output is nondeterministic; workflow control flow does not have to be. Three mechanisms keep a workflow's pass/fail decisions in code instead of in a model's judgment:
+Yoyo does not constrain or grade agent output by default. The calling agent states the output it wants in its prompt and judges the result itself — that judgment is what the model is for. Three opt-in hooks exist for the narrow cases where code, not a model, is the right verifier:
 
-**Gates** are shell commands attached to a phase. They run after all the phase's jobs succeed, in order, from the workflow `cwd` (or a gate-level `cwd`). The first failing gate stops the entire workflow with that gate's exit code, regardless of `--fail-fast`. If any job in the phase failed, gates are recorded as skipped. Use gates to verify agent work with real evidence — tests, linters, builds — before later phases consume it:
+**Gates** are shell commands attached to a phase. They never inspect agent output; they run real checks — tests, linters, builds — after all the phase's jobs succeed, in order, from the workflow `cwd` (or a gate-level `cwd`). The first failing gate stops the entire workflow with that gate's exit code, regardless of `--fail-fast`. If any job in the phase failed, gates are recorded as skipped. Use a gate when the question has a closed-form answer ("do the tests pass?"); do not delegate that question to another agent:
 
 ```json
 {
   "name": "implement",
   "jobs": [{"id": "fix", "role": "worker", "read_only": false, "prompt": "Fix the failing test."}],
-  "gates": [
-    {"name": "tests", "run": "python3 -m pytest -q"},
-    "ruff check ."
-  ]
+  "gates": [{"name": "tests", "run": "python3 -m pytest -q"}]
 }
 ```
 
-**`expect`** is a per-job output contract. If the agent exits 0 but its stdout is missing a required `contains` string or does not match `regex`, the job fails with exit code 3 and `output contract not met` in stderr. Pair it with a prompt that demands a fixed marker (for example "end with VERDICT: PASS or VERDICT: FAIL") to turn free-text agent output into something checkable:
+**`retries`** re-runs a job (same prompt) when it fails, up to N extra attempts. The JSON result records `attempts` per job. Use it for transient failures (crashes, rate limits, truncated runs).
 
-```json
-{"id": "verdict", "prompt": "... End with a line VERDICT: PASS or VERDICT: FAIL.", "expect": {"regex": "VERDICT: (PASS|FAIL)"}}
-```
+**`expect`** is a per-job stdout marker check. If the agent exits 0 but stdout is missing a `contains` string or does not match `regex`, the job fails with exit code 3 and `output contract not met` in stderr. Use it sparingly, and only for a marker the prompt explicitly told the agent to emit (for example "end with a line `VERDICT: PASS` or `VERDICT: FAIL`"). Never use it to grade free-form prose — a regex over an answer the agent phrased its own way produces false failures and pushes quality down, which is worse than no check at all. When in doubt, leave `expect` off and let the supervising agent read the output.
 
-**`retries`** re-runs a job (same prompt) when it fails its exit code or `expect` contract, up to N extra attempts. The JSON result records `attempts` per job. Retries make transient agent flakiness invisible to the rest of the workflow without weakening the contract.
-
-Misconfigured jobs — unknown skills, invalid `expect`, invalid gates — fail loudly when the spec is validated, before any agent call spends tokens.
+Misconfigured specs — unknown skills, invalid `expect`, invalid gates — fail loudly when the spec is validated, before any agent call spends tokens.
 
 Use `for_each` to fan out one job template:
 

@@ -106,14 +106,14 @@ Use `for_each` to fan out one job template:
 - Keep `max_concurrency` and `max_jobs` explicit for expensive workflows.
 - Do not use short workflow timeouts for real agent review; short caps are for smoke tests only. If a workflow review times out, report that the review was unavailable.
 
-## Deterministic Control Flow
+## Verification Hooks (opt-in)
 
-Keep pass/fail decisions in code, not in a model's judgment:
+By default yoyo does not constrain or grade agent output. You — the supervising agent — state the output you want in each job prompt and judge the results yourself; do not wrap jobs in rigid checks the task does not need. Three opt-in hooks exist for the narrow cases where code is the right verifier:
 
-- `gates` (phase level): shell commands run after all the phase's jobs succeed. The first failing gate stops the whole workflow with that gate's exit code. Put tests, linters, and builds here so later phases only run on verified work: `"gates": [{"name": "tests", "run": "python3 -m pytest -q"}]`.
-- `expect` (per job): an output contract checked against the job's stdout (`{"contains": [...], "regex": "..."}`). An agent that exits 0 but misses the contract fails with exit 3. Pair it with a prompt that demands a fixed marker, e.g. "End with VERDICT: PASS or VERDICT: FAIL" plus `"expect": {"regex": "VERDICT: (PASS|FAIL)"}`.
-- `retries` (per job): re-run a failing job (same prompt) up to N extra times. The result records `attempts`.
-- `skill` (per job, phase, or defaults): inject a named SKILL.md as guidance so the agent follows a known playbook — the main lever against unpredictable output for quality-sensitive work like frontend. Unknown skills fail loudly before any job runs.
+- `gates` (phase level): shell commands run after all the phase's jobs succeed. They never inspect agent output — they run real evidence checks (tests, linters, builds). The first failing gate stops the whole workflow with that gate's exit code. Use a gate when the question has a closed-form answer ("do the tests pass?") instead of asking another agent: `"gates": [{"name": "tests", "run": "python3 -m pytest -q"}]`.
+- `retries` (per job): re-run a failing job (same prompt) up to N extra times. The result records `attempts`. For transient failures, not for re-rolling answers you dislike.
+- `expect` (per job): a stdout marker check (`{"contains": [...], "regex": "..."}`); a job that exits 0 but misses it fails with exit 3. Use sparingly, and only for a marker the prompt explicitly demanded (e.g. "End with VERDICT: PASS or VERDICT: FAIL" plus `"expect": {"regex": "VERDICT: (PASS|FAIL)"}`). Never regex-grade free-form prose — that produces false failures and lowers quality. When in doubt, leave it off and read the output.
+- `skill` (per job, phase, or defaults): inject a named SKILL.md as guidance so the agent follows a known playbook for quality-sensitive work like frontend. Unknown skills fail loudly before any job runs.
 
 ## Agent Selection
 

@@ -1183,7 +1183,10 @@ def normalize_phase_gates(phase: dict[str, Any]) -> list[dict[str, Any]]:
         cwd = item.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
             raise YoyoError(f"Workflow gate {name!r} field 'cwd' must be a string")
-        gates.append({"name": name, "run": item["run"], "cwd": cwd, "timeout": item.get("timeout")})
+        timeout = item.get("timeout")
+        if timeout is not None:
+            coerce_float(timeout, default=1.0, field=f"gate {name!r} timeout")
+        gates.append({"name": name, "run": item["run"], "cwd": cwd, "timeout": timeout})
     return gates
 
 
@@ -1204,21 +1207,36 @@ def run_phase_gates(
             continue
         started = time.monotonic()
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 ["/bin/sh", "-c", gate["run"]],
                 cwd=str(cwd),
                 text=True,
-                capture_output=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=os.name == "posix",
             )
-            exit_code = proc.returncode
-            stdout, stderr = proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            exit_code = 124
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = f"gate timed out after {timeout}s"
         except FileNotFoundError as exc:
             raise YoyoError(f"Gate shell not found: {exc}") from exc
+        pgid: int | None = None
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except OSError:
+                pgid = None
+        if pgid is not None:
+            _register_child(pgid)
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+                exit_code = proc.returncode
+            except subprocess.TimeoutExpired:
+                _terminate_child(proc, pgid)
+                stdout, stderr = proc.communicate()
+                exit_code = 124
+                stderr = (stderr or "") + f"\ngate timed out after {timeout}s"
+        finally:
+            if pgid is not None:
+                _unregister_child(pgid)
         results.append(
             {
                 "name": gate["name"],
@@ -1408,7 +1426,12 @@ def run_workflow(args: argparse.Namespace) -> int:
             workflow_job_retries(spec, phase, job)
             workflow_job_expect(spec, phase, job)
             for skill_name in workflow_job_skills(spec, phase, job):
-                resolve_skill(skill_name)
+                skill_path = resolve_skill(skill_name)
+                positive_env_int("YOYO_SKILL_MAX_BYTES", DEFAULT_SKILL_MAX_BYTES)
+                try:
+                    read_limited_text(skill_path, 1)
+                except OSError as exc:
+                    raise YoyoError(f"Skill {skill_name!r} is not readable: {exc}") from exc
     total_jobs = sum(len(jobs) for _, jobs in expanded_phases)
     if total_jobs > max_jobs:
         raise YoyoError(f"Workflow expands to {total_jobs} jobs, above max_jobs={max_jobs}")
