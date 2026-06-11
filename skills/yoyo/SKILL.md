@@ -56,6 +56,8 @@ yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 10 --caller codex "Fix 
 
 Use `yoyo loop` instead of building your own iteration logic or running many rounds inside one ever-growing session. Each iteration is a brand-new fresh-context session of the target agent; continuity lives in a state file (default `.yoyo/loop-state.md`) that the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file next to it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. Iterations are recorded in the run ledger under one shared loop id, `--json` gives a final summary, and `--background` detaches the whole loop. This keeps per-iteration cost flat — one long looping session re-reads its entire growing context on every tool call and compounds cost; a fresh-context loop does not.
 
+Worker cost levers: a fresh `claude -p` session loads tens of thousands of tokens of harness context (system prompt, tools, user-level config — global CLAUDE.md, user skills) and re-reads it on every API call inside the iteration. For mechanical iteration work pass `--model sonnet` (Sonnet 4.6), or keep Opus and lower thinking with `--agent-arg=--effort=low`, and add `--agent-arg=--setting-sources=project` to drop user-level config from workers that are already steered by `--role`/`--skill`. Measured on one setup: the same one-iteration task cost $0.94 default vs $0.15 with the flag, on the same model — expect the ratio, not the exact numbers, to transfer.
+
 Follow-up session (continue a prior delegation with full context):
 
 ```bash
@@ -124,7 +126,14 @@ Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational
 - **Idle-timeout hang guard.** `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) kills the agent if it produces no output for that long. This is a better "truly hung" detector than the wall-clock cap, but only enable it for agents that stream output incrementally; an agent that buffers all output until the end would be killed falsely.
 - **stdin never blocks the caller.** yoyo reads stdin as context only when data is actually available, so an open-but-idle stdin (common when one agent shells out to another) can no longer hang the call before the agent starts. For a slow producer you genuinely want to pipe, use `--stdin-wait <seconds>`. Use `--no-stdin` to ignore stdin entirely.
 - **No orphans.** If yoyo is interrupted or killed (SIGINT/SIGTERM/SIGHUP), it terminates the nested agent's process group instead of leaving it running and burning tokens.
-- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your own shell/tool budget is shorter than the review needs, use `yoyo ask --background` and collect the result with `yoyo wait <run_id>` or `yoyo runs show <run_id>`, rather than raising `--timeout` and blocking. If a real review is cut off, report it as unavailable — never as passed.
+- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your shell tool yields or times out before a real agent call can finish — codex's exec tool yields after ~10–30 seconds, while a real review or worker call takes minutes — do NOT run `yoyo ask` in the foreground, do NOT conclude a still-running call "timed out", and do NOT kill it (that wastes every token it already spent). Detach instead:
+
+  ```bash
+  run_id=$(yoyo ask claude --role review --cwd "$PWD" --background "...")  # returns in <1s
+  yoyo wait "$run_id" --timeout 25   # 124 = still running, wait again; anything else = finished
+  ```
+
+  Each `yoyo wait` poll fits inside a short tool budget; repeat it only while it exits 124. Any other exit means the run finished: 0 = success (result on stdout), other non-zero = the delegated agent failed or died — inspect the output or `yoyo runs show <run_id> --json`, do not keep waiting. The same applies to `yoyo loop`: use `--background` and poll. Note that `claude -p` targets emit nothing until they finish, so "0 bytes captured" in the heartbeat is normal, not a hang. If a real review is cut off, report it as unavailable — never as passed.
 
 ## Coordination Protocol
 
