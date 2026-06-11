@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -624,18 +625,25 @@ def build_prompt(args: argparse.Namespace) -> str:
         and not _stdin_isatty()
     )
     stdin_context_used = False
+    raw_mode = bool(getattr(args, "raw", False))
     prompt_parts: list[str] = []
-    if args.role:
-        prompt_parts.append(ROLE_PROMPTS[args.role].strip())
+    if raw_mode:
+        # Verbatim pass-through, prompt first: a leading "/command" must reach
+        # the target CLI as the first token or it is never expanded.
+        if args.prompt:
+            prompt_parts.append(" ".join(args.prompt).strip())
+    else:
+        if args.role:
+            prompt_parts.append(ROLE_PROMPTS[args.role].strip())
 
-    scope = "read-only delegation" if args.read_only else "full-access delegation"
-    prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
+        scope = "read-only delegation" if args.read_only else "full-access delegation"
+        prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
 
     skills = getattr(args, "skill", None) or []
     if skills:
         prompt_parts.append(skill_prompt_block(list(skills)))
 
-    if args.prompt:
+    if not raw_mode and args.prompt:
         prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
 
     remaining_input = args.max_input_bytes
@@ -782,6 +790,13 @@ def command_for_agent(
 
 
 def validate_ask_args(args: argparse.Namespace) -> dict[str, AgentSpec]:
+    if getattr(args, "raw", False):
+        if args.role is not None:
+            raise YoyoError("--raw sends the prompt verbatim; it cannot be combined with --role")
+        if not args.prompt:
+            raise YoyoError("--raw requires positional prompt text")
+    elif getattr(args, "role", "absent") is None:
+        args.role = "opinion"
     agents = load_agents()
     if args.agent not in agents:
         known = ", ".join(sorted(agents))
@@ -2427,6 +2442,60 @@ def resolve_loop_state_path(args: argparse.Namespace) -> Path:
     return state
 
 
+def loop_task_sidecar(state_path: Path) -> Path:
+    return state_path.with_name(state_path.name + ".task")
+
+
+def guard_loop_state_task(state_path: Path, task: str) -> None:
+    """Refuse to reuse a state file recorded for a different task.
+
+    The sidecar holds the task verbatim because the agent rewrites the state
+    file itself, so the GOAL section in the state body cannot be trusted to
+    stay literal. A state file without a sidecar (hand-crafted) is accepted
+    and adopted when the loop seeds its metadata.
+    """
+    if not state_path.exists():
+        return
+    try:
+        recorded = loop_task_sidecar(state_path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return
+    if recorded and recorded != task:
+        raise YoyoError(
+            f"State file {state_path} belongs to a different loop task ({recorded[:80]!r}). "
+            "Pass --state with a new path, or delete the state file and its .task sidecar to start over."
+        )
+
+
+def acquire_loop_lock(state_path: Path) -> int:
+    """flock an adjacent lockfile so two loops cannot interleave one state file.
+
+    flock rather than a pid file: the kernel drops the lock when the holding
+    process dies, so stale locks cannot exist and there is no reclaim step to
+    race on. The lockfile itself is left in place by design — unlinking it
+    would reintroduce an inode-swap race between a finishing and a starting
+    loop. The pid inside is informational, for the lockout error message only.
+    """
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            holder = ""
+        os.close(fd)
+        suffix = f" (pid {holder})" if holder else ""
+        raise YoyoError(
+            f"Another loop{suffix} is already running against {state_path}; "
+            "stop it or pass a different --state path"
+        )
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    return fd
+
+
 def loop_state_done(state_path: Path) -> bool:
     try:
         text = state_path.read_text(encoding="utf-8", errors="replace")
@@ -2585,6 +2654,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
     # Fail loudly on flag problems (e.g. --read-only on a custom agent without
     # read_only_args) before seeding state or detaching.
     command_for_agent(spec, loop_iteration_args(args, 1, spec, task, state_path))
+    guard_loop_state_task(state_path, task)
 
     if args.dry_run:
         iter_args = loop_iteration_args(args, 1, spec, task, state_path)
@@ -2605,87 +2675,99 @@ def cmd_loop(args: argparse.Namespace) -> int:
         )
 
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    stop_path = state_path.parent / "STOP"
-    if not state_path.exists():
-        state_path.write_text(LOOP_STATE_SEED.format(task=task), encoding="utf-8")
-
-    eprint(f"loop {args.trace_id}: agent={args.agent} state={state_path} max_iter={args.max_iter} (touch {stop_path} to stop)")
-
-    total_cost = 0.0
-    cost_known = False
-    consecutive_failures = 0
-    iterations_run = 0
-    end_reason = "max-iter"
-    rows: list[dict[str, Any]] = []
-
-    for iteration in range(1, args.max_iter + 1):
+    lock_fd = acquire_loop_lock(state_path)
+    try:
+        stop_path = state_path.parent / "STOP"
         if stop_path.exists():
-            end_reason = "stop"
-            break
-        if loop_state_done(state_path):
-            end_reason = "done"
-            break
+            # STOP is a runtime kill switch for a running loop, not configuration;
+            # a leftover from an earlier loop must not end this one at 0 iterations.
+            stop_path.unlink()
+            eprint(f"loop {args.trace_id}: removed stale STOP file {stop_path}")
+        if not state_path.exists():
+            state_path.write_text(LOOP_STATE_SEED.format(task=task), encoding="utf-8")
+        sidecar = loop_task_sidecar(state_path)
+        if not sidecar.exists():
+            sidecar.write_text(task + "\n", encoding="utf-8")
 
-        iter_args = loop_iteration_args(args, iteration, spec, task, state_path)
-        prompt = build_prompt(iter_args)
-        started = utc_now()
-        result = execute_agent_call(args.agent, iter_args, prompt, agents)
-        iterations_run = iteration
+        eprint(f"loop {args.trace_id}: agent={args.agent} state={state_path} max_iter={args.max_iter} (touch {stop_path} to stop)")
 
-        cost: float | None = None
-        usage: dict[str, Any] = {}
-        extracted = extract_loop_usage(spec, str(result.get("stdout", "")))
-        if extracted is not None:
-            text, cost, usage = extracted
-            result["stdout"] = text
-            if cost is not None:
-                result["cost_usd"] = cost
-                total_cost += cost
-                cost_known = True
-            if usage:
-                result["usage"] = usage
+        total_cost = 0.0
+        cost_known = False
+        consecutive_failures = 0
+        iterations_run = 0
+        end_reason = "max-iter"
+        rows: list[dict[str, Any]] = []
 
-        if extracted is None and args.budget_usd is not None and loop_reports_cost(spec):
-            eprint(
-                f"warning: iteration {iteration} output was not a parseable cost envelope; "
-                "its cost is unknown and not counted toward --budget-usd"
+        for iteration in range(1, args.max_iter + 1):
+            if stop_path.exists():
+                end_reason = "stop"
+                break
+            if loop_state_done(state_path):
+                end_reason = "done"
+                break
+
+            iter_args = loop_iteration_args(args, iteration, spec, task, state_path)
+            prompt = build_prompt(iter_args)
+            started = utc_now()
+            result = execute_agent_call(args.agent, iter_args, prompt, agents)
+            iterations_run = iteration
+
+            cost: float | None = None
+            usage: dict[str, Any] = {}
+            extracted = extract_loop_usage(spec, str(result.get("stdout", "")))
+            if extracted is not None:
+                text, cost, usage = extracted
+                result["stdout"] = text
+                if cost is not None:
+                    result["cost_usd"] = cost
+                    total_cost += cost
+                    cost_known = True
+                if usage:
+                    result["usage"] = usage
+
+            if extracted is None and args.budget_usd is not None and loop_reports_cost(spec):
+                eprint(
+                    f"warning: iteration {iteration} output was not a parseable cost envelope; "
+                    "its cost is unknown and not counted toward --budget-usd"
+                )
+
+            run_id = record_loop_iteration_run(args, iter_args.trace_id, iteration, started, result)
+            ok = int(result.get("exit_code", 1)) == 0
+            consecutive_failures = 0 if ok else consecutive_failures + 1
+
+            tail_lines = [line for line in str(result.get("stdout", "")).splitlines() if line.strip()]
+            tail = tail_lines[-1].strip()[:120] if tail_lines else ""
+            duration = float(result.get("duration_s") or 0.0)
+            print_loop_iteration_line(args.json, iteration, ok, duration, cost, total_cost, usage, tail)
+            rows.append(
+                {
+                    "iteration": iteration,
+                    "run_id": run_id,
+                    "exit_code": int(result.get("exit_code", 1)),
+                    "duration_s": duration,
+                    "cost_usd": cost,
+                }
             )
 
-        run_id = record_loop_iteration_run(args, iter_args.trace_id, iteration, started, result)
-        ok = int(result.get("exit_code", 1)) == 0
-        consecutive_failures = 0 if ok else consecutive_failures + 1
-
-        tail_lines = [line for line in str(result.get("stdout", "")).splitlines() if line.strip()]
-        tail = tail_lines[-1].strip()[:120] if tail_lines else ""
-        duration = float(result.get("duration_s") or 0.0)
-        print_loop_iteration_line(args.json, iteration, ok, duration, cost, total_cost, usage, tail)
-        rows.append(
-            {
-                "iteration": iteration,
-                "run_id": run_id,
-                "exit_code": int(result.get("exit_code", 1)),
-                "duration_s": duration,
-                "cost_usd": cost,
-            }
-        )
-
-        # Post-iteration checks in the brief's priority order: an iteration that
-        # finishes the goal must report done even if it also crossed the budget
-        # or was itself a failure.
-        if stop_path.exists():
-            end_reason = "stop"
-            break
-        if loop_state_done(state_path):
-            end_reason = "done"
-            break
-        if args.budget_usd is not None and cost_known and total_cost >= args.budget_usd:
-            end_reason = "budget"
-            break
-        if consecutive_failures >= args.max_fail:
-            end_reason = "max-fail"
-            break
-        if args.interval and iteration < args.max_iter:
-            time.sleep(args.interval)
+            # Post-iteration checks in the brief's priority order: an iteration that
+            # finishes the goal must report done even if it also crossed the budget
+            # or was itself a failure.
+            if stop_path.exists():
+                end_reason = "stop"
+                break
+            if loop_state_done(state_path):
+                end_reason = "done"
+                break
+            if args.budget_usd is not None and cost_known and total_cost >= args.budget_usd:
+                end_reason = "budget"
+                break
+            if consecutive_failures >= args.max_fail:
+                end_reason = "max-fail"
+                break
+            if args.interval and iteration < args.max_iter:
+                time.sleep(args.interval)
+    finally:
+        os.close(lock_fd)
 
     exit_code = 1 if end_reason == "max-fail" else 0
     summary = {
@@ -2703,6 +2785,223 @@ def cmd_loop(args: argparse.Namespace) -> int:
     else:
         print(loop_summary_line(summary))
     return exit_code
+
+
+REVIEW_DIFF_PROMPT = """Review scope: {scope}.
+
+The unified diff below is the focus of this review. The repository at {cwd} is
+the source of truth: read surrounding code when the diff alone is ambiguous.
+Report findings ordered by severity with file/line references. If you find no
+issues, say so explicitly.
+
+<diff>
+{diff}
+</diff>"""
+
+
+REVIEW_SYNTHESIS_PROMPT = """You are consolidating {count} independent code reviews of the same diff, each
+produced by a different AI agent. Merge them into one review with two sections:
+
+1. CONSENSUS — findings raised by two or more reviewers (name the reviewers).
+2. SINGLE-REVIEWER — findings raised by exactly one reviewer; worth attention but unconfirmed.
+
+Drop pure style nits. If reviewers contradict each other, resolve the conflict
+from the diff when possible, otherwise flag the disagreement explicitly.
+Order findings by severity and keep file/line references.
+
+<diff>
+{diff}
+</diff>
+
+{reviews}"""
+
+
+def git_capture(cmd: list[str], cwd: Path) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, errors="replace")
+    except FileNotFoundError as exc:
+        raise YoyoError("git is required for yoyo review") from exc
+    return proc.returncode, proc.stdout
+
+
+def detect_review_base(cwd: Path) -> str:
+    code, out = git_capture(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd)
+    if code == 0 and out.strip():
+        return out.strip()
+    for candidate in ("main", "master"):
+        code, _ = git_capture(["git", "rev-parse", "--verify", "--quiet", candidate], cwd)
+        if code == 0:
+            return candidate
+    raise YoyoError("Could not detect a base branch; pass --base REF")
+
+
+def collect_review_diff(cwd: Path, base: str | None) -> tuple[str, str, list[str]]:
+    code, _ = git_capture(["git", "rev-parse", "--git-dir"], cwd)
+    if code != 0:
+        raise YoyoError(f"yoyo review requires a git repository at {cwd}")
+    code, listed = git_capture(["git", "ls-files", "--others", "--exclude-standard"], cwd)
+    untracked = [line for line in listed.splitlines() if line.strip()] if code == 0 else []
+    code, diff = git_capture(["git", "diff", "HEAD"], cwd)
+    if code == 0 and diff.strip():
+        return diff, "uncommitted changes (git diff HEAD)", untracked
+    resolved = base or detect_review_base(cwd)
+    code, diff = git_capture(["git", "diff", f"{resolved}...HEAD"], cwd)
+    if code != 0:
+        raise YoyoError(f"git diff {resolved}...HEAD failed; pass a valid --base")
+    if not diff.strip():
+        hint = f" ({len(untracked)} untracked files exist; git add them to make them reviewable)" if untracked else ""
+        raise YoyoError(f"Nothing to review: the working tree is clean and {resolved}...HEAD is empty{hint}")
+    return diff, f"committed changes ({resolved}...HEAD)", untracked
+
+
+def review_call_args(args: argparse.Namespace, agent_name: str, role: str | None, prompt_text: str, trace_suffix: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        cwd=str(resolve_cwd(args.cwd)),
+        agent=agent_name,
+        role=role,
+        read_only=True,
+        caller=args.caller,
+        trace_id=f"{args.trace_id}:{trace_suffix}",
+        timeout=args.timeout,
+        max_input_bytes=args.max_input_bytes,
+        max_output_bytes=args.max_output_bytes,
+        model=args.model,
+        agent_arg=None,
+        session=None,
+        session_info=None,
+        dry_run=args.dry_run,
+        quiet=args.quiet,
+        idle_timeout=None,
+        prompt=[prompt_text],
+        file=[],
+        skill=[],
+        use_stdin_context=False,
+    )
+
+
+def post_pr_comment(cwd: Path, body: str) -> None:
+    try:
+        proc = subprocess.run(["gh", "pr", "comment", "--body-file", "-"], cwd=str(cwd), input=body, text=True)
+    except FileNotFoundError as exc:
+        raise YoyoError("--pr requires the gh CLI on PATH") from exc
+    if proc.returncode != 0:
+        raise YoyoError(f"gh pr comment failed with exit code {proc.returncode}")
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    names = [item.strip() for item in args.agents.split(",") if item.strip()]
+    if not names:
+        raise YoyoError("--agents must name at least one agent")
+    if len(names) != len(set(names)):
+        raise YoyoError("--agents must not repeat an agent; consensus needs independent reviewers")
+    synthesizer = args.synthesizer or names[0]
+    for name in [*names, synthesizer]:
+        if name not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown agent {name!r}. Known agents: {known}")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    # Fail loudly before spending tokens if any reviewer cannot run read-only.
+    for name in {*names, synthesizer}:
+        command_for_agent(agents[name], review_call_args(args, name, "review", "probe", "probe"))
+
+    cwd = resolve_cwd(args.cwd)
+    diff, scope, untracked = collect_review_diff(cwd, args.base)
+    encoded = diff.encode("utf-8")
+    if len(encoded) > args.max_input_bytes:
+        diff = encoded[: args.max_input_bytes].decode("utf-8", errors="replace") + "\n[diff truncated by yoyo review]"
+        eprint(f"warning: diff truncated to --max-input-bytes={args.max_input_bytes}")
+
+    review_prompt = REVIEW_DIFF_PROMPT.format(scope=scope, cwd=cwd, diff=diff)
+    if untracked:
+        shown = untracked[:50]
+        more = f"\n... and {len(untracked) - len(shown)} more" if len(untracked) > len(shown) else ""
+        review_prompt += (
+            "\n\nUntracked files NOT included in the diff (read them in the repo if relevant to the change):\n"
+            + "\n".join(shown)
+            + more
+        )
+        eprint(f"warning: {len(untracked)} untracked files are not in the diff; reviewers are told to read them from the repo")
+    eprint(f"review {args.trace_id}: scope={scope} agents={','.join(names)} synthesizer={synthesizer}")
+
+    def run_reviewer(name: str) -> dict[str, Any]:
+        call_args = review_call_args(args, name, "review", review_prompt, name)
+        return execute_agent_call(name, call_args, build_prompt(call_args), agents)
+
+    if args.dry_run:
+        for name in names:
+            emit_dry_run_result(run_reviewer(name), args.json)
+        return 0
+
+    reviews: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        futures = {pool.submit(run_reviewer, name): index for index, name in enumerate(names)}
+        indexed: dict[int, dict[str, Any]] = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {"agent": names[index], "exit_code": 2, "stdout": "", "stderr": str(exc), "stderr_plain": str(exc)}
+            indexed[index] = result
+            status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
+            eprint(f"review {args.trace_id}: {names[index]} {status}")
+        reviews = [indexed[index] for index in range(len(names))]
+
+    successful = [r for r in reviews if int(r.get("exit_code", 1)) == 0 and str(r.get("stdout", "")).strip()]
+    failed = [r for r in reviews if r not in successful]
+    for result in failed:
+        eprint(f"review {args.trace_id}: {result.get('agent')} failed: {str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}")
+    if not successful:
+        eprint(f"review {args.trace_id}: all reviewers failed")
+        return 1
+
+    synthesis: dict[str, Any] | None = None
+    if len(successful) == 1:
+        final_text = str(successful[0]["stdout"]).strip()
+    else:
+        reviews_block = "\n\n".join(
+            f'<review agent="{r["agent"]}">\n{str(r["stdout"]).strip()}\n</review>' for r in successful
+        )
+        synth_prompt = REVIEW_SYNTHESIS_PROMPT.format(count=len(successful), diff=diff, reviews=reviews_block)
+        synth_args = review_call_args(args, synthesizer, None, synth_prompt, "synthesis")
+        synthesis = execute_agent_call(synthesizer, synth_args, build_prompt(synth_args), agents)
+        if int(synthesis.get("exit_code", 1)) == 0 and str(synthesis.get("stdout", "")).strip():
+            final_text = str(synthesis["stdout"]).strip()
+        else:
+            eprint(f"review {args.trace_id}: synthesis via {synthesizer} failed; printing the raw reviews instead")
+            final_text = "\n\n".join(
+                f"=== review by {r['agent']} ===\n{str(r['stdout']).strip()}" for r in successful
+            )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "trace_id": args.trace_id,
+                    "scope": scope,
+                    "agents": names,
+                    "reviews": reviews,
+                    "synthesis": synthesis,
+                    "review": final_text,
+                    "exit_code": 0,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(final_text)
+
+    if args.pr:
+        header = f"## yoyo review ({len(successful)} agents: {', '.join(r['agent'] for r in successful)})\n\n"
+        post_pr_comment(cwd, header + final_text)
+        eprint(f"review {args.trace_id}: posted PR comment via gh")
+    return 0
 
 
 def wait_run(args: argparse.Namespace) -> int:
@@ -3118,7 +3417,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask = sub.add_parser("ask", help="Call another agent non-interactively")
     ask.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
     ask.add_argument("prompt", nargs="*", help="Prompt text. Also accepts piped stdin.")
-    ask.add_argument("--role", choices=sorted(ROLE_PROMPTS), default="opinion")
+    ask.add_argument("--role", choices=sorted(ROLE_PROMPTS), default=None, help="Role preamble (default: opinion; incompatible with --raw)")
+    ask.add_argument(
+        "--raw",
+        action="store_true",
+        help="Send the prompt text verbatim with no role/context wrapper, so the target CLI sees a leading /command and can expand it",
+    )
     ask.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     ask.add_argument("--cwd", default=os.getcwd())
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
@@ -3238,6 +3542,27 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--dry-run", action="store_true", help="Print the composed iteration-1 command and prompt without running")
     loop.add_argument("--background", action="store_true", help="Detach the whole loop and record it in the run ledger")
     loop.set_defaults(func=cmd_loop, collect_unknown_prompt=True, file=[], use_stdin_context=False)
+
+    review = sub.add_parser("review", help="Cross-agent consensus review of the current git diff")
+    review.add_argument(
+        "--agents",
+        default="codex,claude",
+        help="Comma-separated reviewer agents run in parallel, each read-only (default: codex,claude)",
+    )
+    review.add_argument("--base", default=None, help="Base ref for the committed-changes diff when the tree is clean (default: auto-detect origin HEAD, then main, then master)")
+    review.add_argument("--synthesizer", default=None, help="Agent that merges the reviews into a consensus report (default: first of --agents)")
+    review.add_argument("--pr", action="store_true", help="Post the consolidated review as a GitHub PR comment via gh")
+    review.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    review.add_argument("--cwd", default=os.getcwd())
+    review.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))), help="Per-agent timeout in seconds")
+    review.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
+    review.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
+    review.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    review.add_argument("--model", help="Pass a model name to reviewer agents that support --model")
+    review.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
+    review.add_argument("--json", action="store_true", help="Emit a JSON result envelope with per-agent reviews and the synthesis")
+    review.add_argument("--dry-run", action="store_true", help="Print the reviewer commands and prompts without running them")
+    review.set_defaults(func=cmd_review)
 
     runs = sub.add_parser("runs", help="List, show, and prune background run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")

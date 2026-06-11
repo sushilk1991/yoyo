@@ -59,6 +59,14 @@ yoyo ask claude --role opinion "Challenge this design and list failure modes."
 
 `--role` defaults to `opinion`; specify `review` or `worker` when you want those behaviors.
 
+Pass a slash command through to the target CLI:
+
+```bash
+yoyo ask claude --raw "/goal ship the release"
+```
+
+`--raw` sends the positional prompt text verbatim with no role preamble, calling-context line, or `Task:` wrapper, so a leading `/command` arrives as the first token and the target CLI can expand it (Claude Code only treats a prompt as a slash command when it starts with `/`). It is mutually exclusive with `--role` and requires positional prompt text; piped stdin and `--file` context are still appended after the raw prompt. Whether a given CLI expands slash commands in non-interactive mode is the target CLI's behavior, not yoyo's — verify with `--dry-run` plus a cheap probe.
+
 By default, `yoyo ask` is one-shot, full-access, and configured not to ask follow-up permission prompts where the target agent supports that. Use `--read-only` for constrained review.
 When full-access mode includes piped stdin or `--file` context, `yoyo` prints a warning because that context may be untrusted.
 
@@ -155,9 +163,27 @@ Each iteration is a normal `ask`-style call: `--role` (defaults to `worker`), `-
 
 The loop ends on the first of: a `STOP` file next to the state file, `STATUS: DONE` in the state file, `--max-iter` (default 20), `--budget-usd` reached, or `--max-fail` consecutive failed iterations (default 3 — the only ending that exits 1; the rest exit 0). `--interval <seconds>` sleeps between iterations.
 
+Three guards protect the state file. A `<state>.task` sidecar records the task verbatim when the loop seeds state; starting a loop against a state file recorded for a *different* task fails loudly (same task resumes normally; pass a fresh `--state` path or delete both files to start over). A leftover `STOP` file from an earlier loop is deleted at startup with a notice — STOP is a runtime kill switch, not configuration, so touching it only stops a loop that is already running. And a `<state>.lock` file held via `flock` makes concurrent loops on the same state file impossible: the second loop exits with an error while the first holds the lock. The kernel releases the lock when the holding process exits — even on a crash — so stale locks cannot occur; the lockfile itself stays on disk by design and is harmless.
+
 Per-iteration cost is dominated by the agent harness's own context, re-read on every API call inside the iteration — a default `claude -p` session loads tens of thousands of tokens before any work happens (measured ~40k on one 2026-06 setup, ~17k of it user-level configuration — global CLAUDE.md, user skills; your numbers will vary with your config). Two levers cut it: `--model sonnet` (Sonnet 4.6) — or keep Opus and lower thinking with `--agent-arg=--effort=low` — for mechanical iteration work, and `--agent-arg=--setting-sources=project` to drop user-level configuration from workers that are already steered by `--role`/`--skill` (same setup, same model, same one-iteration task: $0.94 default vs $0.15 with the flag).
 
 For claude, iterations run with `--output-format json`, so each per-iteration console line reports real cost and token usage and `--budget-usd` is enforced. Agents that don't report cost (codex, pi, custom) get a one-time warning and no budget enforcement; a malformed envelope degrades to raw text with unknown cost rather than killing the loop, with a loud per-iteration warning when a budget is set (an iteration with unparseable cost is invisible to `--budget-usd`). Every iteration is recorded in the run ledger stamped with a shared loop id (`yoyo runs list` shows `loop_id:iteration`), and `--json` emits a final machine-readable summary. `yoyo loop ... --background` detaches the whole loop exactly like `ask --background`: `yoyo wait <run_id>` blocks on the loop itself, while iterations still get their own ledger entries. `--session` is rejected loudly — fresh context per iteration is the point.
+
+## Review
+
+`yoyo review` runs a cross-vendor consensus code review of the current git diff:
+
+```bash
+yoyo review --cwd "$PWD"                            # codex + claude review in parallel
+yoyo review --agents codex,claude,gemini --json     # three vendors, machine-readable envelope
+yoyo review --base main --pr                        # review committed work, post the result as a PR comment via gh
+```
+
+Each named agent reviews the same diff independently, in parallel, read-only, with `--role review`. If the working tree is dirty the diff is `git diff HEAD` (staged + unstaged); on a clean tree it is `<base>...HEAD`, where `--base` defaults to the auto-detected origin HEAD, then `main`, then `master`. The diff is the review focus; the repo at `--cwd` stays available as the source of truth. Untracked files are never part of a git diff, so they are listed in the review prompt (with a stderr warning) for reviewers to read from the repo — `git add` them to make them part of the reviewed diff itself.
+
+With two or more successful reviews, a synthesizer agent (`--synthesizer`, default: the first of `--agents`) merges them into one report split into **CONSENSUS** findings (raised by two or more reviewers) and **SINGLE-REVIEWER** findings — agreement across vendors is the signal that a finding is real. One reviewer failing is reported and the rest proceed; if synthesis fails the raw reviews are printed instead; only all reviewers failing exits non-zero. `--pr` posts the consolidated review as a GitHub PR comment through the `gh` CLI.
+
+Reviewers must support read-only mode (built-in agents do; custom agents need `read_only_args`). The diff is capped at `--max-input-bytes` with a loud truncation warning.
 
 ## Background Runs
 

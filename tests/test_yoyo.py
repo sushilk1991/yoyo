@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.10.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.11.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -2637,23 +2637,107 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(summary["end_reason"], "done")
             self.assertEqual(counter.read_text(encoding="utf-8"), "2")
 
-    def test_loop_stop_file_prevents_first_iteration(self):
+    def test_loop_removes_stale_stop_file_and_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             command, counter = self._counting_stub(tmp)
             loop_dir = Path(tmp) / ".yoyo"
             loop_dir.mkdir()
-            (loop_dir / "STOP").write_text("", encoding="utf-8")
+            stop = loop_dir / "STOP"
+            stop.write_text("", encoding="utf-8")
             env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
             code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--json", "never runs"],
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "runs despite leftover STOP"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("removed stale STOP file", stderr)
+            self.assertFalse(stop.exists())
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 1)
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+
+    def test_loop_stop_file_created_mid_run_stops_the_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stop = Path(tmp) / ".yoyo" / "STOP"
+            stop_body = (
+                f"stop = {str(stop)!r}\n"
+                "if calls == 2:\n"
+                "    open(stop, 'w').write('')\n"
+            )
+            command, counter = self._counting_stub(tmp, stop_body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--json", "stop midway"],
                 env=env,
             )
 
             self.assertEqual(code, 0, stderr)
             summary = json.loads(stdout)
-            self.assertEqual(summary["iterations"], 0)
+            self.assertEqual(summary["iterations"], 2)
             self.assertEqual(summary["end_reason"], "stop")
-            self.assertFalse(counter.exists())
+            self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+
+    def test_loop_refuses_state_file_recorded_for_a_different_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, counter = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "task one"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "task two"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("different loop task", stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+
+            # Same task resumes against the same state file without complaint.
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "task one"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+
+    def test_loop_lock_blocks_concurrent_loop_and_releases_on_exit(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            command, counter = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            lock = Path(tmp) / ".yoyo" / "loop-state.md.lock"
+            lock.parent.mkdir()
+
+            # While another holder flocks the lockfile, a second loop is refused.
+            holder = os.open(lock, os.O_CREAT | os.O_RDWR)
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                code, _, stderr = self.run_cli(
+                    ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "locked out"],
+                    env=env,
+                )
+                self.assertEqual(code, 2)
+                self.assertIn("already running", stderr)
+                self.assertFalse(counter.exists())
+            finally:
+                os.close(holder)
+
+            # Once the holder exits the kernel releases the flock; a leftover
+            # lockfile on disk alone is not a lock (no stale-pid reclaim races).
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "locked out"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+            self.assertTrue(lock.exists())
 
     def test_loop_seeds_state_file_and_does_not_clobber_existing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2910,6 +2994,245 @@ class YoyoTests(unittest.TestCase):
             code, stdout, stderr = self.run_cli(["runs", "show", run_id], env=env)
             self.assertEqual(code, 0, stderr)
             self.assertIn("loop bg-loop: max-iter after 2 iterations", stdout)
+
+
+    def test_ask_raw_sends_prompt_verbatim_with_no_wrapper(self):
+        env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\""}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "echo", "--raw", "/goal ship the release"],
+            env=env,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(stdout.startswith("/goal ship the release"), stdout)
+        self.assertNotIn("Calling context", stdout)
+        self.assertNotIn("Task:", stdout)
+        self.assertNotIn("second-opinion", stdout)
+
+    def test_ask_raw_rejects_role_and_requires_prompt(self):
+        env = {"YOYO_AGENT_ECHO": "cat"}
+        code, _, stderr = self.run_cli(
+            ["ask", "echo", "--raw", "--role", "review", "/cmd"],
+            env=env,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be combined with --role", stderr)
+
+        code, _, stderr = self.run_cli(["ask", "echo", "--raw"], env=env)
+        self.assertEqual(code, 2)
+        self.assertIn("requires positional prompt text", stderr)
+
+    def _review_repo(self, tmp, *, dirty=True):
+        import subprocess as sp
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        run = lambda *cmd: sp.run(cmd, cwd=repo, check=True, capture_output=True)
+        run("git", "init", "-q", "-b", "main")
+        run("git", "config", "user.email", "test@example.com")
+        run("git", "config", "user.name", "Test")
+        target = repo / "app.py"
+        target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        run("git", "add", "app.py")
+        run("git", "commit", "-q", "-m", "init")
+        if dirty:
+            target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+        return repo
+
+    def _review_config(self, tmp, outputs):
+        """Configure stub reviewer agents with read_only_args so --read-only works."""
+        agents = {}
+        for name, text in outputs.items():
+            body = f"import sys\nsys.stdin.read()\nprint({text!r})\n"
+            command = self._loop_stub_command(tmp, body, name=f"{name}.py")
+            agents[name] = {"command": shlex.split(command), "read_only_args": ["--ro"]}
+        echo_body = "import sys\nsys.stdout.write(sys.stdin.read())\n"
+        echo_command = self._loop_stub_command(tmp, echo_body, name="merge.py")
+        agents["merge"] = {"command": shlex.split(echo_command), "read_only_args": ["--ro"]}
+        config = Path(tmp) / "review-agents.json"
+        config.write_text(json.dumps({"agents": agents}), encoding="utf-8")
+        return config
+
+    def test_review_fans_out_and_synthesizes_consensus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "review-one findings", "r2": "review-two findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1,r2", "--synthesizer", "merge", "--json"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["agents"], ["r1", "r2"])
+            self.assertEqual(len(payload["reviews"]), 2)
+            self.assertIn("uncommitted changes", payload["scope"])
+            # The echo synthesizer reflects its prompt: both reviews and the
+            # consensus instructions must be in there.
+            self.assertIn('<review agent="r1">', payload["review"])
+            self.assertIn("review-one findings", payload["review"])
+            self.assertIn("review-two findings", payload["review"])
+            self.assertIn("CONSENSUS", payload["review"])
+            self.assertIn("return a - b", payload["review"])
+
+    def test_review_single_agent_skips_synthesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "solo findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--json"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIsNone(payload["synthesis"])
+            self.assertEqual(payload["review"], "solo findings")
+
+    def test_review_falls_back_to_raw_reviews_when_synthesis_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "alpha finding", "r2": "beta finding"})
+            agents = json.loads(Path(config).read_text(encoding="utf-8"))
+            fail_command = self._loop_stub_command(tmp, "import sys\nsys.stdin.read()\nsys.exit(3)\n", name="broken.py")
+            agents["agents"]["broken"] = {"command": shlex.split(fail_command), "read_only_args": ["--ro"]}
+            Path(config).write_text(json.dumps(agents), encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1,r2", "--synthesizer", "broken"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("synthesis via 'broken' failed".replace("'", ""), stderr.replace("'", ""))
+            self.assertIn("=== review by r1 ===", stdout)
+            self.assertIn("alpha finding", stdout)
+            self.assertIn("beta finding", stdout)
+
+    def test_review_continues_when_one_reviewer_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "alpha finding"})
+            agents = json.loads(Path(config).read_text(encoding="utf-8"))
+            fail_command = self._loop_stub_command(tmp, "import sys\nsys.stdin.read()\nsys.exit(3)\n", name="broken.py")
+            agents["agents"]["broken"] = {"command": shlex.split(fail_command), "read_only_args": ["--ro"]}
+            Path(config).write_text(json.dumps(agents), encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1,broken", "--json"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("broken failed", stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["review"], "alpha finding")
+            self.assertIsNone(payload["synthesis"])
+
+    def test_review_all_reviewers_failing_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {})
+            agents = json.loads(Path(config).read_text(encoding="utf-8"))
+            fail_command = self._loop_stub_command(tmp, "import sys\nsys.stdin.read()\nsys.exit(3)\n", name="broken.py")
+            agents["agents"]["broken"] = {"command": shlex.split(fail_command), "read_only_args": ["--ro"]}
+            Path(config).write_text(json.dumps(agents), encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "broken"],
+                env=env,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("all reviewers failed", stderr)
+
+    def test_review_clean_tree_uses_base_range_and_empty_range_errors(self):
+        import subprocess as sp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp, dirty=False)
+            config = self._review_config(tmp, {"r1": "range findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+
+            code, _, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--base", "main"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Nothing to review", stderr)
+
+            run = lambda *cmd: sp.run(cmd, cwd=repo, check=True, capture_output=True)
+            run("git", "checkout", "-q", "-b", "feature")
+            (repo / "app.py").write_text("def add(a, b):\n    return a + b + 0\n", encoding="utf-8")
+            run("git", "commit", "-q", "-am", "tweak")
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--base", "main", "--json"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["scope"], "committed changes (main...HEAD)")
+            self.assertEqual(payload["review"], "range findings")
+
+    def test_review_dry_run_prints_commands_without_executing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "never printed"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--dry-run"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("r1.py", stdout)
+            self.assertIn("--ro", stdout)
+            self.assertIn("Review scope: uncommitted changes", stdout)
+            self.assertNotIn("never printed", stdout)
+
+    def test_review_lists_untracked_files_in_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            (repo / "brand_new.py").write_text("print('new')\n", encoding="utf-8")
+            config = self._review_config(tmp, {"r1": "findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--dry-run"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("Untracked files NOT included in the diff", stdout)
+            self.assertIn("brand_new.py", stdout)
+            self.assertIn("untracked files are not in the diff", stderr)
+
+    def test_review_untracked_only_error_hints_at_git_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp, dirty=False)
+            (repo / "brand_new.py").write_text("print('new')\n", encoding="utf-8")
+            config = self._review_config(tmp, {"r1": "findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--base", "main"],
+                env=env,
+            )
+
+            self.assertEqual(code, 2)
+            self.assertIn("Nothing to review", stderr)
+            self.assertIn("untracked files exist", stderr)
+
+    def test_review_rejects_unknown_and_duplicate_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            code, _, stderr = self.run_cli(["review", "--cwd", str(repo), "--agents", "nope"])
+            self.assertEqual(code, 2)
+            self.assertIn("Unknown agent", stderr)
+
+            code, _, stderr = self.run_cli(["review", "--cwd", str(repo), "--agents", "claude,claude"])
+            self.assertEqual(code, 2)
+            self.assertIn("must not repeat", stderr)
 
 
 if __name__ == "__main__":

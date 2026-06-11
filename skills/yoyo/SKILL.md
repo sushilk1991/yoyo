@@ -47,7 +47,20 @@ yoyo ask codex --session auth-review "Is the middleware.py issue you flagged fix
 
 # Interactive (only when a human or supervising agent is present to respond)
 yoyo chat claude --cwd "$PWD" "Help me debug this repo."
+
+# Slash-command pass-through: --raw sends the prompt verbatim (no role/context
+# wrapper) so the target CLI sees the leading /command and can expand it
+yoyo ask claude --raw "/goal ship the release"
 ```
+
+## Consensus review
+
+```bash
+yoyo review --cwd "$PWD" --caller claude                 # codex + claude review the current diff in parallel
+yoyo review --agents codex,claude,gemini --base main --json
+```
+
+`yoyo review` reviews the current git diff (uncommitted changes if the tree is dirty, otherwise `--base...HEAD`) with each named agent independently, read-only, in parallel, then a synthesizer agent (default: first of `--agents`) merges them into CONSENSUS findings (raised by ≥2 reviewers — the trustworthy ones) and SINGLE-REVIEWER findings (unconfirmed). Prefer it over hand-rolled fan-out when reviewing a diff before commit/PR; `--pr` posts the result as a GitHub PR comment via `gh`. Treat consensus findings as worth verifying first, not as automatically true.
 
 ## Background runs and timeouts
 
@@ -69,6 +82,8 @@ yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 10 --caller codex "Fix 
 ```
 
 Use `yoyo loop` instead of grinding many rounds inside one ever-growing session: a long session re-reads its whole context on every call and cost compounds; a loop runs each iteration as a brand-new fresh-context session. Continuity lives in a state file (default `.yoyo/loop-state.md`) the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file beside it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. `--background` detaches the whole loop; poll with `yoyo wait` as above.
+
+State-file guards: reusing a state file recorded for a different task fails loudly (pass a fresh `--state` path per task, or delete the state file and its `.task` sidecar to start over); a leftover `STOP` file is cleared at startup; a flock-held `.lock` file rejects a second concurrent loop on the same state file and releases automatically when the holding process exits.
 
 Worker cost levers: a fresh `claude -p` session re-reads tens of thousands of tokens of harness context on every API call. For mechanical iteration work pass `--model sonnet` (Sonnet 4.6) or keep Opus and lower thinking with `--agent-arg=--effort=low`; add `--agent-arg=--setting-sources=project` to drop user-level config from workers already steered by `--role`/`--skill` (one measured setup: $0.94 → $0.15 per iteration — expect the ratio, not the numbers, to transfer).
 
