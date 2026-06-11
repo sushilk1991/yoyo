@@ -1,196 +1,81 @@
 ---
 name: yoyo
-description: Use this skill when an agent should call Codex, Claude, Pi, or another configured CLI agent as a subagent, worker, reviewer, or second-opinion partner using the yoyo command-line tool. Use it for multi-agent coordination, independent review, scoped delegation, adversarial checks, and agent-to-agent handoffs.
+description: Delegates tasks to Codex, Claude, Pi, or other configured CLI agents as subagents, reviewers, workers, or second-opinion partners via the yoyo CLI. Use for multi-agent coordination, independent code review, scoped delegation, adversarial checks, fresh-context loops, and agent-to-agent handoffs.
 ---
 
 # Yoyo Multi-Agent Coordination
 
-Use `yoyo` to call another CLI agent as a subprocess or interactive session. Treat the other agent as a worker or reviewer, not as an oracle. Its output is evidence to verify.
+`yoyo` calls another CLI agent as a subprocess or interactive session. Treat the target agent's output as evidence to verify, not as an oracle.
 
-## Quick Commands
+## Core commands
 
-`yoyo ask` is one-shot by default. It also defaults to full-access/no-approval mode where the target agent supports that, so agent-to-agent work does not stop for permission prompts. Use `--read-only` for constrained review.
-
-`--role` defaults to `opinion`. Set `--role review` or `--role worker` explicitly when you want bug finding or delegated implementation.
-
-Second opinion:
+`yoyo ask` is one-shot and defaults to full-access/no-approval mode where the target agent supports that, so agent-to-agent work doesn't stop at permission prompts; use `--read-only` for reviews or untrusted input. `--role` defaults to `opinion`; set `review` or `worker` explicitly.
 
 ```bash
+# Second opinion
 yoyo ask claude --role opinion --caller codex "Challenge this plan. What can fail?"
-```
 
-Code review with explicit context:
+# Code review (read-only; the repo, not the prompt, is the source of truth)
+yoyo ask codex --role review --read-only --cwd "$PWD" --file src/main.ts --caller claude "Review this change for bugs. Inspect the repo as needed."
 
-```bash
-yoyo ask codex --role review --cwd "$PWD" --file src/main.ts --caller claude "Review this change for bugs. Inspect the repo as needed."
-```
-
-Scoped worker with write access:
-
-```bash
+# Scoped worker with write access
 yoyo ask pi --role worker --cwd "$PWD" --caller codex "Fix the failing test in tests/foo_test.py. Do not touch unrelated files."
-```
 
-Steered worker (skill injection):
-
-```bash
+# Steered worker: inject a SKILL.md into the prompt when raw output would be
+# too unpredictable (discover names with: yoyo skills; missing names fail loudly)
 yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design --caller claude "Build the settings page. Keep the change minimal."
+
+# Follow-up session — target keeps its prior context across calls
+yoyo ask codex --session auth-review --role review --cwd "$PWD" "Review the auth changes."
+yoyo ask codex --session auth-review "Is the middleware.py issue you flagged fixed now?"
+
+# Interactive (only when a human or supervising agent is present to respond)
+yoyo chat claude --cwd "$PWD" "Help me debug this repo."
 ```
 
-`--skill <name>` (repeatable) injects a named `SKILL.md` into the delegated prompt. Use it whenever the target agent's raw output is too unpredictable for the task: the skill pins down conventions, quality bars, and output shape while your prompt states the task. Discover names with `yoyo skills`. Skills resolve from `YOYO_SKILL_PATH`, then the standard agent skill directories (`~/.claude/skills`, `~/.codex/skills`, ...); a missing skill fails loudly before any tokens are spent.
+## Background runs and timeouts
 
-Background delegation (when your own tool budget is shorter than the task):
+A real review or worker call takes minutes. If your own tool budget yields sooner (codex's exec tool yields after ~10–30s), detach instead of running it foreground — and never kill a still-running call (that wastes every token it already spent) or report it as "timed out":
 
 ```bash
-run_id=$(yoyo ask codex --role review --cwd "$PWD" --background "Audit the auth module.")
-yoyo wait "$run_id"        # or poll later: yoyo runs show "$run_id" --json
+run_id=$(yoyo ask claude --role review --cwd "$PWD" --background "...")   # returns in <1s
+yoyo wait "$run_id" --timeout 25
 ```
 
-Prefer `--background` + `yoyo wait`/`yoyo runs show` over raising `--timeout` and blocking, and over abandoning a long review. The run ledger (`yoyo runs list`) keeps every background result auditable after the fact.
+`yoyo wait` exit codes: 124 = still running, wait again; 0 = success, result on stdout; anything else = the run failed or died — inspect `yoyo runs show <run_id> --json`, do not keep waiting. A `claude -p` target emits nothing until it finishes, so a heartbeat reading "0 bytes captured" is normal, not a hang. Every background run lands in the ledger (`yoyo runs list`).
 
-Fresh-context loop (iterative work — fix tests one by one, migrate files in batches, grind down a checklist):
+The default `--timeout` is one hour of wall clock — an orphan guard, not a progress budget. A short timeout turns valid long-running work into a false failure; if a review is cut off, report it as unavailable, never as passed. `--idle-timeout` kills on output silence and suits only agents that stream incrementally (a buffering target like `claude -p` would be killed falsely).
+
+## Loops (iterative work at flat cost)
 
 ```bash
 yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 10 --caller codex "Fix the failing tests, one per iteration."
 ```
 
-Use `yoyo loop` instead of building your own iteration logic or running many rounds inside one ever-growing session. Each iteration is a brand-new fresh-context session of the target agent; continuity lives in a state file (default `.yoyo/loop-state.md`) that the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file next to it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. Iterations are recorded in the run ledger under one shared loop id, `--json` gives a final summary, and `--background` detaches the whole loop. This keeps per-iteration cost flat — one long looping session re-reads its entire growing context on every tool call and compounds cost; a fresh-context loop does not.
+Use `yoyo loop` instead of grinding many rounds inside one ever-growing session: a long session re-reads its whole context on every call and cost compounds; a loop runs each iteration as a brand-new fresh-context session. Continuity lives in a state file (default `.yoyo/loop-state.md`) the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file beside it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. `--background` detaches the whole loop; poll with `yoyo wait` as above.
 
-Worker cost levers: a fresh `claude -p` session loads tens of thousands of tokens of harness context (system prompt, tools, user-level config — global CLAUDE.md, user skills) and re-reads it on every API call inside the iteration. For mechanical iteration work pass `--model sonnet` (Sonnet 4.6), or keep Opus and lower thinking with `--agent-arg=--effort=low`, and add `--agent-arg=--setting-sources=project` to drop user-level config from workers that are already steered by `--role`/`--skill`. Measured on one setup: the same one-iteration task cost $0.94 default vs $0.15 with the flag, on the same model — expect the ratio, not the exact numbers, to transfer.
+Worker cost levers: a fresh `claude -p` session re-reads tens of thousands of tokens of harness context on every API call. For mechanical iteration work pass `--model sonnet` (Sonnet 4.6) or keep Opus and lower thinking with `--agent-arg=--effort=low`; add `--agent-arg=--setting-sources=project` to drop user-level config from workers already steered by `--role`/`--skill` (one measured setup: $0.94 → $0.15 per iteration — expect the ratio, not the numbers, to transfer).
 
-Follow-up session (continue a prior delegation with full context):
+## Delegation protocol
 
-```bash
-yoyo ask codex --session auth-review --role review --cwd "$PWD" "Review the auth changes."
-yoyo ask codex --session auth-review "Is the middleware.py issue you flagged fixed now?"
-```
-
-Use `--session <name>` whenever you expect to ask the same agent follow-up questions; it avoids re-sending context and the target agent keeps its prior reasoning. `yoyo sessions list` shows recorded sessions.
-
-Interactive session:
-
-```bash
-yoyo chat claude --cwd "$PWD" "Help me debug this repo."
-```
-
-Generate a real image (diagrams for plans, explainer illustrations) via codex's native GPT-image tool:
-
-```bash
-yoyo imagegen "Hand-drawn flowchart, boxes labeled 'PLAN', 'BUILD', 'REVIEW', white background. No other text." --out flow.png --size 1536x1024 --quality high
-```
-
-Yoyo verifies the output is a real image file (magic bytes, size, freshness) and the prompt forbids code-drawn fakes. See the `yoyo-imagegen` skill for prompt recipes.
-
-Inspect setup:
-
-```bash
-yoyo doctor
-yoyo doctor --live   # real probes through every agent's read-only and full-access flag paths; run after CLI upgrades
-yoyo agents
-yoyo skills
-```
-
-Update the installed CLI and skills from the recorded source checkout:
-
-```bash
-yoyo update
-```
-
-Use `yoyo update --no-pull` to reinstall from the current recorded checkout without fetching.
-
-Run a reusable multi-agent workflow (path or bundled template name):
-
-```bash
-yoyo workflow --list
-yoyo workflow cross-review --input "review the current branch diff" --json
-yoyo workflow ./workflow.json --input "audit this change" --json
-```
-
-Trace/debug a delegation:
-
-```bash
-yoyo ask claude --trace-id "$USER-auth-review" --json "Review this plan."
-```
-
-## Timeout Discipline
-
-Agent calls default to a one-hour wall-clock timeout. It exists only to prevent orphaned or truly hung subprocesses; it is not a progress budget for real agent work.
-
-Do not add short ad hoc timeouts to real reviews, audits, or worker delegations. A three-minute cap can turn a valid long-running review into a false failure. Use short `--timeout` values only for deterministic smoke tests with fake or trivial agents.
-
-Use `--timeout` or `YOYO_TIMEOUT` only when the task has an explicit operational reason for a shorter or longer cap. If a real review times out, report it as an unavailable review, not as a passed or failed review.
-
-### Liveness, hangs, and "stuck" calls
-
-- **Progress heartbeat.** Long calls print a periodic `yoyo: still running, Ns elapsed, M bytes captured` line to stderr so a working agent is not mistaken for a hung one. Disable with `--quiet` or `YOYO_HEARTBEAT_SECS=0`; change the interval with `YOYO_HEARTBEAT_SECS=<seconds>`.
-- **Idle-timeout hang guard.** `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) kills the agent if it produces no output for that long. This is a better "truly hung" detector than the wall-clock cap, but only enable it for agents that stream output incrementally; an agent that buffers all output until the end would be killed falsely.
-- **stdin never blocks the caller.** yoyo reads stdin as context only when data is actually available, so an open-but-idle stdin (common when one agent shells out to another) can no longer hang the call before the agent starts. For a slow producer you genuinely want to pipe, use `--stdin-wait <seconds>`. Use `--no-stdin` to ignore stdin entirely.
-- **No orphans.** If yoyo is interrupted or killed (SIGINT/SIGTERM/SIGHUP), it terminates the nested agent's process group instead of leaving it running and burning tokens.
-- **Caller tool budgets.** A heartbeat does not extend the timeout of whatever tool invoked yoyo. If your shell tool yields or times out before a real agent call can finish — codex's exec tool yields after ~10–30 seconds, while a real review or worker call takes minutes — do NOT run `yoyo ask` in the foreground, do NOT conclude a still-running call "timed out", and do NOT kill it (that wastes every token it already spent). Detach instead:
-
-  ```bash
-  run_id=$(yoyo ask claude --role review --cwd "$PWD" --background "...")  # returns in <1s
-  yoyo wait "$run_id" --timeout 25   # 124 = still running, wait again; anything else = finished
-  ```
-
-  Each `yoyo wait` poll fits inside a short tool budget; repeat it only while it exits 124. Any other exit means the run finished: 0 = success (result on stdout), other non-zero = the delegated agent failed or died — inspect the output or `yoyo runs show <run_id> --json`, do not keep waiting. The same applies to `yoyo loop`: use `--background` and poll. Note that `claude -p` targets emit nothing until they finish, so "0 bytes captured" in the heartbeat is normal, not a hang. If a real review is cut off, report it as unavailable — never as passed.
-
-## Coordination Protocol
-
-1. Define the success criterion before delegating.
-2. Pick the narrowest role:
-   - `opinion`: challenge reasoning or architecture.
-   - `review`: find concrete bugs and missing tests.
-   - `worker`: do a bounded implementation task.
-3. Pass only the context needed. Prefer `--file` for exact artifacts and a short prompt for the ask.
-   For quality-sensitive work (frontend, design, testing conventions), add `--skill <name>` so the worker follows a known playbook instead of improvising.
-4. Use default full access for trusted automation or worker tasks. Use `--read-only` for reviews, second opinions, or untrusted prompts.
-5. Verify the result yourself. Run tests, inspect diffs, and reconcile disagreements before acting.
-6. For long or noisy tasks, set `--trace-id` and consider `--max-output-bytes` so failures are auditable and output cannot grow without bound. Do not set short timeouts for real agent review.
-7. For large diffs or generated files, use `--max-input-bytes`; yoyo applies it as an aggregate cap across stdin and `--file` context.
-8. For many related agent calls, prefer `yoyo workflow` with a checked spec over ad hoc manual fan-out. Dry-run the workflow before spending tokens.
-
-## Good Delegation Prompts
-
-Ask for falsification:
-
-```bash
-yoyo ask claude --role opinion --file plan.md "Find the strongest reason this plan is wrong. Do not rewrite it."
-```
-
-Ask for focused implementation:
-
-```bash
-yoyo ask codex --role worker --file tests/test_cli.py "Make this test pass with the smallest production change."
-```
-
-Ask for review after edits:
-
-```bash
-git diff -- src tests | yoyo ask pi --role review --cwd "$PWD" "Review this diff for correctness issues. Use the current worktree as the source of truth."
-```
+1. Define the success criterion before delegating, and pick the narrowest role: `opinion` to challenge reasoning, `review` to find bugs, `worker` for a bounded implementation task.
+2. Pass only the context needed: `--file` for exact artifacts, `--cwd "$PWD"` for repo work (pipe `git diff` only as supplemental focus, not the only context), `--skill` for quality-sensitive output.
+3. Prompt for falsification, not validation: "Find the strongest reason this plan is wrong" beats "review my plan".
+4. Verify the result yourself — run tests, inspect diffs. If two agents disagree, identify the factual claim that would settle it and inspect code, docs, or live state directly.
+5. After a target returns, note what it claimed, what you verified, and what you rejected; never present its output as confirmed unless independently verified.
 
 ## Guardrails
 
-- Do not delegate deterministic work that a script or test can answer.
-- Do not ask multiple agents broad open-ended questions and average the answers.
-- Do not let a worker perform irreversible operations, releases, credential changes, or destructive git commands unless the human explicitly asked for that and you can verify every step.
-- Use `yoyo chat` only when a human or supervising agent is available to interact. Use `yoyo ask` for autonomous one-shot delegation.
-- Use `--read-only` for built-in agents when reviewing untrusted diffs/files. For custom agents, configure `read_only_args`; yoyo fails loudly if read-only cannot be enforced.
-- For repo review, pass `--cwd "$PWD"` and ask the subagent to inspect the current worktree. Pipe `git diff` only as supplemental focus, not as the only context.
-- Yoyo is intentionally powerful. Do not remove `--agent-arg` or full-access paths just to make misuse impossible; document and verify the actual capability being requested.
-- Workflow jobs default to read-only. Do not feed one agent's output into a write-capable workflow job or a job with raw `agent_args` unless the workflow explicitly sets `allow_untrusted_context: true` and the risk is justified.
-- Treat the full-access warning on stdin/`--file` as meaningful; switch to `--read-only` unless the input and task are trusted.
-- If agents disagree, identify the factual claim that would settle it, then inspect code, docs, tests, or live state.
-- If the target agent fails, times out, or lacks credentials, report that directly and continue with the best local verification path.
+- Don't delegate deterministic work a script or test can answer, and don't ask several agents the same broad question and average the answers.
+- Use `--read-only` for untrusted diffs, files, or prompts; the full-access warning on stdin/`--file` input is meaningful. Yoyo is intentionally powerful — request the capability the task needs rather than removing capabilities to prevent misuse.
+- A worker must not perform irreversible operations (releases, credential changes, destructive git) unless the human explicitly asked and every step is verifiable.
+- Workflow jobs default to read-only; feeding one agent's output into a write-capable job or a job with raw `agent_args` requires the workflow to set `allow_untrusted_context: true` with justified risk.
+- If the target agent fails or lacks credentials, report that directly and continue with the best local verification path.
+- For long or noisy tasks set `--trace-id`, `--max-output-bytes`, and `--max-input-bytes` (an aggregate cap across stdin and `--file`) so failures are auditable and output is bounded.
 
-## Synthesis Pattern
+## More
 
-After a subagent returns, summarize:
-
-- What it claimed.
-- Which claims were verified.
-- Which claims were rejected or remain uncertain.
-- What changed in your plan because of it.
-
-Never present subagent output as confirmed-current unless you independently verified it.
+- `yoyo doctor [--live]`, `yoyo agents`, `yoyo skills`, `yoyo update` — setup, health probes, discovery.
+- `yoyo workflow <name|path> --input "..." --json` (`--list` to discover) — reusable multi-agent workflows; prefer one checked spec over ad hoc fan-out, and dry-run before spending tokens.
+- `yoyo imagegen "<prompt>" --out file.png` — real verified image via codex's GPT-image tool; see the `yoyo-imagegen` skill for prompt recipes.
+- Liveness tuning (heartbeat interval, stdin wait, env vars): `yoyo ask --help` or the README.
