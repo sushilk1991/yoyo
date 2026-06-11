@@ -1,11 +1,27 @@
 ---
 name: yoyo
-description: Delegates tasks to Codex, Claude, Pi, or other configured CLI agents as subagents, reviewers, workers, or second-opinion partners via the yoyo CLI. Use for multi-agent coordination, independent code review, scoped delegation, adversarial checks, fresh-context loops, and agent-to-agent handoffs.
+description: Delegates tasks to Codex, Claude, Pi — or, on demand, Cursor, Gemini, and Grok — as subagents, reviewers, workers, or second-opinion partners via the yoyo CLI. Use for multi-agent coordination, independent code review, scoped delegation, adversarial checks, fresh-context loops, and agent-to-agent handoffs.
 ---
 
 # Yoyo Multi-Agent Coordination
 
 `yoyo` calls another CLI agent as a subprocess or interactive session. Treat the target agent's output as evidence to verify, not as an oracle.
+
+## Choosing an agent
+
+Default to the core trio — they support `--session` follow-ups and are the battle-tested paths:
+
+- `codex` — OpenAI Codex. Default reviewer and second opinion; also powers `yoyo imagegen`.
+- `claude` — Anthropic. Default worker and the only agent that reports per-call cost, so `yoyo loop --budget-usd` is enforced only here.
+- `pi` — lightweight and cheap; good for small scoped worker tasks and quick opinions.
+
+`cursor`, `gemini`, and `grok` are **on-demand only**: one-shot (`--session` is rejected), reach for them when their specific edge fits — not as part of the regular rotation, and never to fan the same question out to every agent.
+
+- `cursor` (Cursor agent CLI) — pro: cross-vendor model picker in one CLI (`--model gpt-5`, `sonnet-4`, ...; `cursor-agent --list-models`), editor-grade code edits. Con: needs `cursor-agent login` or `CURSOR_API_KEY`, bills through your Cursor plan. Use when you want a specific model yoyo's other agents don't expose, or an independent implementation pass.
+- `gemini` (Google Gemini CLI) — pro: very large context window, so it absorbs whole-repo dumps and long logs that overflow other agents; distinct vendor for tiebreaks. Con: weaker fit for surgical multi-file edits; output can be verbose. Use for huge-input review/summarization or a third-vendor opinion.
+- `grok` (xAI Grok CLI) — pro: a fourth independent vendor for adversarial cross-checks; Claude-Code-style permission modes map cleanly onto `--read-only`. Con: newer, less battle-tested harness; noisy stderr; `yoyo chat grok` takes no initial prompt. Use when you want one more genuinely independent opinion on a contested call.
+
+The decision rule: vendor diversity is the reason these exist. When two agents disagree, a third vendor breaks the tie better than a second call to the same model family — and an adversarial review is more credible from a different vendor than the one that wrote the code.
 
 ## Core commands
 

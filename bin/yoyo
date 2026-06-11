@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.9.1"
+VERSION = "0.10.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -113,6 +113,13 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
     "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude"),
     "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi"),
+    # On-demand agents: one-shot only (no --session), useful for cross-vendor
+    # opinions. cursor-agent and gemini read the prompt from piped stdin in
+    # print mode; grok has no stdin sentinel, so the prompt arrives via
+    # --prompt-file /dev/stdin.
+    "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "text"], flavor="cursor"),
+    "gemini": AgentSpec("gemini", ["gemini", "--skip-trust", "-o", "text"], flavor="gemini"),
+    "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
 }
 
 
@@ -727,6 +734,32 @@ def command_for_agent(
             cmd.extend(["--tools", "read,grep,find,ls"])
         else:
             cmd.extend(["--tools", "read,grep,find,ls,bash,edit,write"])
+    elif spec.flavor == "cursor":
+        if interactive:
+            cmd = [spec.command[0]]
+        else:
+            # --trust only applies to --print/headless mode.
+            cmd.append("--trust")
+        if args.read_only:
+            cmd.extend(["--mode", "plan"])
+        else:
+            cmd.append("--force")
+    elif spec.flavor == "gemini":
+        if interactive:
+            cmd = [spec.command[0]]
+        if args.read_only:
+            cmd.extend(["--approval-mode", "plan"])
+        else:
+            cmd.extend(["--approval-mode", "yolo"])
+    elif spec.flavor == "grok":
+        if interactive:
+            if args.prompt:
+                raise YoyoError("grok rejects a positional prompt; run yoyo chat grok without one")
+            cmd = [spec.command[0]]
+        if args.read_only:
+            cmd.extend(["--permission-mode", "plan"])
+        else:
+            cmd.extend(["--permission-mode", "bypassPermissions"])
     else:
         if args.read_only and not spec.read_only_args:
             raise YoyoError(f"Agent {spec.name!r} has no configured read_only_args, so --read-only cannot be enforced")
@@ -735,7 +768,7 @@ def command_for_agent(
         else:
             cmd.extend(spec.full_access_args or [])
 
-    if spec.flavor in ("codex", "claude", "pi") and args.model:
+    if spec.flavor in ("codex", "claude", "pi", "cursor", "gemini", "grok") and args.model:
         cmd.extend(["--model", args.model])
     cmd.extend(args.agent_arg or [])
     if interactive:
@@ -2840,7 +2873,7 @@ def doctor_agent_names(agents: dict[str, AgentSpec], requested: list[str] | None
 
 
 def doctor_supports_read_only(spec: AgentSpec) -> bool:
-    return spec.flavor in ("codex", "claude", "pi") or bool(spec.read_only_args)
+    return spec.flavor in ("codex", "claude", "pi", "cursor", "gemini", "grok") or bool(spec.read_only_args)
 
 
 def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) -> argparse.Namespace:

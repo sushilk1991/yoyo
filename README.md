@@ -1,6 +1,6 @@
 # yoyo
 
-`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. It lets Codex, Claude, Pi, or configured custom agents ask each other for second opinions, reviews, scoped worker tasks, and interactive sessions.
+`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. It lets Codex, Claude, Pi, or configured custom agents ask each other for second opinions, reviews, scoped worker tasks, and interactive sessions. Cursor (`cursor-agent`), Gemini, and Grok are also built in as on-demand, one-shot agents — for when cross-vendor diversity is the point (tiebreaks, adversarial checks, huge-context review); the bundled skill documents when to reach for each.
 
 The design is deliberately boring: one Python script, subprocess calls, explicit prompts, no daemon, no package manager requirement.
 
@@ -49,6 +49,8 @@ yoyo agents
 
 `yoyo doctor` also reports whether a source checkout has been recorded for `yoyo update`.
 
+Built-in agents: `codex`, `claude`, `pi` (session-capable defaults) plus on-demand one-shot agents `cursor`, `gemini`, `grok`. The on-demand agents authenticate through their own CLIs (`cursor-agent login` or `CURSOR_API_KEY`; `gemini` and `grok` sign in on first interactive run); probe one with a real call via `yoyo doctor --live --agent <name>`.
+
 Ask for a second opinion:
 
 ```bash
@@ -76,6 +78,14 @@ Pipe context:
 
 ```bash
 git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff. Use the current worktree as the source of truth."
+```
+
+Break a tie with a different vendor (on-demand agents):
+
+```bash
+yoyo ask gemini --role opinion --read-only --cwd "$PWD" "codex and claude disagree on whether this migration is safe. Decide, with reasons."
+yoyo ask grok --role review --read-only --cwd "$PWD" --file src/auth.ts "Adversarial review: find the strongest reason this change is wrong."
+yoyo ask cursor --model gpt-5 --role opinion "Critique this API design."
 ```
 
 For repo review, the worktree is the primary context. A diff is useful focus, but diff-only review can miss callers, tests, config, generated behavior, and adjacent invariants. Prefer `--cwd "$PWD"` plus a diff or `--file` context.
@@ -174,7 +184,7 @@ yoyo sessions list
 yoyo sessions rm codex:auth-review
 ```
 
-Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. Custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
+Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. The on-demand agents (cursor, gemini, grok) and custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
 
 `--session` also works with `chat` for interactive follow-ups (codex chat can only resume an existing recorded session).
 

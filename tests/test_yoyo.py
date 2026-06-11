@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.9.1")
+        self.assertEqual(stdout.strip(), "yoyo 0.10.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -527,6 +527,87 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("--tools read,grep,find,ls,bash,edit,write", stdout)
         self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_defaults_to_full_access_for_cursor(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "cursor", "--dry-run", "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("cursor-agent -p --output-format text --trust --force", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_read_only_constrains_cursor(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "cursor", "--dry-run", "--read-only", "Review it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("cursor-agent -p --output-format text --trust --mode plan", stdout)
+        self.assertNotIn("--force", stdout)
+        self.assertIn("mode=read-only delegation", stdout)
+
+    def test_ask_defaults_to_full_access_for_gemini(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "gemini", "--dry-run", "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("gemini --skip-trust -o text --approval-mode yolo", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_read_only_constrains_gemini(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "gemini", "--dry-run", "--read-only", "Review it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("gemini --skip-trust -o text --approval-mode plan", stdout)
+        self.assertIn("mode=read-only delegation", stdout)
+
+    def test_ask_defaults_to_full_access_for_grok(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "grok", "--dry-run", "Do it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("grok --prompt-file /dev/stdin --output-format plain --permission-mode bypassPermissions", stdout)
+        self.assertIn("mode=full-access delegation", stdout)
+
+    def test_ask_read_only_constrains_grok(self):
+        code, stdout, stderr = self.run_cli(
+            ["ask", "grok", "--dry-run", "--read-only", "Review it."],
+        )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("grok --prompt-file /dev/stdin --output-format plain --permission-mode plan", stdout)
+        self.assertIn("mode=read-only delegation", stdout)
+
+    def test_on_demand_agents_pass_model_flag(self):
+        for agent, model in (("cursor", "sonnet-4"), ("gemini", "gemini-2.5-pro"), ("grok", "grok-4")):
+            code, stdout, stderr = self.run_cli(
+                ["ask", agent, "--dry-run", "--model", model, "Do it."],
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn(f"--model {model}", stdout)
+
+    def test_on_demand_agents_reject_session(self):
+        for agent in ("cursor", "gemini", "grok"):
+            code, stdout, stderr = self.run_cli(
+                ["ask", agent, "--dry-run", "--session", "s1", "Do it."],
+            )
+
+            self.assertEqual(code, 2)
+            self.assertIn("does not support --session", stderr)
+
+    def test_chat_grok_rejects_initial_prompt(self):
+        code, stdout, stderr = self.run_cli(
+            ["chat", "grok", "--dry-run", "hello"],
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("positional prompt", stderr)
 
     def test_ask_read_only_constrains_codex(self):
         code, stdout, stderr = self.run_cli(
