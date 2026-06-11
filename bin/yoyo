@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -68,6 +68,36 @@ Return concise sections:
 - Open risks
 """,
 }
+
+
+LOOP_PROTOCOL = """=== LOOP PROTOCOL (yoyo loop iteration {iteration}/{max_iter}) ===
+You are one iteration of a fresh-context loop. You have NO memory of prior
+iterations; the state file is your only continuity.
+
+State file: {state_path}
+1. Read the state file FIRST. It records the goal, done work, and next step.
+2. Do ONE meaningful increment of work this iteration. Keep this session small.
+3. Before ending, REWRITE the state file: goal, what is done (terse list),
+   exactly what the next iteration should do first, and any gotchas learned.
+4. When the overall goal is fully complete and verified, write a line
+   containing exactly "STATUS: DONE" in the state file.
+=== END LOOP PROTOCOL ===
+
+TASK:
+{task}"""
+
+
+LOOP_STATE_SEED = """# yoyo loop state
+
+GOAL:
+{task}
+
+DONE:
+(nothing yet)
+
+NEXT:
+Start from scratch.
+"""
 
 
 @dataclass(frozen=True)
@@ -1052,6 +1082,8 @@ def run_summary(run_dir: Path) -> dict[str, Any]:
         "duration": round(duration, 3) if duration is not None else None,
         "trace_id": (meta or {}).get("trace_id"),
         "exit_code": result.get("exit_code") if status == "done" and result is not None else None,
+        "loop_id": (meta or {}).get("loop_id"),
+        "iteration": (meta or {}).get("iteration"),
     }
 
 
@@ -1088,6 +1120,7 @@ def start_background_run(args: argparse.Namespace) -> int:
         not args.prompt
         and not args.file
         and not (getattr(args, "skill", None) or [])
+        and not getattr(args, "input", None)
         and not (stdin_bytes and stdin_bytes.strip())
     ):
         raise YoyoError("No prompt provided. Pass text, pipe stdin, or use --file.")
@@ -2039,9 +2072,13 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, ensure_ascii=False))
         return
-    if result["stdout"]:
-        print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
-    stderr = result.get("stderr_plain", result["stderr"])
+    stdout = result.get("stdout") or ""
+    if not stdout and result.get("loop_id") and result.get("end_reason"):
+        # A background loop's parent result is a loop summary, not an ask envelope.
+        stdout = loop_summary_line(result) + "\n"
+    if stdout:
+        print(stdout, end="" if stdout.endswith("\n") else "\n")
+    stderr = result.get("stderr_plain", result.get("stderr") or "")
     if stderr:
         eprint(stderr, end="" if stderr.endswith("\n") else "\n")
     if result.get("trace_id"):
@@ -2100,13 +2137,15 @@ def list_runs(args: argparse.Namespace) -> int:
     if not rows:
         print("no runs found")
         return 0
-    print(f"{'run_id':<24}  {'agent':<12}  {'status':<8}  {'started_at':<20}  duration")
+    print(f"{'run_id':<24}  {'agent':<12}  {'status':<8}  {'started_at':<20}  {'duration':<9}  loop")
     for row in rows:
         duration = "" if row["duration"] is None else f"{float(row['duration']):.1f}s"
-        print(
+        loop_label = f"{row['loop_id']}:{row['iteration']}" if row.get("loop_id") else ""
+        line = (
             f"{row['run_id']:<24}  {str(row['agent'] or ''):<12}  {row['status']:<8}  "
-            f"{str(row['started_at'] or ''):<20}  {duration}"
+            f"{str(row['started_at'] or ''):<20}  {duration:<9}  {loop_label}"
         )
+        print(line.rstrip())
     return 0
 
 
@@ -2291,6 +2330,346 @@ def cmd_imagegen(args: argparse.Namespace) -> int:
         print(f"image: {out} ({size} bytes)")
         eprint(f"trace_id={result.get('trace_id')}")
     return 0
+
+
+def loop_reports_cost(spec: AgentSpec) -> bool:
+    return spec.flavor == "claude"
+
+
+def loop_agent_args(spec: AgentSpec, base: list[str] | None) -> list[str]:
+    extra = list(base or [])
+    if spec.flavor == "claude" and "--output-format" not in extra:
+        # The JSON envelope carries per-iteration cost/usage; the agent's text
+        # lives in its "result" field and is unwrapped by extract_loop_usage.
+        extra.extend(["--output-format", "json"])
+    return extra
+
+
+def extract_loop_usage(spec: AgentSpec, stdout: str) -> tuple[str, float | None, dict[str, Any]] | None:
+    """Per-flavor usage extraction hook: (logical_stdout, cost_usd, usage) or None.
+
+    Returns None for flavors that report nothing and for unparseable output, so
+    a crashed or truncated envelope degrades to raw text with unknown cost
+    instead of killing the loop.
+    """
+    if spec.flavor != "claude":
+        return None
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_text = data.get("result")
+    text = raw_text if isinstance(raw_text, str) else stdout
+    raw_cost = data.get("total_cost_usd")
+    cost = float(raw_cost) if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool) else None
+    usage = data.get("usage")
+    return text, cost, dict(usage) if isinstance(usage, dict) else {}
+
+
+def loop_task_text(args: argparse.Namespace) -> str:
+    if args.input and args.prompt:
+        raise YoyoError("Pass the loop task as positional text or --input, not both")
+    if args.input:
+        path = Path(args.input).expanduser()
+        if not path.is_absolute():
+            path = resolve_cwd(args.cwd) / path
+        if not path.is_file():
+            raise YoyoError(f"Loop task file not found: {path}")
+        task, _, _ = read_input_file(path, args.max_input_bytes)
+    else:
+        task = " ".join(args.prompt)
+    if not task.strip():
+        raise YoyoError("yoyo loop requires a task; pass text or --input FILE")
+    return task.strip()
+
+
+def resolve_loop_state_path(args: argparse.Namespace) -> Path:
+    state = Path(args.state).expanduser()
+    if not state.is_absolute():
+        state = resolve_cwd(args.cwd) / state
+    if state.exists() and not state.is_file():
+        raise YoyoError(f"Loop state path is not a file: {state}")
+    return state
+
+
+def loop_state_done(state_path: Path) -> bool:
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    # Exact-line match: the seeded GOAL embeds the task verbatim, so a task
+    # that merely mentions STATUS: DONE must not stop the loop at iteration 1.
+    return any(line.strip() == "STATUS: DONE" for line in text.splitlines())
+
+
+def loop_iteration_args(
+    args: argparse.Namespace,
+    iteration: int,
+    spec: AgentSpec,
+    task: str,
+    state_path: Path,
+) -> argparse.Namespace:
+    body = LOOP_PROTOCOL.format(iteration=iteration, max_iter=args.max_iter, state_path=state_path, task=task)
+    return argparse.Namespace(
+        cwd=str(resolve_cwd(args.cwd)),
+        agent=args.agent,
+        role=args.role,
+        read_only=args.read_only,
+        caller=args.caller,
+        trace_id=f"{args.trace_id}:{iteration}",
+        timeout=args.timeout,
+        max_input_bytes=args.max_input_bytes,
+        max_output_bytes=args.max_output_bytes,
+        model=args.model,
+        agent_arg=loop_agent_args(spec, args.agent_arg),
+        session=None,
+        session_info=None,
+        dry_run=args.dry_run,
+        quiet=args.quiet,
+        idle_timeout=args.idle_timeout,
+        prompt=[body],
+        file=[],
+        skill=list(args.skill or []),
+        use_stdin_context=False,
+    )
+
+
+def record_loop_iteration_run(
+    args: argparse.Namespace,
+    trace_id: str,
+    iteration: int,
+    started: datetime,
+    result: dict[str, Any],
+) -> str | None:
+    try:
+        root = runs_root()
+        root.mkdir(parents=True, exist_ok=True)
+        run_id = generate_run_id()
+        run_dir = root / run_id
+        run_dir.mkdir(mode=0o700)
+        meta = {
+            "run_id": run_id,
+            "agent": args.agent,
+            "role": args.role,
+            "cwd": str(resolve_cwd(args.cwd)),
+            "trace_id": trace_id,
+            "caller": args.caller,
+            "loop_id": args.trace_id,
+            "iteration": iteration,
+            "pid": None,
+            "started_at": iso_utc(started),
+        }
+        (run_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return run_id
+    except OSError as exc:
+        eprint(f"yoyo: failed to record loop iteration {iteration} in the run ledger: {exc}")
+        return None
+
+
+def loop_summary_line(summary: dict[str, Any]) -> str:
+    cost = summary.get("total_cost_usd")
+    cost_note = ""
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        cost_note = f", total cost ${float(cost):.2f}"
+    return (
+        f"loop {summary.get('loop_id')}: {summary.get('end_reason')} after "
+        f"{summary.get('iterations')} iterations{cost_note}, state {summary.get('state')}"
+    )
+
+
+def loop_usage_fields(usage: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for label, key in (
+        ("out", "output_tokens"),
+        ("cache_r", "cache_read_input_tokens"),
+        ("cache_w", "cache_creation_input_tokens"),
+    ):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            parts.append(f"{label}={value:,}")
+    return " ".join(parts)
+
+
+def print_loop_iteration_line(
+    as_json: bool,
+    iteration: int,
+    ok: bool,
+    duration: float,
+    cost: float | None,
+    total_cost: float,
+    usage: dict[str, Any],
+    tail: str,
+) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{stamp}] iter {iteration:>3}  {'ok  ' if ok else 'FAIL'}  {duration:6.0f}s"
+    if cost is not None:
+        line += f"  ${cost:.2f}  (total ${total_cost:.2f})"
+    fields = loop_usage_fields(usage)
+    if fields:
+        line += f"  {fields}"
+    if tail:
+        line += f"  {tail}"
+    # In --json mode stdout is reserved for the final summary envelope.
+    if as_json:
+        eprint(line)
+    else:
+        print(line, flush=True)
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    if args.agent not in agents:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+    if getattr(args, "session", None):
+        raise YoyoError(
+            "loop does not support --session; every iteration is intentionally a fresh-context session "
+            "(the state file is the only continuity)"
+        )
+    if args.max_iter < 1:
+        raise YoyoError("--max-iter must be at least 1")
+    if args.max_fail < 1:
+        raise YoyoError("--max-fail must be at least 1")
+    if args.interval < 0:
+        raise YoyoError("--interval must be at least 0")
+    if args.budget_usd is not None and args.budget_usd <= 0:
+        raise YoyoError("--budget-usd must be greater than 0")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    for skill_name in args.skill or []:
+        resolve_skill(skill_name)
+
+    spec = agents[args.agent]
+    task = loop_task_text(args)
+    state_path = resolve_loop_state_path(args)
+    # Fail loudly on flag problems (e.g. --read-only on a custom agent without
+    # read_only_args) before seeding state or detaching.
+    command_for_agent(spec, loop_iteration_args(args, 1, spec, task, state_path))
+
+    if args.dry_run:
+        iter_args = loop_iteration_args(args, 1, spec, task, state_path)
+        prompt = build_prompt(iter_args)
+        result = execute_agent_call(args.agent, iter_args, prompt, agents)
+        emit_dry_run_result(result, args.json)
+        return 0
+
+    if getattr(args, "background", False):
+        return start_background_run(args)
+
+    if args.budget_usd is not None and not loop_reports_cost(spec):
+        eprint(f"warning: agent {args.agent!r} does not report cost; --budget-usd will not be enforced")
+    if args.read_only:
+        eprint(
+            "warning: a read-only loop cannot rewrite its own state file; "
+            "maintain it manually or the loop will never see STATUS: DONE"
+        )
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    stop_path = state_path.parent / "STOP"
+    if not state_path.exists():
+        state_path.write_text(LOOP_STATE_SEED.format(task=task), encoding="utf-8")
+
+    eprint(f"loop {args.trace_id}: agent={args.agent} state={state_path} max_iter={args.max_iter} (touch {stop_path} to stop)")
+
+    total_cost = 0.0
+    cost_known = False
+    consecutive_failures = 0
+    iterations_run = 0
+    end_reason = "max-iter"
+    rows: list[dict[str, Any]] = []
+
+    for iteration in range(1, args.max_iter + 1):
+        if stop_path.exists():
+            end_reason = "stop"
+            break
+        if loop_state_done(state_path):
+            end_reason = "done"
+            break
+
+        iter_args = loop_iteration_args(args, iteration, spec, task, state_path)
+        prompt = build_prompt(iter_args)
+        started = utc_now()
+        result = execute_agent_call(args.agent, iter_args, prompt, agents)
+        iterations_run = iteration
+
+        cost: float | None = None
+        usage: dict[str, Any] = {}
+        extracted = extract_loop_usage(spec, str(result.get("stdout", "")))
+        if extracted is not None:
+            text, cost, usage = extracted
+            result["stdout"] = text
+            if cost is not None:
+                result["cost_usd"] = cost
+                total_cost += cost
+                cost_known = True
+            if usage:
+                result["usage"] = usage
+
+        if extracted is None and args.budget_usd is not None and loop_reports_cost(spec):
+            eprint(
+                f"warning: iteration {iteration} output was not a parseable cost envelope; "
+                "its cost is unknown and not counted toward --budget-usd"
+            )
+
+        run_id = record_loop_iteration_run(args, iter_args.trace_id, iteration, started, result)
+        ok = int(result.get("exit_code", 1)) == 0
+        consecutive_failures = 0 if ok else consecutive_failures + 1
+
+        tail_lines = [line for line in str(result.get("stdout", "")).splitlines() if line.strip()]
+        tail = tail_lines[-1].strip()[:120] if tail_lines else ""
+        duration = float(result.get("duration_s") or 0.0)
+        print_loop_iteration_line(args.json, iteration, ok, duration, cost, total_cost, usage, tail)
+        rows.append(
+            {
+                "iteration": iteration,
+                "run_id": run_id,
+                "exit_code": int(result.get("exit_code", 1)),
+                "duration_s": duration,
+                "cost_usd": cost,
+            }
+        )
+
+        # Post-iteration checks in the brief's priority order: an iteration that
+        # finishes the goal must report done even if it also crossed the budget
+        # or was itself a failure.
+        if stop_path.exists():
+            end_reason = "stop"
+            break
+        if loop_state_done(state_path):
+            end_reason = "done"
+            break
+        if args.budget_usd is not None and cost_known and total_cost >= args.budget_usd:
+            end_reason = "budget"
+            break
+        if consecutive_failures >= args.max_fail:
+            end_reason = "max-fail"
+            break
+        if args.interval and iteration < args.max_iter:
+            time.sleep(args.interval)
+
+    exit_code = 1 if end_reason == "max-fail" else 0
+    summary = {
+        "loop_id": args.trace_id,
+        "agent": args.agent,
+        "state": str(state_path),
+        "iterations": iterations_run,
+        "end_reason": end_reason,
+        "total_cost_usd": round(total_cost, 4) if cost_known else None,
+        "exit_code": exit_code,
+        "runs": rows,
+    }
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False))
+    else:
+        print(loop_summary_line(summary))
+    return exit_code
 
 
 def wait_run(args: argparse.Namespace) -> int:
@@ -2776,6 +3155,56 @@ def build_parser() -> argparse.ArgumentParser:
     imagegen.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     imagegen.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
     imagegen.set_defaults(func=cmd_imagegen)
+
+    loop = sub.add_parser("loop", help="Run a task as repeated fresh-context agent iterations with a shared state file")
+    loop.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
+    loop.add_argument("prompt", nargs="*", help="The overall loop goal. Or use --input FILE.")
+    loop.add_argument("--input", help="Read the loop task from a file instead of positional text")
+    loop.add_argument(
+        "--state",
+        default=os.path.join(".yoyo", "loop-state.md"),
+        help="State file carrying continuity between iterations (default: .yoyo/loop-state.md, relative to --cwd)",
+    )
+    loop.add_argument("--max-iter", type=int, default=20, help="Hard iteration cap (default: 20)")
+    loop.add_argument("--interval", type=float, default=0.0, help="Seconds to sleep between iterations (default: 0)")
+    loop.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        help="Stop once cumulative reported cost reaches this; enforced only for agents that report cost (claude)",
+    )
+    loop.add_argument("--max-fail", type=int, default=3, help="Stop after N consecutive failed iterations (default: 3)")
+    loop.add_argument("--role", choices=sorted(ROLE_PROMPTS), default="worker", help="Role prompt for each iteration (default: worker)")
+    loop.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    loop.add_argument("--cwd", default=os.getcwd())
+    loop.add_argument("--skill", action="append", default=[], help="Inject a named skill (SKILL.md) into every iteration; repeatable")
+    loop.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))),
+        help="Per-iteration timeout in seconds",
+    )
+    loop.add_argument(
+        "--trace-id",
+        default=os.environ.get("YOYO_TRACE_ID") or generate_run_id(),
+        help="Loop id; stamped on every iteration's run-ledger record",
+    )
+    loop.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
+    loop.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    loop.add_argument("--idle-timeout", type=float, default=None, help="Kill an iteration if it emits no output for this many seconds (hang guard)")
+    loop.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
+    loop.add_argument("--model", help="Pass a model name to agents that support --model")
+    loop.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Constrain each iteration to read-only mode where supported (the agent then cannot update the state file)",
+    )
+    loop.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
+    loop.add_argument("--session", help=argparse.SUPPRESS)
+    loop.add_argument("--json", action="store_true", help="Emit a final JSON loop summary (per-iteration lines go to stderr)")
+    loop.add_argument("--dry-run", action="store_true", help="Print the composed iteration-1 command and prompt without running")
+    loop.add_argument("--background", action="store_true", help="Detach the whole loop and record it in the run ledger")
+    loop.set_defaults(func=cmd_loop, collect_unknown_prompt=True, file=[], use_stdin_context=False)
 
     runs = sub.add_parser("runs", help="List, show, and prune background run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")

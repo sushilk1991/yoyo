@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.8.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.9.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -2489,6 +2489,346 @@ class YoyoTests(unittest.TestCase):
 
             self.assertEqual(code, 0, stderr)
             self.assertTrue((home / ".claude/skills/yoyo-imagegen/SKILL.md").exists())
+
+    def _loop_stub_command(self, tmp, body, name="stub.py"):
+        script = Path(tmp) / name
+        script.write_text(body, encoding="utf-8")
+        return f"python3 {shlex.quote(str(script))}"
+
+    def _counting_stub(self, tmp, per_call_body=""):
+        """A stub agent that drains stdin and tracks how many times it ran."""
+        counter = Path(tmp) / "calls.txt"
+        body = (
+            "import os, sys\n"
+            f"counter = {str(counter)!r}\n"
+            "calls = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+            "calls += 1\n"
+            "open(counter, 'w').write(str(calls))\n"
+            "sys.stdin.read()\n"
+            f"{per_call_body}\n"
+            "print('iteration output line')\n"
+        )
+        return self._loop_stub_command(tmp, body), counter
+
+    def _claude_flavor_config(self, tmp, body, name="fakeclaude"):
+        command = self._loop_stub_command(tmp, body)
+        config = Path(tmp) / "agents.json"
+        config.write_text(
+            json.dumps({"agents": {name: {"command": shlex.split(command), "kind": "claude"}}}),
+            encoding="utf-8",
+        )
+        return config
+
+    def test_loop_stops_at_max_iter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, counter = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--json", "do the work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 3)
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(summary["exit_code"], 0)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "3")
+
+    def test_loop_stops_when_state_file_reports_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            done_body = (
+                f"state = {str(state)!r}\n"
+                "if calls == 2:\n"
+                "    open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
+            )
+            command, counter = self._counting_stub(tmp, done_body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--json", "finish in two"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+
+    def test_loop_stop_file_prevents_first_iteration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, counter = self._counting_stub(tmp)
+            loop_dir = Path(tmp) / ".yoyo"
+            loop_dir.mkdir()
+            (loop_dir / "STOP").write_text("", encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--json", "never runs"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 0)
+            self.assertEqual(summary["end_reason"], "stop")
+            self.assertFalse(counter.exists())
+
+    def test_loop_seeds_state_file_and_does_not_clobber_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "seed me"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            seeded = state.read_text(encoding="utf-8")
+            self.assertIn("GOAL:\nseed me", seeded)
+            self.assertIn("NEXT:\nStart from scratch.", seeded)
+
+            custom = "# my own state\n\nGOAL:\nseed me\n\nNEXT:\ncontinue step 4\n"
+            state.write_text(custom, encoding="utf-8")
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "--json", "seed me"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(state.read_text(encoding="utf-8"), custom)
+
+    def test_loop_claude_flavor_envelope_cost_accumulates_until_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body = (
+                "import json, sys\n"
+                "sys.stdin.read()\n"
+                "print(json.dumps({'result': 'did one increment', 'total_cost_usd': 0.6, "
+                "'usage': {'output_tokens': 8412, 'cache_read_input_tokens': 121000, "
+                "'cache_creation_input_tokens': 43000}}))\n"
+            )
+            config = self._claude_flavor_config(tmp, body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "10", "--budget-usd", "1.0", "--json", "work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["end_reason"], "budget")
+            self.assertAlmostEqual(summary["total_cost_usd"], 1.2)
+            self.assertEqual([row["cost_usd"] for row in summary["runs"]], [0.6, 0.6])
+            self.assertIn("$0.60", stderr)
+            self.assertIn("out=8,412", stderr)
+            self.assertIn("did one increment", stderr)
+
+    def test_loop_malformed_claude_envelope_keeps_loop_alive_with_unknown_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "import sys\nsys.stdin.read()\nprint('this is not a json envelope')\n"
+            config = self._claude_flavor_config(tmp, body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "2", "--json", "work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertIsNone(summary["total_cost_usd"])
+            self.assertEqual([row["exit_code"] for row in summary["runs"]], [0, 0])
+            self.assertIn("this is not a json envelope", stderr)
+
+    def test_loop_max_fail_aborts_and_success_resets_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fail_body = "sys.exit(0 if calls == 2 else 1)"
+            command, counter = self._counting_stub(tmp, fail_body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--max-fail", "3", "--json", "flaky"],
+                env=env,
+            )
+
+            self.assertEqual(code, 1, stderr)
+            summary = json.loads(stdout)
+            # fail, ok (resets), fail, fail, fail -> abort after iteration 5
+            self.assertEqual(summary["iterations"], 5)
+            self.assertEqual(summary["end_reason"], "max-fail")
+            self.assertEqual(summary["exit_code"], 1)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "5")
+
+    def test_loop_dry_run_prompt_contains_protocol_state_path_and_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_skill(Path(tmp) / "skills", "frontend")
+            code, stdout, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--skill", "frontend", "--dry-run", "Build the page."],
+                env={"YOYO_SKILL_PATH": str(Path(tmp) / "skills")},
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== LOOP PROTOCOL (yoyo loop iteration 1/20) ===", stdout)
+            self.assertIn(str(Path(tmp).resolve() / ".yoyo" / "loop-state.md"), stdout)
+            self.assertIn('<skill name="frontend">', stdout)
+            self.assertIn("Use 8px spacing", stdout)
+            self.assertIn("TASK:\nBuild the page.", stdout)
+            self.assertIn("--output-format json", stdout)
+            self.assertIn("delegated worker", stdout)
+
+    def test_loop_rejects_session(self):
+        code, stdout, stderr = self.run_cli(
+            ["loop", "claude", "--session", "named", "task"],
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("does not support --session", stderr)
+
+    def test_loop_iterations_share_loop_id_in_run_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--trace-id", "loop-xyz", "--json", "ledger me"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            code, stdout, stderr = self.run_cli(["runs", "list", "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            rows = [row for row in json.loads(stdout) if row["loop_id"] == "loop-xyz"]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sorted(row["iteration"] for row in rows), [1, 2])
+            for row in rows:
+                self.assertEqual(row["agent"], "stub")
+                self.assertEqual(row["status"], "done")
+                self.assertEqual(row["exit_code"], 0)
+
+            code, stdout, stderr = self.run_cli(["runs", "list"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("loop-xyz:1", stdout)
+            self.assertIn("loop-xyz:2", stdout)
+
+    def test_loop_dry_run_executes_nothing_and_creates_no_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, counter = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--dry-run", "plan only"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== LOOP PROTOCOL", stdout)
+            self.assertIn("python3", stdout)
+            self.assertFalse(counter.exists())
+            self.assertFalse((Path(tmp) / ".yoyo").exists())
+            self.assertFalse((Path(tmp) / "state" / "runs").exists())
+
+    def test_loop_budget_with_costless_agent_warns_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--budget-usd", "5", "--json", "work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertIn("does not report cost", stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["end_reason"], "max-iter")
+
+    def test_loop_task_text_requires_task_and_rejects_both_sources(self):
+        code, _, stderr = self.run_cli(["loop", "claude"])
+        self.assertEqual(code, 2)
+        self.assertIn("requires a task", stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task_file = Path(tmp) / "task.md"
+            task_file.write_text("from file", encoding="utf-8")
+            code, _, stderr = self.run_cli(
+                ["loop", "claude", "--input", str(task_file), "also positional"],
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("not both", stderr)
+
+            code, stdout, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--input", str(task_file), "--dry-run"],
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("TASK:\nfrom file", stdout)
+
+    def test_loop_done_outranks_budget_on_the_same_iteration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            body = (
+                "import json, sys\n"
+                "sys.stdin.read()\n"
+                f"open({str(state)!r}, 'a').write('\\nSTATUS: DONE\\n')\n"
+                "print(json.dumps({'result': 'finished and verified', 'total_cost_usd': 5.0, 'usage': {}}))\n"
+            )
+            config = self._claude_flavor_config(tmp, body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "fakeclaude", "--cwd", tmp, "--budget-usd", "1.0", "--json", "finish now"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(summary["iterations"], 1)
+            self.assertAlmostEqual(summary["total_cost_usd"], 5.0)
+
+    def test_loop_malformed_envelope_with_budget_warns_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "import sys\nsys.stdin.read()\nprint('no envelope here')\n"
+            config = self._claude_flavor_config(tmp, body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "1", "--budget-usd", "1.0", "--json", "work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0)
+            self.assertIn("not a parseable cost envelope", stderr)
+            self.assertIn("not counted toward --budget-usd", stderr)
+            summary = json.loads(stdout)
+            self.assertIsNone(summary["total_cost_usd"])
+
+    def test_loop_background_records_parent_run_and_iteration_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--trace-id", "bg-loop", "--background", "work"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "10", "--poll", "0.05", "--json"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["end_reason"], "max-iter")
+            self.assertEqual(payload["iterations"], 2)
+            self.assertEqual(payload["loop_id"], "bg-loop")
+
+            code, stdout, stderr = self.run_cli(["runs", "list", "--json", "--limit", "10"], env=env)
+            self.assertEqual(code, 0, stderr)
+            children = [row for row in json.loads(stdout) if row["loop_id"] == "bg-loop"]
+            self.assertEqual(sorted(row["iteration"] for row in children), [1, 2])
+
+            # Human-mode show renders a loop summary line, not silence.
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("loop bg-loop: max-iter after 2 iterations", stdout)
 
 
 if __name__ == "__main__":

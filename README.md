@@ -131,6 +131,22 @@ yoyo chat codex --cwd "$PWD" "Help me debug this repo."
 yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
 ```
 
+## Loops
+
+`yoyo loop` runs one task as a sequence of independent fresh-context iterations against a single agent:
+
+```bash
+yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 20 "Fix the failing tests, one per iteration."
+```
+
+Why fresh context instead of one long session: a long-lived agentic session grows its context monotonically and re-reads all of it on every tool call, so cost compounds without bound (in practice most of the spend becomes cache reads, not useful output). `yoyo loop` makes each iteration a brand-new session with empty context; continuity lives in a small state file (default `.yoyo/loop-state.md`, relative to `--cwd`) that the agent reads first and rewrites before ending. Per-iteration cost stays flat instead of growing with the loop's age.
+
+Each iteration is a normal `ask`-style call: `--role` (defaults to `worker`), `--skill`, `--cwd`, `--timeout`, `--read-only`, and the byte caps pass through unchanged, and the injected loop protocol tells the agent to read the state file, do one increment of work, rewrite the state file, and write a line `STATUS: DONE` when the overall goal is complete and verified.
+
+The loop ends on the first of: a `STOP` file next to the state file, `STATUS: DONE` in the state file, `--max-iter` (default 20), `--budget-usd` reached, or `--max-fail` consecutive failed iterations (default 3 — the only ending that exits 1; the rest exit 0). `--interval <seconds>` sleeps between iterations.
+
+For claude, iterations run with `--output-format json`, so each per-iteration console line reports real cost and token usage and `--budget-usd` is enforced. Agents that don't report cost (codex, pi, custom) get a one-time warning and no budget enforcement; a malformed envelope degrades to raw text with unknown cost rather than killing the loop, with a loud per-iteration warning when a budget is set (an iteration with unparseable cost is invisible to `--budget-usd`). Every iteration is recorded in the run ledger stamped with a shared loop id (`yoyo runs list` shows `loop_id:iteration`), and `--json` emits a final machine-readable summary. `yoyo loop ... --background` detaches the whole loop exactly like `ask --background`: `yoyo wait <run_id>` blocks on the loop itself, while iterations still get their own ledger entries. `--session` is rejected loudly — fresh context per iteration is the point.
+
 ## Background Runs
 
 A real review or worker task can outlive the calling agent's own tool budget. `--background` detaches the run and records it in a durable run ledger, so the caller returns immediately and collects the result later:

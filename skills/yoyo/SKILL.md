@@ -48,6 +48,14 @@ yoyo wait "$run_id"        # or poll later: yoyo runs show "$run_id" --json
 
 Prefer `--background` + `yoyo wait`/`yoyo runs show` over raising `--timeout` and blocking, and over abandoning a long review. The run ledger (`yoyo runs list`) keeps every background result auditable after the fact.
 
+Fresh-context loop (iterative work — fix tests one by one, migrate files in batches, grind down a checklist):
+
+```bash
+yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 10 --caller codex "Fix the failing tests, one per iteration."
+```
+
+Use `yoyo loop` instead of building your own iteration logic or running many rounds inside one ever-growing session. Each iteration is a brand-new fresh-context session of the target agent; continuity lives in a state file (default `.yoyo/loop-state.md`) that the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file next to it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. Iterations are recorded in the run ledger under one shared loop id, `--json` gives a final summary, and `--background` detaches the whole loop. This keeps per-iteration cost flat — one long looping session re-reads its entire growing context on every tool call and compounds cost; a fresh-context loop does not.
+
 Follow-up session (continue a prior delegation with full context):
 
 ```bash
