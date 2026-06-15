@@ -1,6 +1,6 @@
 # yoyo
 
-`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. It lets Codex, Claude, Pi, or configured custom agents ask each other for second opinions, reviews, scoped worker tasks, and interactive sessions. Cursor (`cursor-agent`), Gemini, and Grok are also built in as on-demand, one-shot agents — for when cross-vendor diversity is the point (tiebreaks, adversarial checks, huge-context review); the bundled skill documents when to reach for each.
+`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. It lets Codex, Claude, Pi, or configured custom agents ask each other for second opinions, reviews, scoped worker tasks, and interactive sessions. Cursor (`cursor-agent`), Antigravity (`agy`), and Grok are also built in as on-demand, one-shot agents — for when cross-vendor diversity is the point (tiebreaks, adversarial checks, huge-context review); the bundled skill documents when to reach for each.
 
 The design is deliberately boring: one Python script, subprocess calls, explicit prompts, no daemon, no package manager requirement.
 
@@ -49,7 +49,7 @@ yoyo agents
 
 `yoyo doctor` also reports whether a source checkout has been recorded for `yoyo update`.
 
-Built-in agents: `codex`, `claude`, `pi` (session-capable defaults) plus on-demand one-shot agents `cursor`, `gemini`, `grok`. The on-demand agents authenticate through their own CLIs (`cursor-agent login` or `CURSOR_API_KEY`; `gemini` and `grok` sign in on first interactive run); probe one with a real call via `yoyo doctor --live --agent <name>`.
+Built-in agents: `codex`, `claude`, `pi` (session-capable defaults) plus on-demand one-shot agents `cursor`, `agy`, `grok`. The on-demand agents authenticate through their own CLIs (`cursor-agent login` or `CURSOR_API_KEY`; `grok` signs in on first interactive run; `agy` — Google Antigravity, the successor to the Gemini CLI — opens a browser to sign in on its first model call). `agy` has no headless read-only mode (its `--sandbox` only restricts the terminal, not file writes), so it runs **full-access only** and cannot be a `review`, `--read-only`, or loop `--checker` agent — use `codex`/`claude`/`pi` there. Probe one with a real call via `yoyo doctor --live --agent <name>`.
 
 Ask for a second opinion:
 
@@ -91,7 +91,7 @@ git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff. Use the
 Break a tie with a different vendor (on-demand agents):
 
 ```bash
-yoyo ask gemini --role opinion --read-only --cwd "$PWD" "codex and claude disagree on whether this migration is safe. Decide, with reasons."
+yoyo ask agy --role opinion --cwd "$PWD" "codex and claude disagree on whether this migration is safe. Decide, with reasons."  # agy is full-access only; the opinion role keeps it from editing
 yoyo ask grok --role review --read-only --cwd "$PWD" --file src/auth.ts "Adversarial review: find the strongest reason this change is wrong."
 yoyo ask cursor --model gpt-5 --role opinion "Critique this API design."
 ```
@@ -161,7 +161,30 @@ Why fresh context instead of one long session: a long-lived agentic session grow
 
 Each iteration is a normal `ask`-style call: `--role` (defaults to `worker`), `--skill`, `--cwd`, `--timeout`, `--read-only`, and the byte caps pass through unchanged, and the injected loop protocol tells the agent to read the state file, do one increment of work, rewrite the state file, and write a line `STATUS: DONE` when the overall goal is complete and verified.
 
-The loop ends on the first of: a `STOP` file next to the state file, `STATUS: DONE` in the state file, `--max-iter` (default 20), `--budget-usd` reached, or `--max-fail` consecutive failed iterations (default 3 — the only ending that exits 1; the rest exit 0). `--interval <seconds>` sleeps between iterations.
+The loop ends on the first of: a `STOP` file next to the state file, an accepted `STATUS: DONE` in the state file, `--max-iter` (default 20), `--budget-usd` reached, or `--max-fail` consecutive failed iterations (default 3 — the only ending that exits 1; the rest exit 0). `--interval <seconds>` sleeps between iterations.
+
+### Verified completion (opt-in)
+
+By default a single agent both does the work and writes its own `STATUS: DONE` — it grades its own homework, which over many iterations drifts toward "done enough." `--done-policy` makes that `STATUS: DONE` a *candidate* that must clear an objective check before the loop accepts it. yoyo never grades the agent's prose; you supply the closed-form evidence.
+
+```bash
+# Closed-form gate: DONE is accepted only when the command exits 0.
+yoyo loop claude --cwd "$PWD" --gate "pytest -q" "Fix the failing auth tests, one per iteration."
+
+# Independent checker: a separate, cheaper agent re-derives whether the repo meets the goal.
+yoyo loop claude --checker codex --checker-model <cheap-model> "Migrate the DB layer."
+
+# Both — the strongest practical mode.
+yoyo loop claude --gate "make ci" --checker codex --done-policy gate+checker "..."
+```
+
+- **`--gate CMD`** (repeatable) is a shell command — a test, type check, lint, or build. When the worker writes `STATUS: DONE`, every gate runs from `--cwd`; if any exits non-zero, yoyo strips the false `STATUS: DONE`, appends the gate's output to the state file so the next fresh iteration sees *why* it was rejected, and the loop continues. Gates come only from this flag, never from the agent-rewritable state file — the state file is not a shell-injection surface.
+- **`--checker AGENT`** runs an independent, read-only completion check, blind to the worker's state-file prose: it gets the goal, the standing spec, and the `git diff`, then re-derives whether the repository meets the goal and ends with a `VERDICT: PASS`/`VERDICT: FAIL` line (the one marker yoyo parses — never the surrounding prose). It fails closed: a checker that errors or omits the verdict does not let the loop exit. `--checker-model` picks its model — use a cheaper tier than the worker (e.g. `sonnet` against an Opus worker), but not Haiku, since judging completion is itself a judgment task.
+- **`--done-policy`** is `worker` (self-declared, the default), `gate`, `checker`, or `gate+checker`. It is auto-derived when you pass `--gate`/`--checker`, so you rarely set it explicitly; gates run before the checker so a cheap deterministic failure short-circuits before spending checker tokens.
+
+The default stays `worker` — yoyo does not nag or inject a gate you didn't ask for. The final summary reports `done_policy`, `verified` (whether the terminal `done` was verification-backed or self-declared), and the count of `gate_failures` / `checker_rejections`, so a loop that keeps claiming-then-failing is visible rather than silent.
+
+`--spec PATH` adds a standing spec file that is **re-read every iteration and never rewritten** — distinct from the mutable `--state` file. The state file tells the agent where it is; the spec tells it where to go and what not to do. Because each iteration's state rewrite is lossy, "don't touch `src/payments/`"-style constraints drift away over a long loop; a spec the worker (and the checker) reads fresh every iteration holds them in place.
 
 Three guards protect the state file. A `<state>.task` sidecar records the task verbatim when the loop seeds state; starting a loop against a state file recorded for a *different* task fails loudly (same task resumes normally; pass a fresh `--state` path or delete both files to start over). A leftover `STOP` file from an earlier loop is deleted at startup with a notice — STOP is a runtime kill switch, not configuration, so touching it only stops a loop that is already running. And a `<state>.lock` file held via `flock` makes concurrent loops on the same state file impossible: the second loop exits with an error while the first holds the lock. The kernel releases the lock when the holding process exits — even on a crash — so stale locks cannot occur; the lockfile itself stays on disk by design and is harmless.
 
@@ -175,7 +198,7 @@ For claude, iterations run with `--output-format json`, so each per-iteration co
 
 ```bash
 yoyo review --cwd "$PWD"                            # codex + claude review in parallel
-yoyo review --agents codex,claude,gemini --json     # three vendors, machine-readable envelope
+yoyo review --agents codex,claude,grok --json       # three vendors, machine-readable envelope (review needs read-only, so not agy)
 yoyo review --base main --pr                        # review committed work, post the result as a PR comment via gh
 ```
 
@@ -210,7 +233,7 @@ yoyo sessions list
 yoyo sessions rm codex:auth-review
 ```
 
-Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. The on-demand agents (cursor, gemini, grok) and custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
+Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. The on-demand agents (cursor, agy, grok) and custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
 
 `--session` also works with `chat` for interactive follow-ups (codex chat can only resume an existing recorded session).
 

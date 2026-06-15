@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -101,6 +101,48 @@ Start from scratch.
 """
 
 
+# Re-read every iteration, never rewritten — the standing spec that fights goal
+# drift when the mutable state file's lossy summaries shed the original
+# constraints. Prepended ahead of the loop protocol so it anchors each fresh
+# context.
+LOOP_SPEC_BLOCK = """=== STANDING SPEC (immutable; defines the goal and constraints; re-read every iteration; DO NOT edit) ===
+{spec}
+=== END STANDING SPEC ==="""
+
+
+# Appended after the task when a --done-policy gates completion, so the worker
+# knows its self-declared STATUS: DONE is a candidate that yoyo will verify.
+LOOP_COMPLETION_CHECK = """=== COMPLETION CHECK ===
+Your "STATUS: DONE" is a CANDIDATE, not the final word. When you write it, yoyo
+verifies the goal with {verifiers}. If verification fails, yoyo removes your
+STATUS: DONE line, appends the failure to the state file, and a fresh iteration
+continues. Do not write STATUS: DONE until the work genuinely passes these
+checks — declaring done early only wastes an iteration.
+=== END COMPLETION CHECK ==="""
+
+
+# The independent checker is blind to the worker's state-file prose by design:
+# it gets the immutable goal, the standing spec, and the diff, then re-derives
+# whether the repository meets the goal. The only thing yoyo parses is the
+# explicitly-demanded VERDICT marker — never the surrounding prose.
+LOOP_CHECKER_PROMPT = """You are an INDEPENDENT completion checker. A different agent claims the task
+below is finished. You did not write this code and must not assume it is
+correct. Judge ONLY whether the repository at {cwd} actually satisfies the goal.
+Read the repository as needed.
+
+GOAL:
+{task}
+{spec_block}
+What changed (git diff HEAD; may be empty if the work was already committed):
+<diff>
+{diff}
+</diff>
+
+List anything missing, broken, or unverified. Then end your reply with exactly
+one line — either "VERDICT: PASS" if the goal is fully and correctly met, or
+"VERDICT: FAIL" if anything is incomplete or unproven."""
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     name: str
@@ -110,16 +152,26 @@ class AgentSpec:
     full_access_args: list[str] | None = None
 
 
+# agy takes the prompt as the value of its -p flag rather than on stdin. The
+# final prompt is not known where command_for_agent builds argv, so the flavor
+# emits this sentinel as the -p value and execute_agent_call swaps it for the
+# real prompt (and feeds empty stdin). NUL makes accidental collisions with real
+# prompt text impossible.
+AGY_PROMPT_SENTINEL = "\x00YOYO_AGY_PROMPT\x00"
+
+
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
     "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude"),
     "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi"),
     # On-demand agents: one-shot only (no --session), useful for cross-vendor
-    # opinions. cursor-agent and gemini read the prompt from piped stdin in
-    # print mode; grok has no stdin sentinel, so the prompt arrives via
-    # --prompt-file /dev/stdin.
+    # opinions. cursor-agent reads the prompt from piped stdin in print mode;
+    # grok has no stdin sentinel, so the prompt arrives via --prompt-file
+    # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
+    # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
+    # and has no headless read-only mode.
     "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "text"], flavor="cursor"),
-    "gemini": AgentSpec("gemini", ["gemini", "--skip-trust", "-o", "text"], flavor="gemini"),
+    "agy": AgentSpec("agy", ["agy"], flavor="agy"),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
 }
 
@@ -752,13 +804,21 @@ def command_for_agent(
             cmd.extend(["--mode", "plan"])
         else:
             cmd.append("--force")
-    elif spec.flavor == "gemini":
-        if interactive:
-            cmd = [spec.command[0]]
+    elif spec.flavor == "agy":
         if args.read_only:
-            cmd.extend(["--approval-mode", "plan"])
+            raise YoyoError(
+                "agy has no headless read-only mode (its --sandbox only restricts the terminal, "
+                "not file writes), so --read-only cannot be enforced; use codex, claude, or pi "
+                "for read-only review or as a loop --checker"
+            )
+        if interactive:
+            if args.prompt:
+                raise YoyoError("agy chat takes no inline prompt; run `yoyo chat agy` and type in the session")
+            cmd = [spec.command[0], "--dangerously-skip-permissions"]
         else:
-            cmd.extend(["--approval-mode", "yolo"])
+            # agy reads the prompt as the value of -p (not stdin); execute_agent_call
+            # swaps the sentinel for the real prompt and feeds empty stdin instead.
+            cmd = [spec.command[0], "-p", AGY_PROMPT_SENTINEL, "--add-dir", cwd, "--dangerously-skip-permissions"]
     elif spec.flavor == "grok":
         if interactive:
             if args.prompt:
@@ -776,7 +836,7 @@ def command_for_agent(
         else:
             cmd.extend(spec.full_access_args or [])
 
-    if spec.flavor in ("codex", "claude", "pi", "cursor", "gemini", "grok") and args.model:
+    if spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok") and args.model:
         cmd.extend(["--model", args.model])
     cmd.extend(args.agent_arg or [])
     if interactive:
@@ -1292,6 +1352,11 @@ def execute_agent_call(
             codex_output_file = str(tmpdir / "codex-last-message.txt")
 
         cmd = command_for_agent(agents[agent_name], args, codex_output_file)
+        feed = prompt
+        if AGY_PROMPT_SENTINEL in cmd:
+            # agy carries the prompt as the -p value, not on stdin.
+            cmd = [prompt if part == AGY_PROMPT_SENTINEL else part for part in cmd]
+            feed = ""
         if args.dry_run:
             result = {"agent": agent_name, "command": cmd, "prompt": prompt, "trace_id": args.trace_id, "exit_code": 0}
             session = result_session(args)
@@ -1308,7 +1373,7 @@ def execute_agent_call(
         try:
             proc = run_to_files(
                 cmd,
-                prompt,
+                feed,
                 cwd,
                 stdout_path,
                 stderr_path,
@@ -1745,6 +1810,57 @@ def normalize_phase_gates(phase: dict[str, Any]) -> list[dict[str, Any]]:
     return gates
 
 
+def run_shell_gate(name: str, run: str, cwd: Path, timeout: float, dry_run: bool) -> dict[str, Any]:
+    """Run a single deterministic shell gate and return its result record.
+
+    Shared by workflow phase gates and loop completion gates so both honor the
+    same timeout, process-group cleanup, and output caps.
+    """
+    if dry_run:
+        return {"name": name, "command": run, "cwd": str(cwd), "dry_run": True}
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", run],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+    except FileNotFoundError as exc:
+        raise YoyoError(f"Gate shell not found: {exc}") from exc
+    pgid: int | None = None
+    if os.name == "posix":
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+    if pgid is not None:
+        _register_child(pgid)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            _terminate_child(proc, pgid)
+            stdout, stderr = proc.communicate()
+            exit_code = 124
+            stderr = (stderr or "") + f"\ngate timed out after {timeout}s"
+    finally:
+        if pgid is not None:
+            _unregister_child(pgid)
+    return {
+        "name": name,
+        "command": run,
+        "cwd": str(cwd),
+        "exit_code": exit_code,
+        "duration_s": round(time.monotonic() - started, 3),
+        "stdout": stdout[-DEFAULT_GATE_OUTPUT_BYTES:],
+        "stderr": stderr[-DEFAULT_GATE_OUTPUT_BYTES:],
+    }
+
+
 def run_phase_gates(
     gates: list[dict[str, Any]],
     cli_args: argparse.Namespace,
@@ -1757,54 +1873,10 @@ def run_phase_gates(
     for gate in gates:
         cwd = resolve_cwd(str(gate["cwd"] or phase.get("cwd") or defaults.get("cwd") or cli_args.cwd))
         timeout = coerce_float(gate["timeout"], default=cli_args.timeout, field="gate timeout")
-        if cli_args.dry_run:
-            results.append({"name": gate["name"], "command": gate["run"], "cwd": str(cwd), "dry_run": True})
-            continue
-        started = time.monotonic()
-        try:
-            proc = subprocess.Popen(
-                ["/bin/sh", "-c", gate["run"]],
-                cwd=str(cwd),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=os.name == "posix",
-            )
-        except FileNotFoundError as exc:
-            raise YoyoError(f"Gate shell not found: {exc}") from exc
-        pgid: int | None = None
-        if os.name == "posix":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = None
-        if pgid is not None:
-            _register_child(pgid)
-        try:
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-                exit_code = proc.returncode
-            except subprocess.TimeoutExpired:
-                _terminate_child(proc, pgid)
-                stdout, stderr = proc.communicate()
-                exit_code = 124
-                stderr = (stderr or "") + f"\ngate timed out after {timeout}s"
-        finally:
-            if pgid is not None:
-                _unregister_child(pgid)
-        results.append(
-            {
-                "name": gate["name"],
-                "command": gate["run"],
-                "cwd": str(cwd),
-                "exit_code": exit_code,
-                "duration_s": round(time.monotonic() - started, 3),
-                "stdout": stdout[-DEFAULT_GATE_OUTPUT_BYTES:],
-                "stderr": stderr[-DEFAULT_GATE_OUTPUT_BYTES:],
-            }
-        )
-        if exit_code != 0:
-            return results, exit_code
+        result = run_shell_gate(gate["name"], gate["run"], cwd, timeout, cli_args.dry_run)
+        results.append(result)
+        if not result.get("dry_run") and result.get("exit_code", 0) != 0:
+            return results, result["exit_code"]
     return results, 0
 
 
@@ -2506,14 +2578,261 @@ def loop_state_done(state_path: Path) -> bool:
     return any(line.strip() == "STATUS: DONE" for line in text.splitlines())
 
 
+def resolve_done_policy(args: argparse.Namespace) -> str:
+    """Resolve and validate --done-policy against the verifiers actually supplied.
+
+    Passing --gate or --checker while the policy is still the default 'worker'
+    derives the obvious policy; a policy naming a verifier that was not supplied
+    (or a verifier supplied that the policy ignores) is a loud usage error.
+    Gate commands and the checker come only from these CLI flags, never from the
+    agent-rewritable state file or an injected skill — the state file must not
+    be a shell-command-injection surface in an unattended loop.
+    """
+    policy = getattr(args, "done_policy", None)
+    gates = list(getattr(args, "gate", None) or [])
+    checker = getattr(args, "checker", None)
+    if policy is None:
+        # No explicit policy: derive it from whichever verifiers were supplied.
+        derived = []
+        if gates:
+            derived.append("gate")
+        if checker:
+            derived.append("checker")
+        policy = "+".join(derived) if derived else "worker"
+    uses_gate = "gate" in policy
+    uses_checker = "checker" in policy
+    if uses_gate and not gates:
+        raise YoyoError("--done-policy includes 'gate' but no --gate command was given")
+    if uses_checker and not checker:
+        raise YoyoError("--done-policy includes 'checker' but no --checker agent was given")
+    if gates and not uses_gate:
+        raise YoyoError(f"--gate was given but --done-policy {policy!r} ignores gates; use --done-policy gate or gate+checker")
+    if checker and not uses_checker:
+        raise YoyoError(f"--checker was given but --done-policy {policy!r} ignores the checker; use --done-policy checker or gate+checker")
+    return policy
+
+
+def loop_verifiers_label(policy: str, gate_cmds: list[str], checker_name: str | None) -> str | None:
+    if policy == "worker":
+        return None
+    parts: list[str] = []
+    if "gate" in policy:
+        parts.append("the gate command(s) " + "; ".join(f"`{cmd}`" for cmd in gate_cmds))
+    if "checker" in policy:
+        parts.append(f"an independent checker agent ({checker_name})")
+    return " and ".join(parts)
+
+
+def resolve_loop_spec_path(args: argparse.Namespace) -> Path | None:
+    if not getattr(args, "spec", None):
+        return None
+    path = Path(args.spec).expanduser()
+    if not path.is_absolute():
+        path = resolve_cwd(args.cwd) / path
+    if not path.is_file():
+        raise YoyoError(f"--spec file not found: {path}")
+    return path
+
+
+def read_loop_spec(spec_path: Path | None, max_bytes: int) -> str | None:
+    """Read the standing spec fresh (so edits are picked up) under the byte cap."""
+    if spec_path is None:
+        return None
+    text, _, _ = read_input_file(spec_path, max_bytes)
+    return text.strip()
+
+
+def loop_git_diff(cwd: Path) -> str:
+    code, _ = git_capture(["git", "rev-parse", "--git-dir"], cwd)
+    if code != 0:
+        return ""
+    code, diff = git_capture(["git", "diff", "HEAD"], cwd)
+    return diff if code == 0 else ""
+
+
+def parse_checker_verdict(text: str) -> str | None:
+    """Return the last explicit VERDICT marker (PASS/FAIL) or None.
+
+    Only the marker the checker prompt explicitly demanded is parsed — never the
+    surrounding prose. This is the one blessed marker-check, not prose grading.
+    """
+    verdict: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip().upper()
+        if stripped.startswith("VERDICT:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value.startswith("PASS"):
+                verdict = "PASS"
+            elif value.startswith("FAIL"):
+                verdict = "FAIL"
+    return verdict
+
+
+def checker_call_args(
+    args: argparse.Namespace,
+    checker_name: str,
+    checker_model: str | None,
+    checker_spec: AgentSpec,
+    prompt_text: str,
+    trace_suffix: str,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        cwd=str(resolve_cwd(args.cwd)),
+        agent=checker_name,
+        role="review",
+        read_only=True,
+        caller=args.caller,
+        trace_id=f"{args.trace_id}:{trace_suffix}",
+        timeout=args.timeout,
+        max_input_bytes=args.max_input_bytes,
+        max_output_bytes=args.max_output_bytes,
+        model=checker_model,
+        agent_arg=loop_agent_args(checker_spec, None),
+        session=None,
+        session_info=None,
+        dry_run=False,
+        quiet=args.quiet,
+        idle_timeout=args.idle_timeout,
+        prompt=[prompt_text],
+        file=[],
+        skill=[],
+        use_stdin_context=False,
+    )
+
+
+def run_loop_checker(
+    args: argparse.Namespace,
+    checker_name: str,
+    checker_model: str | None,
+    agents: dict[str, AgentSpec],
+    task: str,
+    spec_text: str | None,
+    trace_suffix: str,
+) -> dict[str, Any]:
+    """Independent, read-only completion check, blind to the worker's state prose."""
+    cwd = resolve_cwd(args.cwd)
+    diff = loop_git_diff(cwd)
+    if not diff.strip():
+        diff = "(no uncommitted diff; inspect the repository directly)"
+    encoded = diff.encode("utf-8")
+    if len(encoded) > args.max_input_bytes:
+        diff = encoded[: args.max_input_bytes].decode("utf-8", errors="replace") + "\n[diff truncated by yoyo loop]"
+    spec_block = ("\n" + LOOP_SPEC_BLOCK.format(spec=spec_text) + "\n") if spec_text else ""
+    prompt_text = LOOP_CHECKER_PROMPT.format(cwd=cwd, task=task, spec_block=spec_block, diff=diff)
+    checker_spec = agents[checker_name]
+    call_args = checker_call_args(args, checker_name, checker_model, checker_spec, prompt_text, trace_suffix)
+    result = execute_agent_call(checker_name, call_args, build_prompt(call_args), agents)
+    text = str(result.get("stdout", ""))
+    cost: float | None = None
+    extracted = extract_loop_usage(checker_spec, text)
+    if extracted is not None:
+        text, cost, _ = extracted
+    exit_code = int(result.get("exit_code", 1))
+    verdict = parse_checker_verdict(text)
+    # Fail closed: a checker that errors or omits the verdict must not let a
+    # possibly-incomplete task exit as done.
+    passed = exit_code == 0 and verdict == "PASS"
+    return {"pass": passed, "verdict": verdict, "exit_code": exit_code, "cost_usd": cost, "tail": text.strip()[-800:]}
+
+
+def loop_gate_records(gate_cmds: list[str], cwd: Path, timeout: float) -> tuple[list[dict[str, Any]], int]:
+    results: list[dict[str, Any]] = []
+    for index, run in enumerate(gate_cmds):
+        result = run_shell_gate(f"gate-{index + 1}", run, cwd, timeout, dry_run=False)
+        results.append(result)
+        if result.get("exit_code", 0) != 0:
+            return results, result["exit_code"]
+    return results, 0
+
+
+def format_gate_rejection(failed: dict[str, Any]) -> str:
+    tail = (str(failed.get("stderr") or "") + str(failed.get("stdout") or "")).strip()[-1500:]
+    return (
+        "## VERIFICATION REJECTED — your STATUS: DONE was not accepted\n"
+        f"The completion gate `{failed.get('command')}` failed (exit {failed.get('exit_code')}).\n"
+        "Fix the underlying problem; only declare done once it passes. Last output:\n"
+        f"```\n{tail}\n```"
+    )
+
+
+def format_checker_rejection(verdict: dict[str, Any]) -> str:
+    if verdict.get("verdict") is None:
+        reason = f"the checker emitted no VERDICT line (treated as FAIL; checker exit {verdict.get('exit_code')})"
+    else:
+        reason = f"an independent checker returned VERDICT: {verdict.get('verdict')}"
+    tail = str(verdict.get("tail") or "").strip()[-1500:]
+    return (
+        "## VERIFICATION REJECTED — your STATUS: DONE was not accepted\n"
+        f"Completion check failed: {reason}.\n"
+        "Address the gaps it raised before declaring done again. Checker notes:\n"
+        f"```\n{tail}\n```"
+    )
+
+
+def reject_loop_done(state_path: Path, feedback: str) -> None:
+    """Strip the worker's false STATUS: DONE and append why it was rejected."""
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    kept = [line for line in text.splitlines() if line.strip() != "STATUS: DONE"]
+    body = "\n".join(kept).rstrip()
+    state_path.write_text(body + "\n\n" + feedback + "\n", encoding="utf-8")
+
+
+def verify_loop_done(
+    args: argparse.Namespace,
+    policy: str,
+    gate_cmds: list[str],
+    checker_name: str | None,
+    checker_model: str | None,
+    agents: dict[str, AgentSpec],
+    task: str,
+    spec_text: str | None,
+    trace_suffix: str,
+) -> dict[str, Any]:
+    """Decide whether a worker-written STATUS: DONE is accepted.
+
+    Gates run first (cheap, deterministic) before spending checker tokens. On
+    rejection, returns the feedback to append to the state file so the next
+    fresh iteration sees exactly why its claim was rejected.
+    """
+    cwd = resolve_cwd(args.cwd)
+    info: dict[str, Any] = {"accepted": True, "feedback": None, "gate": None, "checker": None, "cost_usd": None}
+    if "gate" in policy:
+        results, code = loop_gate_records(gate_cmds, cwd, args.timeout)
+        info["gate"] = results
+        if code != 0:
+            info["accepted"] = False
+            info["feedback"] = format_gate_rejection(results[-1])
+            return info
+    if "checker" in policy:
+        verdict = run_loop_checker(args, str(checker_name), checker_model, agents, task, spec_text, trace_suffix)
+        info["checker"] = verdict
+        info["cost_usd"] = verdict.get("cost_usd")
+        if not verdict["pass"]:
+            info["accepted"] = False
+            info["feedback"] = format_checker_rejection(verdict)
+            return info
+    return info
+
+
 def loop_iteration_args(
     args: argparse.Namespace,
     iteration: int,
     spec: AgentSpec,
     task: str,
     state_path: Path,
+    spec_text: str | None = None,
+    verifiers: str | None = None,
 ) -> argparse.Namespace:
-    body = LOOP_PROTOCOL.format(iteration=iteration, max_iter=args.max_iter, state_path=state_path, task=task)
+    parts: list[str] = []
+    if spec_text:
+        parts.append(LOOP_SPEC_BLOCK.format(spec=spec_text))
+    parts.append(LOOP_PROTOCOL.format(iteration=iteration, max_iter=args.max_iter, state_path=state_path, task=task))
+    if verifiers:
+        parts.append(LOOP_COMPLETION_CHECK.format(verifiers=verifiers))
+    body = "\n\n".join(parts)
     return argparse.Namespace(
         cwd=str(resolve_cwd(args.cwd)),
         agent=args.agent,
@@ -2576,9 +2895,17 @@ def loop_summary_line(summary: dict[str, Any]) -> str:
     cost_note = ""
     if isinstance(cost, (int, float)) and not isinstance(cost, bool):
         cost_note = f", total cost ${float(cost):.2f}"
+    verify_note = ""
+    if summary.get("end_reason") == "done":
+        verify_note = " (verified)" if summary.get("verified") else " (self-declared; no --done-policy gate)"
+    gate_failures = summary.get("gate_failures") or 0
+    checker_rejections = summary.get("checker_rejections") or 0
+    reject_note = ""
+    if gate_failures or checker_rejections:
+        reject_note = f", rejected done: {gate_failures} gate / {checker_rejections} checker"
     return (
-        f"loop {summary.get('loop_id')}: {summary.get('end_reason')} after "
-        f"{summary.get('iterations')} iterations{cost_note}, state {summary.get('state')}"
+        f"loop {summary.get('loop_id')}: {summary.get('end_reason')}{verify_note} after "
+        f"{summary.get('iterations')} iterations{cost_note}{reject_note}, state {summary.get('state')}"
     )
 
 
@@ -2651,13 +2978,30 @@ def cmd_loop(args: argparse.Namespace) -> int:
     spec = agents[args.agent]
     task = loop_task_text(args)
     state_path = resolve_loop_state_path(args)
+    policy = resolve_done_policy(args)
+    gate_cmds = list(getattr(args, "gate", None) or [])
+    for cmd in gate_cmds:
+        if not cmd.strip():
+            raise YoyoError("--gate command must not be empty")
+    spec_path = resolve_loop_spec_path(args)
+    spec_text = read_loop_spec(spec_path, args.max_input_bytes)
+    verifiers = loop_verifiers_label(policy, gate_cmds, args.checker)
     # Fail loudly on flag problems (e.g. --read-only on a custom agent without
     # read_only_args) before seeding state or detaching.
-    command_for_agent(spec, loop_iteration_args(args, 1, spec, task, state_path))
+    command_for_agent(spec, loop_iteration_args(args, 1, spec, task, state_path, spec_text, verifiers))
+    if args.checker:
+        if args.checker not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown checker agent {args.checker!r}. Known agents: {known}")
+        # The checker always runs read-only; fail loudly now if that can't be enforced.
+        command_for_agent(
+            agents[args.checker],
+            checker_call_args(args, args.checker, args.checker_model, agents[args.checker], "probe", "probe"),
+        )
     guard_loop_state_task(state_path, task)
 
     if args.dry_run:
-        iter_args = loop_iteration_args(args, 1, spec, task, state_path)
+        iter_args = loop_iteration_args(args, 1, spec, task, state_path, spec_text, verifiers)
         prompt = build_prompt(iter_args)
         result = execute_agent_call(args.agent, iter_args, prompt, agents)
         emit_dry_run_result(result, args.json)
@@ -2694,19 +3038,50 @@ def cmd_loop(args: argparse.Namespace) -> int:
         total_cost = 0.0
         cost_known = False
         consecutive_failures = 0
+        gate_failures = 0
+        checker_rejections = 0
         iterations_run = 0
         end_reason = "max-iter"
         rows: list[dict[str, Any]] = []
 
+        def accept_done(trace_suffix: str, current_spec: str | None) -> bool:
+            """A worker STATUS: DONE is a candidate; verify it under the policy.
+
+            On rejection, strip the false DONE, append the reason to the state
+            file so the next fresh iteration sees it, count it, and keep going.
+            """
+            nonlocal total_cost, cost_known, gate_failures, checker_rejections
+            if not loop_state_done(state_path):
+                return False
+            if policy == "worker":
+                return True
+            info = verify_loop_done(
+                args, policy, gate_cmds, args.checker, args.checker_model, agents, task, current_spec, trace_suffix
+            )
+            check_cost = info.get("cost_usd")
+            if isinstance(check_cost, (int, float)) and not isinstance(check_cost, bool):
+                total_cost += float(check_cost)
+                cost_known = True
+            if info["accepted"]:
+                return True
+            if info.get("checker") is not None and not info["checker"].get("pass"):
+                checker_rejections += 1
+            else:
+                gate_failures += 1
+            reject_loop_done(state_path, str(info["feedback"]))
+            eprint(f"loop {args.trace_id}: iteration's STATUS: DONE rejected by verification; continuing")
+            return False
+
         for iteration in range(1, args.max_iter + 1):
+            current_spec_text = read_loop_spec(spec_path, args.max_input_bytes)
             if stop_path.exists():
                 end_reason = "stop"
                 break
-            if loop_state_done(state_path):
+            if accept_done(f"{iteration}:precheck", current_spec_text):
                 end_reason = "done"
                 break
 
-            iter_args = loop_iteration_args(args, iteration, spec, task, state_path)
+            iter_args = loop_iteration_args(args, iteration, spec, task, state_path, current_spec_text, verifiers)
             prompt = build_prompt(iter_args)
             started = utc_now()
             result = execute_agent_call(args.agent, iter_args, prompt, agents)
@@ -2751,11 +3126,11 @@ def cmd_loop(args: argparse.Namespace) -> int:
 
             # Post-iteration checks in the brief's priority order: an iteration that
             # finishes the goal must report done even if it also crossed the budget
-            # or was itself a failure.
+            # or was itself a failure. A verified done outranks a self-declared one.
             if stop_path.exists():
                 end_reason = "stop"
                 break
-            if loop_state_done(state_path):
+            if accept_done(f"{iteration}:check", current_spec_text):
                 end_reason = "done"
                 break
             if args.budget_usd is not None and cost_known and total_cost >= args.budget_usd:
@@ -2776,6 +3151,10 @@ def cmd_loop(args: argparse.Namespace) -> int:
         "state": str(state_path),
         "iterations": iterations_run,
         "end_reason": end_reason,
+        "done_policy": policy,
+        "verified": end_reason == "done" and policy != "worker",
+        "gate_failures": gate_failures,
+        "checker_rejections": checker_rejections,
         "total_cost_usd": round(total_cost, 4) if cost_known else None,
         "exit_code": exit_code,
         "runs": rows,
@@ -3172,7 +3551,9 @@ def doctor_agent_names(agents: dict[str, AgentSpec], requested: list[str] | None
 
 
 def doctor_supports_read_only(spec: AgentSpec) -> bool:
-    return spec.flavor in ("codex", "claude", "pi", "cursor", "gemini", "grok") or bool(spec.read_only_args)
+    # agy is intentionally absent: it has no headless read-only mode, so its
+    # read-only probe is skipped and reported as unsupported.
+    return spec.flavor in ("codex", "claude", "pi", "cursor", "grok") or bool(spec.read_only_args)
 
 
 def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) -> argparse.Namespace:
@@ -3531,6 +3912,28 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--idle-timeout", type=float, default=None, help="Kill an iteration if it emits no output for this many seconds (hang guard)")
     loop.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     loop.add_argument("--model", help="Pass a model name to agents that support --model")
+    loop.add_argument(
+        "--gate",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Closed-form completion gate: a shell command (e.g. 'pytest -q'). STATUS: DONE is only accepted when every gate exits 0. Repeatable; CLI-only (never read from the state file).",
+    )
+    loop.add_argument(
+        "--done-policy",
+        choices=["worker", "gate", "checker", "gate+checker"],
+        default=None,
+        help="How STATUS: DONE is verified: worker (self-declared; the default when no verifier is given), gate (--gate commands pass), checker (--checker agent approves), or gate+checker. Auto-derived when --gate/--checker is passed.",
+    )
+    loop.add_argument(
+        "--checker",
+        help="Agent that independently verifies completion, blind to the worker's state-file prose (judges goal + git diff + repo, read-only). Implies a checker done-policy.",
+    )
+    loop.add_argument("--checker-model", help="Model for the --checker agent (recommend a cheaper tier than the worker, e.g. sonnet; not Haiku for completion judgment)")
+    loop.add_argument(
+        "--spec",
+        help="Immutable standing-spec file re-read every iteration and never rewritten (fights goal drift); distinct from the mutable --state file",
+    )
     loop.add_argument(
         "--read-only",
         action="store_true",

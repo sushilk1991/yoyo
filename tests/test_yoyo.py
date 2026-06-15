@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.11.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.12.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -547,23 +547,26 @@ class YoyoTests(unittest.TestCase):
         self.assertNotIn("--force", stdout)
         self.assertIn("mode=read-only delegation", stdout)
 
-    def test_ask_defaults_to_full_access_for_gemini(self):
+    def test_ask_defaults_to_full_access_for_agy(self):
         code, stdout, stderr = self.run_cli(
-            ["ask", "gemini", "--dry-run", "Do it."],
+            ["ask", "agy", "--dry-run", "Do it."],
         )
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn("gemini --skip-trust -o text --approval-mode yolo", stdout)
+        # agy carries the prompt as the -p value and runs full-access by default.
+        self.assertIn("agy -p", stdout)
+        self.assertIn("--add-dir", stdout)
+        self.assertIn("--dangerously-skip-permissions", stdout)
         self.assertIn("mode=full-access delegation", stdout)
 
-    def test_ask_read_only_constrains_gemini(self):
+    def test_ask_read_only_rejects_agy(self):
         code, stdout, stderr = self.run_cli(
-            ["ask", "gemini", "--dry-run", "--read-only", "Review it."],
+            ["ask", "agy", "--dry-run", "--read-only", "Review it."],
         )
 
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("gemini --skip-trust -o text --approval-mode plan", stdout)
-        self.assertIn("mode=read-only delegation", stdout)
+        # agy has no headless read-only mode, so --read-only must fail loudly.
+        self.assertEqual(code, 2)
+        self.assertIn("no headless read-only mode", stderr)
 
     def test_ask_defaults_to_full_access_for_grok(self):
         code, stdout, stderr = self.run_cli(
@@ -584,7 +587,7 @@ class YoyoTests(unittest.TestCase):
         self.assertIn("mode=read-only delegation", stdout)
 
     def test_on_demand_agents_pass_model_flag(self):
-        for agent, model in (("cursor", "sonnet-4"), ("gemini", "gemini-2.5-pro"), ("grok", "grok-4")):
+        for agent, model in (("cursor", "sonnet-4"), ("agy", "gemini-3.1-pro"), ("grok", "grok-4")):
             code, stdout, stderr = self.run_cli(
                 ["ask", agent, "--dry-run", "--model", model, "Do it."],
             )
@@ -593,7 +596,7 @@ class YoyoTests(unittest.TestCase):
             self.assertIn(f"--model {model}", stdout)
 
     def test_on_demand_agents_reject_session(self):
-        for agent in ("cursor", "gemini", "grok"):
+        for agent in ("cursor", "agy", "grok"):
             code, stdout, stderr = self.run_cli(
                 ["ask", agent, "--dry-run", "--session", "s1", "Do it."],
             )
@@ -2995,6 +2998,172 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("loop bg-loop: max-iter after 2 iterations", stdout)
 
+    def _done_each_call_stub(self, tmp, state):
+        """A worker stub that claims STATUS: DONE on every iteration."""
+        body = (
+            "import sys\n"
+            f"state = {str(state)!r}\n"
+            "sys.stdin.read()\n"
+            "open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
+            "print('claimed done')\n"
+        )
+        return self._loop_stub_command(tmp, body)
+
+    def _checker_config(self, tmp, checker_body, name="checkbot"):
+        script = Path(tmp) / f"{name}.py"
+        script.write_text(checker_body, encoding="utf-8")
+        config = Path(tmp) / "checker-agents.json"
+        config.write_text(
+            json.dumps(
+                {"agents": {name: {"command": ["python3", str(script)], "read_only_args": ["--ro"], "full_access_args": []}}}
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    def test_loop_gate_rejects_self_declared_done_and_strips_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            command = self._done_each_call_stub(tmp, state)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--gate", "exit 1", "--json", "do the work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            # A failing gate never lets the self-declared DONE end the loop.
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(summary["done_policy"], "gate")
+            self.assertFalse(summary["verified"])
+            self.assertEqual(summary["gate_failures"], 3)
+            self.assertEqual(summary["iterations"], 3)
+            # The false DONE line was stripped (the rejection text mentions the
+            # phrase, but no standalone STATUS: DONE line — what the loop checks —
+            # survives) and the rejection was recorded for the next iteration.
+            final_state = state.read_text(encoding="utf-8")
+            self.assertFalse(any(line.strip() == "STATUS: DONE" for line in final_state.splitlines()))
+            self.assertIn("VERIFICATION REJECTED", final_state)
+
+    def test_loop_gate_accepts_done_when_gate_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            done_body = (
+                f"state = {str(state)!r}\n"
+                "if calls == 2:\n"
+                "    open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
+            )
+            command, counter = self._counting_stub(tmp, done_body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--gate", "exit 0", "--json", "finish in two"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertTrue(summary["verified"])
+            self.assertEqual(summary["done_policy"], "gate")
+            self.assertEqual(summary["gate_failures"], 0)
+            self.assertEqual(summary["iterations"], 2)
+
+    def test_loop_gate_does_not_run_until_done_is_claimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The worker never claims done; the gate writes a marker if it ever runs.
+            command, _ = self._counting_stub(tmp)
+            marker = Path(tmp) / "gate-ran"
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--gate", f"touch {shlex.quote(str(marker))}", "--json", "never done"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(summary["gate_failures"], 0)
+            self.assertFalse(marker.exists(), "gate must not run when STATUS: DONE was never claimed")
+
+    def test_loop_done_policy_gate_without_gate_command_errors(self):
+        code, _, stderr = self.run_cli(["loop", "claude", "--done-policy", "gate", "do it"])
+        self.assertEqual(code, 2)
+        self.assertIn("no --gate command", stderr)
+
+    def test_loop_explicit_worker_policy_with_gate_is_a_conflict(self):
+        code, _, stderr = self.run_cli(["loop", "claude", "--done-policy", "worker", "--gate", "exit 0", "do it"])
+        self.assertEqual(code, 2)
+        self.assertIn("ignores gates", stderr)
+
+    def test_loop_checker_rejects_then_accepts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            worker = self._done_each_call_stub(tmp, state)
+            checker_counter = Path(tmp) / "checks.txt"
+            checker_body = (
+                "import os, sys\n"
+                f"counter = {str(checker_counter)!r}\n"
+                "sys.stdin.read()\n"
+                "n = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+                "n += 1\n"
+                "open(counter, 'w').write(str(n))\n"
+                "print('missing tests' if n == 1 else 'looks complete')\n"
+                "print('VERDICT: FAIL' if n == 1 else 'VERDICT: PASS')\n"
+            )
+            config = self._checker_config(tmp, checker_body)
+            env = {
+                "YOYO_STATE_DIR": str(Path(tmp) / "state"),
+                "YOYO_AGENT_WORKER": worker,
+                "YOYO_CONFIG": str(config),
+            }
+            code, stdout, stderr = self.run_cli(
+                ["loop", "worker", "--cwd", tmp, "--max-iter", "5", "--checker", "checkbot", "--json", "build it"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertTrue(summary["verified"])
+            self.assertEqual(summary["done_policy"], "checker")
+            self.assertEqual(summary["checker_rejections"], 1)
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(checker_counter.read_text(encoding="utf-8"), "2")
+
+    def test_loop_checker_unknown_agent_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--checker", "nope", "do it"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Unknown checker agent", stderr)
+
+    def test_loop_dry_run_shows_spec_block_and_completion_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "VISION.md"
+            spec.write_text("Never touch src/payments/.", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--spec", "VISION.md", "--gate", "pytest -q", "--dry-run", "Build the page."],
+                env={},
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("STANDING SPEC", stdout)
+            self.assertIn("Never touch src/payments/.", stdout)
+            self.assertIn("COMPLETION CHECK", stdout)
+            self.assertIn("pytest -q", stdout)
+
+    def test_loop_spec_file_not_found_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--spec", "missing.md", "do it"],
+                env={},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("--spec file not found", stderr)
 
     def test_ask_raw_sends_prompt_verbatim_with_no_wrapper(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\""}

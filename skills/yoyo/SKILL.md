@@ -1,6 +1,6 @@
 ---
 name: yoyo
-description: Delegates tasks to Codex, Claude, Pi — or, on demand, Cursor, Gemini, and Grok — as subagents, reviewers, workers, or second-opinion partners via the yoyo CLI. Use for multi-agent coordination, independent code review, scoped delegation, adversarial checks, fresh-context loops, and agent-to-agent handoffs.
+description: Delegates tasks to Codex, Claude, Pi — or, on demand, Cursor, Antigravity (agy), and Grok — as subagents, reviewers, workers, or second-opinion partners via the yoyo CLI. Use for multi-agent coordination, independent code review, scoped delegation, adversarial checks, fresh-context loops, and agent-to-agent handoffs.
 ---
 
 # Yoyo Multi-Agent Coordination
@@ -15,10 +15,10 @@ Default to the core trio — they support `--session` follow-ups and are the bat
 - `claude` — Anthropic. Default worker and the only agent that reports per-call cost, so `yoyo loop --budget-usd` is enforced only here.
 - `pi` — lightweight and cheap; good for small scoped worker tasks and quick opinions.
 
-`cursor`, `gemini`, and `grok` are **on-demand only**: one-shot (`--session` is rejected), reach for them when their specific edge fits — not as part of the regular rotation, and never to fan the same question out to every agent.
+`cursor`, `agy`, and `grok` are **on-demand only**: one-shot (`--session` is rejected), reach for them when their specific edge fits — not as part of the regular rotation, and never to fan the same question out to every agent.
 
 - `cursor` (Cursor agent CLI) — pro: cross-vendor model picker in one CLI (`--model gpt-5`, `sonnet-4`, ...; `cursor-agent --list-models`), editor-grade code edits. Con: needs `cursor-agent login` or `CURSOR_API_KEY`, bills through your Cursor plan. Use when you want a specific model yoyo's other agents don't expose, or an independent implementation pass.
-- `gemini` (Google Gemini CLI) — pro: very large context window, so it absorbs whole-repo dumps and long logs that overflow other agents; distinct vendor for tiebreaks. Con: weaker fit for surgical multi-file edits; output can be verbose. Use for huge-input review/summarization or a third-vendor opinion.
+- `agy` (Google Antigravity CLI — the Gemini CLI successor; Gemini CLI stops serving consumers 2026-06-18) — pro: Google's Gemini 3.x models plus a hosted Claude/GPT-OSS picker (`agy models`), large context, distinct vendor for tiebreaks; signs in via browser on first model call. Con: **full-access only — no headless read-only mode**, so it can't be a `review` or loop `--checker` agent or take `--read-only` (use codex/claude/pi there); takes the prompt as the `-p` value (handled internally); `yoyo chat agy` takes no initial prompt. Use for a full-access worker pass or a third-vendor opinion where editing is acceptable.
 - `grok` (xAI Grok CLI) — pro: a fourth independent vendor for adversarial cross-checks; Claude-Code-style permission modes map cleanly onto `--read-only`. Con: newer, less battle-tested harness; noisy stderr; `yoyo chat grok` takes no initial prompt. Use when you want one more genuinely independent opinion on a contested call.
 
 The decision rule: vendor diversity is the reason these exist. When two agents disagree, a third vendor breaks the tie better than a second call to the same model family — and an adversarial review is more credible from a different vendor than the one that wrote the code.
@@ -57,7 +57,7 @@ yoyo ask claude --raw "/goal ship the release"
 
 ```bash
 yoyo review --cwd "$PWD" --caller claude                 # codex + claude review the current diff in parallel
-yoyo review --agents codex,claude,gemini --base main --json
+yoyo review --agents codex,claude,grok --base main --json   # review needs read-only, so not agy
 ```
 
 `yoyo review` reviews the current git diff (uncommitted changes if the tree is dirty, otherwise `--base...HEAD`) with each named agent independently, read-only, in parallel, then a synthesizer agent (default: first of `--agents`) merges them into CONSENSUS findings (raised by ≥2 reviewers — the trustworthy ones) and SINGLE-REVIEWER findings (unconfirmed). Prefer it over hand-rolled fan-out when reviewing a diff before commit/PR; `--pr` posts the result as a GitHub PR comment via `gh`. Treat consensus findings as worth verifying first, not as automatically true.
@@ -81,7 +81,9 @@ The default `--timeout` is one hour of wall clock — an orphan guard, not a pro
 yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 10 --caller codex "Fix the failing tests, one per iteration."
 ```
 
-Use `yoyo loop` instead of grinding many rounds inside one ever-growing session: a long session re-reads its whole context on every call and cost compounds; a loop runs each iteration as a brand-new fresh-context session. Continuity lives in a state file (default `.yoyo/loop-state.md`) the worker reads first and rewrites before ending. The loop stops on `STATUS: DONE` in the state file, a `STOP` file beside it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. `--background` detaches the whole loop; poll with `yoyo wait` as above.
+Use `yoyo loop` instead of grinding many rounds inside one ever-growing session: a long session re-reads its whole context on every call and cost compounds; a loop runs each iteration as a brand-new fresh-context session. Continuity lives in a state file (default `.yoyo/loop-state.md`) the worker reads first and rewrites before ending. The loop stops on an accepted `STATUS: DONE` in the state file, a `STOP` file beside it, `--max-iter`, `--budget-usd` (enforced for claude, which reports per-iteration cost), or `--max-fail` consecutive failures. `--background` detaches the whole loop; poll with `yoyo wait` as above.
+
+Verified completion (opt-in): by default the worker grades its own `STATUS: DONE`. For unattended loops add an objective check so it can't quietly exit half-done. `--gate "pytest -q"` (repeatable) only accepts `STATUS: DONE` when the command exits 0; a failed gate strips the false DONE, appends the failure to the state file, and continues. `--checker <agent>` adds an independent read-only checker (blind to the worker's prose; judges goal + git diff + repo, ends in `VERDICT: PASS/FAIL`); pair with `--checker-model <cheap-tier>`. `--done-policy worker|gate|checker|gate+checker` (auto-derived from the flags) controls which apply. yoyo never grades prose — gates are closed-form evidence only. `--spec VISION.md` adds an immutable spec re-read every iteration (never rewritten) to hold constraints that the lossy state rewrite would otherwise drop. The `--json` summary reports `verified`, `gate_failures`, and `checker_rejections`.
 
 State-file guards: reusing a state file recorded for a different task fails loudly (pass a fresh `--state` path per task, or delete the state file and its `.task` sidecar to start over); a leftover `STOP` file is cleared at startup; a flock-held `.lock` file rejects a second concurrent loop on the same state file and releases automatically when the holding process exits.
 
