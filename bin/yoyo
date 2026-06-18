@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -2401,6 +2401,124 @@ def imagegen_exec_args(args: argparse.Namespace, out: Path) -> argparse.Namespac
     )
 
 
+def codex_image_cli_script() -> Path | None:
+    """Locate codex's bundled deterministic image CLI (image_gen.py), or None."""
+    codex_home = os.environ.get("CODEX_HOME")
+    base = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    script = base / "skills" / ".system" / "imagegen" / "scripts" / "image_gen.py"
+    return script if script.is_file() else None
+
+
+def image_cli_output_format(out: Path) -> str:
+    suffix = out.suffix.lower()
+    return "jpeg" if suffix in (".jpg", ".jpeg") else suffix.lstrip(".")
+
+
+def build_image_cli_command(
+    args: argparse.Namespace, out: Path, edit_path: Path | None, script: Path
+) -> list[str]:
+    # codex's image_gen.py needs the `openai` package; `uv run --with openai` supplies
+    # it in an ephemeral env without a global install. Fall back to the current
+    # interpreter when uv is absent (then `openai` must already be importable).
+    if shutil.which("uv"):
+        runner = ["uv", "run", "--quiet", "--with", "openai", "python"]
+    else:
+        runner = [sys.executable]
+    cmd = [*runner, str(script)]
+    if edit_path is not None:
+        cmd += ["edit", "--image", str(edit_path)]
+    else:
+        cmd += ["generate"]
+    # --no-augment keeps the caller's prompt verbatim (the default prepends
+    # "Primary request:"); --force writes exactly to --out instead of versioning it.
+    cmd += [
+        "--prompt", args.prompt_text,
+        "--out", str(out),
+        "--output-format", image_cli_output_format(out),
+        "--no-augment",
+        "--force",
+    ]
+    if args.size:
+        cmd += ["--size", args.size]
+    if args.quality:
+        cmd += ["--quality", args.quality]
+    if args.model:
+        cmd += ["--model", args.model]
+    cmd += args.agent_arg or []
+    return cmd
+
+
+def run_image_cli(
+    args: argparse.Namespace, out: Path, edit_path: Path | None, script: Path
+) -> dict[str, Any]:
+    """Generate an image deterministically via codex's bundled gpt-image CLI.
+
+    Unlike agent delegation, this is a single subprocess that writes the file
+    directly to --out: no LLM reasoning loop, no copy step, and it works headless
+    (the built-in image_gen tool is unavailable in `codex exec`).
+    """
+    cmd = build_image_cli_command(args, out, edit_path, script)
+    if args.dry_run:
+        spec_lines = [f"Image prompt:\n{args.prompt_text}"]
+        if edit_path is not None:
+            spec_lines.append(f"Edit reference: {edit_path}")
+        if args.size:
+            spec_lines.append(f"Size: {args.size}.")
+        if args.quality:
+            spec_lines.append(f"Quality: {args.quality}.")
+        return {
+            "agent": args.agent,
+            "command": cmd,
+            "prompt": "\n".join(spec_lines) + "\n",
+            "trace_id": args.trace_id,
+            "exit_code": 0,
+        }
+    cwd = resolve_cwd(args.cwd)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="yoyo-img-") as tmp:
+        tmpdir = Path(tmp)
+        stdout_path = tmpdir / "stdout.txt"
+        stderr_path = tmpdir / "stderr.txt"
+        label = f"imagegen {args.trace_id}".strip()
+        try:
+            proc = run_to_files(
+                cmd, "", cwd, stdout_path, stderr_path, args.timeout,
+                idle_timeout=resolve_idle_timeout(args),
+                heartbeat=resolve_heartbeat(args),
+                label=label,
+            )
+        except FileNotFoundError as exc:
+            raise YoyoError(
+                f"Image CLI runner not found: {cmd[0]!r}. Install `uv` (recommended) "
+                "or make the `openai` package importable by the current Python."
+            ) from exc
+        except subprocess.TimeoutExpired:
+            return _timeout_result(
+                args.agent, cmd, args, started, stdout_path, stderr_path,
+                f"Timed out after {args.timeout}s",
+            )
+        except AgentIdleTimeout as exc:
+            return _timeout_result(
+                args.agent, cmd, args, started, stdout_path, stderr_path,
+                f"Idle timeout after {exc.idle_seconds}s with no output "
+                f"({exc.captured_bytes} bytes captured before the stall)",
+            )
+        stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+        stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+        return {
+            "agent": args.agent,
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "duration_s": round(time.monotonic() - started, 3),
+            "trace_id": args.trace_id,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stderr_plain": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+
+
 def cmd_imagegen(args: argparse.Namespace) -> int:
     agents = load_agents()
     if args.agent not in agents:
@@ -2424,11 +2542,38 @@ def cmd_imagegen(args: argparse.Namespace) -> int:
         if not edit_path.is_file():
             raise YoyoError(f"Edit reference image not found: {edit_path}")
 
-    prompt = build_imagegen_prompt(args, out, edit_path)
-    exec_args = imagegen_exec_args(args, out)
     before = image_fingerprint(out)
 
-    result = execute_agent_call(args.agent, exec_args, prompt, agents)
+    # codex ships a deterministic image CLI (image_gen.py, backed by gpt-image-2)
+    # that writes the file directly. Its built-in image_gen tool is NOT exposed in
+    # headless `codex exec`, so delegating to a codex agent burns minutes and persists
+    # nothing. Use the CLI for codex; keep agent delegation for any other --agent that
+    # has its own image-generation capability.
+    spec = agents[args.agent]
+    script = codex_image_cli_script() if spec.flavor == "codex" else None
+    if spec.flavor == "codex" and script is None:
+        raise YoyoError(
+            "codex image CLI not found at "
+            "$CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py. "
+            "Reinstall codex (it ships the imagegen skill), or pass --agent <other>."
+        )
+
+    if script is not None:
+        if not args.dry_run and not os.environ.get("OPENAI_API_KEY"):
+            raise YoyoError(
+                "OPENAI_API_KEY is not set. The codex imagegen path renders via the "
+                "OpenAI Images API (billed to that account), which is separate from your "
+                "codex ChatGPT-subscription login. Codex's built-in image tool can render "
+                "interactively but cannot persist a file in headless `codex exec`, so yoyo "
+                "needs an API key here. Export OPENAI_API_KEY, or pass --agent <other> with "
+                "its own real image-generation capability."
+            )
+        result = run_image_cli(args, out, edit_path, script)
+    else:
+        prompt = build_imagegen_prompt(args, out, edit_path)
+        exec_args = imagegen_exec_args(args, out)
+        result = execute_agent_call(args.agent, exec_args, prompt, agents)
+
     if args.dry_run:
         emit_dry_run_result(result, args.json)
         return 0

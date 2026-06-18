@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.12.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.13.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -2547,7 +2547,94 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("Do NOT draw or render the image with code", stdout)
         self.assertIn(str(out), stdout)
+
+    def _fake_codex_home(self, tmp):
+        script = (
+            Path(tmp) / "codexhome" / "skills" / ".system"
+            / "imagegen" / "scripts" / "image_gen.py"
+        )
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("# fake codex image CLI\n", encoding="utf-8")
+        return script.parents[4]
+
+    def test_imagegen_codex_uses_bundled_image_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = self._fake_codex_home(tmp)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo on white, flat vector, no other text",
+                 "--out", str(out), "--size", "1024x1024", "--quality", "low", "--dry-run"],
+                env={"CODEX_HOME": str(codex_home), "YOYO_CONFIG": str(Path(tmp) / "missing.json")},
+            )
+        self.assertEqual(code, 0, stderr)
+        # Deterministic CLI path, not agent delegation.
+        self.assertIn("image_gen.py", stdout)
+        self.assertIn("generate", stdout)
+        self.assertIn("--no-augment", stdout)
+        self.assertIn("--force", stdout)
+        self.assertIn("--output-format png", stdout)
+        self.assertIn(str(out), stdout)
+        self.assertNotIn("Do NOT draw or render the image with code", stdout)
+
+    def test_imagegen_codex_edit_uses_cli_edit_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = self._fake_codex_home(tmp)
+            ref = Path(tmp) / "ref.png"
+            ref.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 4096)
+            out = Path(tmp) / "art-v2.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "make it blue", "--edit", str(ref), "--out", str(out), "--dry-run"],
+                env={"CODEX_HOME": str(codex_home), "YOYO_CONFIG": str(Path(tmp) / "missing.json")},
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("edit", stdout)
+        self.assertIn("--image", stdout)
+        self.assertIn(str(ref), stdout)
+
+    def test_imagegen_codex_missing_cli_errors_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "x", "--out", str(out), "--dry-run"],
+                env={"CODEX_HOME": str(tmp), "YOYO_CONFIG": str(Path(tmp) / "missing.json")},
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("codex image CLI not found", stderr)
         self.assertFalse(out.exists())
+
+    def test_imagegen_codex_requires_api_key_with_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = self._fake_codex_home(tmp)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--out", str(out)],
+                env={
+                    "CODEX_HOME": str(codex_home),
+                    "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+                    "OPENAI_API_KEY": "",
+                },
+            )
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("OPENAI_API_KEY is not set", stderr)
+        # The error must explain the subscription-vs-API distinction, not just
+        # surface a bare "no key" — that confusion is what bred the wrong consensus.
+        self.assertIn("subscription", stderr.lower())
+        self.assertFalse(out.exists())
+
+    def test_imagegen_codex_dry_run_does_not_require_api_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = self._fake_codex_home(tmp)
+            out = Path(tmp) / "art.png"
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--out", str(out), "--dry-run"],
+                env={
+                    "CODEX_HOME": str(codex_home),
+                    "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+                    "OPENAI_API_KEY": "",
+                },
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("image_gen.py", stdout)
 
     def test_install_skill_skips_imagegen_skill_without_codex(self):
         with tempfile.TemporaryDirectory() as tmp:

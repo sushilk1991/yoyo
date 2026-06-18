@@ -239,7 +239,7 @@ Per agent: claude uses `--session-id` on create and `--resume` on follow-up (ses
 
 ## Image Generation
 
-`yoyo imagegen` generates a real raster image by delegating to an agent with a native image-generation tool. The default agent is codex, whose bundled `imagegen` skill uses the built-in `image_gen` tool (GPT-image models, no API key needed):
+`yoyo imagegen` generates a real raster image with GPT-image. For the default agent (codex) it runs codex's bundled deterministic image CLI (`image_gen.py`, backed by `gpt-image-2`) as a single subprocess that writes the file straight to `--out` in ~15–25s:
 
 ```bash
 yoyo imagegen "Hand-drawn flowchart in black marker on white, four boxes labeled 'SPEC', 'BUILD', 'GATE', 'REVIEW', bold arrows. No other text." --out flow.png --size 1536x1024 --quality high
@@ -247,11 +247,13 @@ yoyo imagegen "make the background white" --edit flow.png --out flow-v2.png
 yoyo imagegen "..." --out hero.png --json
 ```
 
-The delegated prompt forbids code-drawn output (no PIL, no SVG, no matplotlib) and instructs the agent to fail rather than fake it. Yoyo then verifies the artifact deterministically: the file must exist at `--out`, have changed since before the call, start with the correct magic bytes for its extension (`.png`, `.jpg`, `.jpeg`, `.webp`), and have a plausible size. A renamed SVG or a stale leftover file fails the run loudly.
+This needs `OPENAI_API_KEY` (the call bills via the OpenAI Images API) and `uv` on PATH (it supplies the `openai` package in an ephemeral env). The codex built-in `image_gen` tool is deliberately **not** used: it is unavailable in headless `codex exec` and never persists a file there, so a delegated agent would burn minutes and produce nothing. The CLI path is fast, deterministic, and persists reliably.
 
-`--size WIDTHxHEIGHT` and `--quality low|medium|high|auto` pass through as hints; `--edit existing.png` switches to edit mode with that image as the reference. Use `--quality low` to iterate on composition, then regenerate the final at `high`.
+Yoyo verifies the artifact deterministically: the file must exist at `--out`, have changed since before the call, start with the correct magic bytes for its extension (`.png`, `.jpg`, `.jpeg`, `.webp`), and have a plausible size. A renamed SVG or a stale leftover file fails the run loudly.
 
-The bundled `yoyo-imagegen` skill teaches calling agents when to reach for images (flow diagrams in plans, whimsical explainer notes, architecture sketches) and how to write prompts that produce document-quality results. It installs only when codex is on PATH, since codex provides the default image tool.
+`--size WIDTHxHEIGHT` and `--quality low|medium|high|auto` pass through to the model; `--edit existing.png` switches to edit mode with that image as the reference. Use `--quality low` to iterate on composition, then regenerate the final at `high`. `--agent <other>` delegates to a different configured agent that has its own image capability instead of using the CLI.
+
+The bundled `yoyo-imagegen` skill teaches calling agents when to reach for images (flow diagrams in plans, whimsical explainer notes, architecture sketches) and how to write prompts that produce document-quality results. It installs only when codex is on PATH, since codex bundles the `image_gen.py` CLI it drives.
 
 ## Live Doctor
 

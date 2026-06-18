@@ -1,11 +1,13 @@
 ---
 name: yoyo-imagegen
-description: Generate real raster images (diagrams, explainer illustrations, plan visuals, mockups, posters) through yoyo imagegen, which delegates to Codex's native GPT-image tool. Use when a document, plan, HTML report, or explanation would land better with a visual, or when the user asks for an image, diagram, illustration, or mockup.
+description: Generate real raster images (diagrams, explainer illustrations, plan visuals, mockups, posters) through yoyo imagegen, which renders with GPT-image (gpt-image-2). Use when a document, plan, HTML report, or explanation would land better with a visual, or when the user asks for an image, diagram, illustration, or mockup.
 ---
 
 # Yoyo Imagegen
 
-`yoyo imagegen` generates a real model-rendered image by delegating to an agent with a native image-generation tool (default: codex, whose `imagegen` skill uses the built-in `image_gen` GPT-image tool). Yoyo verifies the artifact deterministically: the file must exist, have changed, carry correct magic bytes for its extension, and have a plausible size. A code-drawn fake (PIL, SVG, matplotlib) fails the run.
+`yoyo imagegen` generates a real model-rendered image with GPT-image. For the default agent (codex) it shells out to codex's bundled deterministic image CLI (`image_gen.py`, backed by `gpt-image-2`): one subprocess that writes the file straight to `--out` in ~15–25s, with no LLM reasoning loop and no copy step. Yoyo verifies the artifact deterministically: the file must exist, have changed, carry correct magic bytes for its extension, and have a plausible size — which rejects non-image junk, a stale leftover, or a renamed SVG. It does not prove the bytes are a model render rather than a code-drawn PNG (a PIL- or matplotlib-saved PNG passes these checks), so always Read the result yourself before trusting it. On the default codex path a code-drawn fake cannot arise anyway: the bundled CLI only calls the image API, never an agent that could draw one.
+
+Requirements: `OPENAI_API_KEY` must be set — this path bills via the OpenAI Images API, which is **separate from codex's ChatGPT-subscription login**. That subscription can render images in an interactive codex session but cannot persist a file under headless `codex exec` (the built-in tool returns the image in chat only, and nothing reaches the exec filesystem), so it is not a substitute for the key here. `uv` should be on PATH so the `openai` package is supplied automatically. If the key is missing, `yoyo imagegen` fails fast with this explanation instead of burning a subprocess.
 
 ## Command
 
@@ -64,4 +66,4 @@ When writing a plan, report, or HTML document that explains a flow, lifecycle, a
 
 - Never draw images with code as a fallback; if generation fails, report it and continue without the image.
 - Images explain; they do not carry load-bearing facts. Keep the authoritative details in text.
-- This skill ships with yoyo but installs only when codex is present, since codex provides the default image tool. `--agent` can target another configured agent that has a real image-generation capability.
+- This skill ships with yoyo but installs only when codex is present, since codex bundles the `image_gen.py` CLI it drives. If generation fails with a missing-key or missing-`uv` error, surface it and continue without the image. `--agent` can target another configured agent that has its own real image-generation capability (that path delegates to the agent instead of the CLI).
