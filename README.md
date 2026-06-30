@@ -1,12 +1,23 @@
 # yoyo
 
-`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. It lets Codex, Claude, Pi, or configured custom agents ask each other for second opinions, reviews, scoped worker tasks, and interactive sessions. Cursor (`cursor-agent`), Antigravity (`agy`), and Grok are also built in as on-demand, one-shot agents — for when cross-vendor diversity is the point (tiebreaks, adversarial checks, huge-context review); the bundled skill documents when to reach for each.
+`yoyo` is a tiny, dependency-free CLI for calling one coding agent from another. Codex, Claude, Pi (and configured custom agents) can ask each other for second opinions, reviews, scoped work, deep research, and interactive sessions. Cursor, Antigravity (`agy`), and Grok are built in as on-demand, one-shot agents for when cross-vendor diversity is the point.
 
-The design is deliberately boring: one Python script, subprocess calls, explicit prompts, no daemon, no package manager requirement.
+The design is deliberately boring: one Python script, subprocess calls, explicit prompts. No daemon, no package manager. Requires Python 3.9+.
 
-It also includes `yoyo workflow`, a local multi-agent runner for reusable fan-out and audit workflows. A workflow is a JSON spec that runs phases in order, runs jobs within a phase in parallel, passes per-job agent/model/role settings to `yoyo ask`, and can feed previous phase results into later read-only review jobs.
+## Commands at a glance
 
-Requires Python 3.9+.
+| Command | What it does |
+| --- | --- |
+| `yoyo ask <agent> "..."` | One-shot call: opinion, review, or scoped worker task |
+| `yoyo research "..."` | Fan a topic out to agents under different lenses, synthesize a decision brief |
+| `yoyo review` | Cross-vendor consensus review of the current git diff |
+| `yoyo loop <agent> "..."` | Run a task as repeated fresh-context iterations at flat cost |
+| `yoyo chat <agent>` | Interactive session |
+| `yoyo workflow <name>` | Run a saved multi-agent workflow from a JSON spec |
+| `yoyo imagegen "..." --out f.png` | Generate a real image with GPT-image |
+| `yoyo runs` / `wait` / `sessions` / `doctor` / `agents` / `skills` | Manage runs, sessions, and setup |
+
+Output is verifiable, not authoritative: treat any agent's answer as evidence to check, not an oracle.
 
 ## Install
 
@@ -16,138 +27,81 @@ cd yoyo
 ./install.sh
 ```
 
-This installs:
+This installs `~/.local/bin/yoyo`, the bundled skills (for Codex, Claude, Pi, OpenCode, and compatible skill dirs), workflow templates at `~/.config/yoyo/workflows/`, the `yoyo-imagegen` skill (only when codex is on PATH), and a source pointer for `yoyo update`. Make sure `~/.local/bin` is on `PATH`.
 
-- `~/.local/bin/yoyo`
-- the bundled `yoyo` and `yoyo-workflow` skills for Codex, Claude, Pi, OpenCode, and agent-compatible skill directories when their standard directories are present or creatable
-- bundled workflow templates at `~/.config/yoyo/workflows/`
-- the `yoyo-imagegen` skill (only when codex is on PATH)
-- a source checkout pointer at `~/.config/yoyo/source`, used by `yoyo update`
+Update later with `yoyo update` (fetch + ff-only pull + reinstall), or `yoyo update --no-pull` to reinstall from the current checkout.
 
-Make sure `~/.local/bin` is on `PATH`.
+## Agents
 
-Update the local install from the recorded checkout:
+| Agent | Command | Notes |
+| --- | --- | --- |
+| `codex` | `codex exec` | Default reviewer/second opinion; powers `imagegen` |
+| `claude` | `claude -p` | Default worker; only agent that reports per-call cost (so `loop --budget-usd` is enforced here) |
+| `pi` | `pi -p --mode text` | Lightweight and cheap |
+| `cursor` | `cursor-agent -p` | On-demand. Cross-vendor model picker (`--model gpt-5`, `sonnet-4`, …) |
+| `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). **Full-access only** — no read-only mode |
+| `grok` | `grok` | On-demand. A fourth independent vendor for adversarial cross-checks |
 
-```bash
-yoyo update
-```
+`codex`, `claude`, and `pi` support `--session` follow-ups and are the battle-tested defaults. The on-demand agents are one-shot only — reach for them when a specific edge fits (a model the others don't expose, a third vendor to break a tie), not as a default rotation. On-demand agents authenticate through their own CLIs. Probe any agent with a real call: `yoyo doctor --live --agent <name>`.
 
-This runs `git fetch`, `git pull --ff-only`, then `install.sh`. Reinstall from the current checkout without pulling:
+Built-in agents depend on specific CLI flags (codex's `exec`/`--sandbox`/`--output-last-message`; claude's `-p`/`--permission-mode`/`--tools`; pi's `--mode`/`--tools`). yoyo doesn't detect CLI versions, so a renamed flag surfaces as an agent error — run `yoyo doctor --live` after upgrading a CLI to catch drift early.
 
-```bash
-yoyo update --no-pull
-```
+## Ask
 
-## Usage
-
-Check available agents:
+`yoyo ask` is one-shot and full-access by default (so agent-to-agent calls don't stall on permission prompts). `--role` defaults to `opinion`; pass `review` or `worker` for those behaviors. Use `--read-only` for a bounded reviewer or untrusted input.
 
 ```bash
-yoyo doctor
-yoyo agents
-```
-
-`yoyo doctor` also reports whether a source checkout has been recorded for `yoyo update`.
-
-Built-in agents: `codex`, `claude`, `pi` (session-capable defaults) plus on-demand one-shot agents `cursor`, `agy`, `grok`. The on-demand agents authenticate through their own CLIs (`cursor-agent login` or `CURSOR_API_KEY`; `grok` signs in on first interactive run; `agy` — Google Antigravity, the successor to the Gemini CLI — opens a browser to sign in on its first model call). `agy` has no headless read-only mode (its `--sandbox` only restricts the terminal, not file writes), so it runs **full-access only** and cannot be a `review`, `--read-only`, or loop `--checker` agent — use `codex`/`claude`/`pi` there. Probe one with a real call via `yoyo doctor --live --agent <name>`.
-
-Ask for a second opinion:
-
-```bash
+# Second opinion
 yoyo ask claude --role opinion "Challenge this design and list failure modes."
+
+# Read-only review (the repo, not the prompt, is the source of truth)
+yoyo ask codex --role review --read-only --cwd "$PWD" --file bin/yoyo "Find correctness bugs and missing tests."
+
+# Scoped worker with write access
+yoyo ask pi --role worker --cwd "$PWD" "Fix the failing test. Don't touch unrelated files."
+
+# Pipe context
+git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff against the worktree."
+
+# Break a tie with a different vendor
+yoyo ask agy --role opinion --cwd "$PWD" "codex and claude disagree on this migration. Decide, with reasons."
 ```
 
-`--role` defaults to `opinion`; specify `review` or `worker` when you want those behaviors.
-
-Pass a slash command through to the target CLI:
+**Steer output with a skill.** `--skill <name>` (repeatable) injects a named `SKILL.md` into the prompt as guidance — the main lever for making an unpredictable agent produce consistent results: the skill says *how*, the prompt says *what*. Names resolve by directory from `YOYO_SKILL_PATH`, then `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, and Pi's skills dir; a missing skill fails loudly. Discover with `yoyo skills`.
 
 ```bash
-yoyo ask claude --raw "/goal ship the release"
+yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design "Build the settings page. Keep it minimal."
 ```
 
-`--raw` sends the positional prompt text verbatim with no role preamble, calling-context line, or `Task:` wrapper, so a leading `/command` arrives as the first token and the target CLI can expand it (Claude Code only treats a prompt as a slash command when it starts with `/`). It is mutually exclusive with `--role` and requires positional prompt text; piped stdin and `--file` context are still appended after the raw prompt. Whether a given CLI expands slash commands in non-interactive mode is the target CLI's behavior, not yoyo's — verify with `--dry-run` plus a cheap probe.
+**Writing good prompts:** put the instruction first; attach context with `--cwd`/`--file`/stdin; state the success criterion, scope, and exclusions; ask reviewers to falsify ("find the strongest reason this is wrong"); replace vague words ("good", "clean") with observable criteria. Let the worktree be the source of truth.
 
-By default, `yoyo ask` is one-shot, full-access, and configured not to ask follow-up permission prompts where the target agent supports that. Use `--read-only` for constrained review.
-When full-access mode includes piped stdin or `--file` context, `yoyo` prints a warning because that context may be untrusted.
+**Other flags:** `--raw` sends the prompt verbatim (no role/context wrapper) so a leading `/command` reaches the target CLI; `--json` emits a result envelope; `--trace-id` tags a call; `--model` passes a model through; `--max-output-bytes` / `--max-input-bytes` cap output and (stdin + `--file`) input. Calls default to a one-hour timeout — a hung-process guard, not a progress budget; don't shorten it for real work. A periodic stderr heartbeat keeps a working agent from looking hung (`--quiet` to disable); `--idle-timeout` adds a no-output hang guard for agents that stream.
 
-Review a file:
+## Research
+
+`yoyo research` gathers **diverse perspectives before you decide what to do next** — it does not hunt for one right answer. Each lens runs as one parallel agent call investigating from a single angle; a synthesizer then writes a decision brief: where perspectives converge, where they're in **tension** (the most useful part), key evidence, open questions, and options for next steps.
 
 ```bash
-yoyo ask codex --role review --cwd "$PWD" --file bin/yoyo "Find correctness bugs and missing tests. Inspect the repo as needed."
+yoyo research --cwd "$PWD" "Should we move the core engine to Rust?"
+yoyo research --lenses proponent,skeptic,analyst --agents codex,claude --json "Is WebGPU ready for our renderer?"
+yoyo research --lenses regulatory,market,security --file rfc.md "Adopt passkeys for login?"
 ```
 
-Delegate scoped work:
+Default lenses are `proponent,skeptic,analyst,explorer,pragmatist` — the case for, the case against, first-principles facts, prior art and alternatives, and the execution path. Lenses are assigned to `--agents` round-robin, so by default the for/against split lands on different vendors — a real disagreement, not one model arguing with itself. Unknown lens names become ad-hoc angles, so `--lenses regulatory,market,security` works for domain-specific research. Each lens is one call, so subset `--lenses` to spend less.
+
+Unlike `review`, research defaults to **full-access** so agents can use web search, fetch, and code execution to investigate; `--read-only` restricts them but limits those tools on some agents. `--file` adds shared context to every researcher. The synthesis surfaces disagreement rather than averaging it — verify the load-bearing claims yourself before acting.
+
+## Review
+
+`yoyo review` runs a cross-vendor consensus review of the current git diff: each agent reviews the same diff independently, in parallel, read-only, then a synthesizer merges the results.
 
 ```bash
-yoyo ask pi --role worker --cwd "$PWD" "Fix the failing test. Do not touch unrelated files."
+yoyo review --cwd "$PWD"                         # codex + claude in parallel
+yoyo review --agents codex,claude,grok --json    # three vendors (review needs read-only, so not agy)
+yoyo review --base main --pr                      # review committed work, post as a PR comment via gh
 ```
 
-Pipe context:
-
-```bash
-git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff. Use the current worktree as the source of truth."
-```
-
-Break a tie with a different vendor (on-demand agents):
-
-```bash
-yoyo ask agy --role opinion --cwd "$PWD" "codex and claude disagree on whether this migration is safe. Decide, with reasons."  # agy is full-access only; the opinion role keeps it from editing
-yoyo ask grok --role review --read-only --cwd "$PWD" --file src/auth.ts "Adversarial review: find the strongest reason this change is wrong."
-yoyo ask cursor --model gpt-5 --role opinion "Critique this API design."
-```
-
-For repo review, the worktree is the primary context. A diff is useful focus, but diff-only review can miss callers, tests, config, generated behavior, and adjacent invariants. Prefer `--cwd "$PWD"` plus a diff or `--file` context.
-
-Steer the target agent with a skill:
-
-```bash
-yoyo ask codex --role worker --cwd "$PWD" --skill frontend-design "Build the settings page. Keep the change minimal."
-```
-
-`--skill <name>` (repeatable) injects a named `SKILL.md` into the delegated prompt as guidance. This is the main lever for making an otherwise unpredictable agent produce consistent results: the skill constrains *how* the work is done while the prompt states *what* to do. Skills are resolved by directory name from `YOYO_SKILL_PATH` (colon-separated), then `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, and the Pi skills directory. First match wins; a missing skill fails loudly before the agent is launched. Per-skill content is capped by `YOYO_SKILL_MAX_BYTES` (default 100000).
-
-List discoverable skills:
-
-```bash
-yoyo skills
-yoyo skills --json
-```
-
-JSON output:
-
-```bash
-yoyo ask claude --json --role opinion "Return one risk."
-```
-
-Trace a delegated call:
-
-```bash
-yoyo ask claude --trace-id "auth-review-001" --json "Review this plan."
-```
-
-Agent calls default to a one-hour timeout. The timeout is a hung-process guard, not a progress budget. Do not shorten it for real reviews, audits, or worker delegations; short caps are only for deterministic smoke tests with fake or trivial agents. Override with `--timeout` or `YOYO_TIMEOUT` only when you have an explicit operational reason.
-
-Long calls print a periodic progress heartbeat to stderr so a working agent is not mistaken for a hung one (`--quiet` or `YOYO_HEARTBEAT_SECS=0` disables it; `YOYO_HEARTBEAT_SECS` sets the interval). For a stricter hang guard on agents that stream output, add `--idle-timeout <seconds>` (or `YOYO_IDLE_TIMEOUT`) to terminate an agent that goes silent. yoyo reads stdin as context only when input is actually available, so an open-but-idle stdin can no longer block the call before the agent starts; use `--stdin-wait <seconds>` to wait for a slow producer or `--no-stdin` to ignore stdin entirely.
-
-Limit captured output:
-
-```bash
-yoyo ask codex --max-output-bytes 200000 "Summarize this repo."
-```
-
-Limit captured input:
-
-```bash
-git diff | yoyo ask claude --cwd "$PWD" --max-input-bytes 200000 "Review this diff. Inspect the worktree as needed."
-```
-
-Open an interactive session:
-
-```bash
-yoyo chat claude
-yoyo chat codex --cwd "$PWD" "Help me debug this repo."
-yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
-```
+A dirty tree reviews `git diff HEAD`; a clean tree reviews `<base>...HEAD` (`--base` auto-detects origin HEAD, then `main`, then `master`). The synthesizer (`--synthesizer`, default: first of `--agents`) splits findings into **CONSENSUS** (raised by ≥2 reviewers — the trustworthy signal) and **SINGLE-REVIEWER** (unconfirmed). One reviewer failing is reported and the rest proceed; only all reviewers failing exits non-zero. Untracked files aren't in a git diff, so they're listed in the prompt for reviewers to read (`git add` them to review their contents). Reviewers must support read-only (built-ins do; custom agents need `read_only_args`).
 
 ## Loops
 
@@ -157,107 +111,68 @@ yoyo chat pi --agent-arg=--provider --agent-arg=anthropic --model haiku
 yoyo loop claude --cwd "$PWD" --max-iter 30 --budget-usd 20 "Fix the failing tests, one per iteration."
 ```
 
-Why fresh context instead of one long session: a long-lived agentic session grows its context monotonically and re-reads all of it on every tool call, so cost compounds without bound (in practice most of the spend becomes cache reads, not useful output). `yoyo loop` makes each iteration a brand-new session with empty context; continuity lives in a small state file (default `.yoyo/loop-state.md`, relative to `--cwd`) that the agent reads first and rewrites before ending. Per-iteration cost stays flat instead of growing with the loop's age.
-
-Each iteration is a normal `ask`-style call: `--role` (defaults to `worker`), `--skill`, `--cwd`, `--timeout`, `--read-only`, and the byte caps pass through unchanged, and the injected loop protocol tells the agent to read the state file, do one increment of work, rewrite the state file, and write a line `STATUS: DONE` when the overall goal is complete and verified.
-
-The loop ends on the first of: a `STOP` file next to the state file, an accepted `STATUS: DONE` in the state file, `--max-iter` (default 20), `--budget-usd` reached, or `--max-fail` consecutive failed iterations (default 3 — the only ending that exits 1; the rest exit 0). `--interval <seconds>` sleeps between iterations.
+A long-lived session re-reads its whole growing context on every tool call, so cost compounds. A loop makes each iteration a brand-new session with empty context; continuity lives in a small state file (default `.yoyo/loop-state.md`) the agent reads first and rewrites before ending. Per-iteration cost stays flat. `--role` (default `worker`), `--skill`, `--cwd`, `--read-only`, and byte caps pass through. The loop ends on the first of: a `STOP` file beside the state file, an accepted `STATUS: DONE`, `--max-iter` (default 20), `--budget-usd`, or `--max-fail` consecutive failures (default 3 — the only exit-1 ending).
 
 ### Verified completion (opt-in)
 
-By default a single agent both does the work and writes its own `STATUS: DONE` — it grades its own homework, which over many iterations drifts toward "done enough." `--done-policy` makes that `STATUS: DONE` a *candidate* that must clear an objective check before the loop accepts it. yoyo never grades the agent's prose; you supply the closed-form evidence.
+By default the agent grades its own `STATUS: DONE`, which drifts toward "done enough" over many iterations. These flags make `DONE` a *candidate* that must clear an objective check — yoyo never grades prose, you supply the closed-form evidence:
 
 ```bash
-# Closed-form gate: DONE is accepted only when the command exits 0.
-yoyo loop claude --cwd "$PWD" --gate "pytest -q" "Fix the failing auth tests, one per iteration."
-
-# Independent checker: a separate, cheaper agent re-derives whether the repo meets the goal.
+yoyo loop claude --cwd "$PWD" --gate "pytest -q" "Fix the failing auth tests."
 yoyo loop claude --checker codex --checker-model <cheap-model> "Migrate the DB layer."
-
-# Both — the strongest practical mode.
-yoyo loop claude --gate "make ci" --checker codex --done-policy gate+checker "..."
+yoyo loop claude --gate "make ci" --checker codex "..."   # both — the strongest mode
 ```
 
-- **`--gate CMD`** (repeatable) is a shell command — a test, type check, lint, or build. When the worker writes `STATUS: DONE`, every gate runs from `--cwd`; if any exits non-zero, yoyo strips the false `STATUS: DONE`, appends the gate's output to the state file so the next fresh iteration sees *why* it was rejected, and the loop continues. Gates come only from this flag, never from the agent-rewritable state file — the state file is not a shell-injection surface.
-- **`--checker AGENT`** runs an independent, read-only completion check, blind to the worker's state-file prose: it gets the goal, the standing spec, and the `git diff`, then re-derives whether the repository meets the goal and ends with a `VERDICT: PASS`/`VERDICT: FAIL` line (the one marker yoyo parses — never the surrounding prose). It fails closed: a checker that errors or omits the verdict does not let the loop exit. `--checker-model` picks its model — use a cheaper tier than the worker (e.g. `sonnet` against an Opus worker), but not Haiku, since judging completion is itself a judgment task.
-- **`--done-policy`** is `worker` (self-declared, the default), `gate`, `checker`, or `gate+checker`. It is auto-derived when you pass `--gate`/`--checker`, so you rarely set it explicitly; gates run before the checker so a cheap deterministic failure short-circuits before spending checker tokens.
+- **`--gate CMD`** (repeatable): a shell command (test/lint/build). On `DONE`, every gate runs from `--cwd`; any non-zero exit strips the false `DONE`, appends the failure to the state file so the next iteration sees why, and continues. Gates come only from this flag, never the agent-rewritable state file.
+- **`--checker AGENT`**: an independent read-only check, blind to the worker's prose — it gets the goal, spec, and `git diff`, re-derives whether the repo meets the goal, and ends with `VERDICT: PASS`/`FAIL`. It fails closed. `--checker-model` picks a cheaper tier (but not Haiku — judging is itself a judgment task).
+- **`--done-policy`** (`worker`/`gate`/`checker`/`gate+checker`) is auto-derived from the flags, so you rarely set it.
+- **`--spec PATH`**: a standing spec re-read every iteration and never rewritten — holds constraints ("don't touch `src/payments/`") that the lossy state rewrite would otherwise drop.
 
-The default stays `worker` — yoyo does not nag or inject a gate you didn't ask for. The final summary reports `done_policy`, `verified` (whether the terminal `done` was verification-backed or self-declared), and the count of `gate_failures` / `checker_rejections`, so a loop that keeps claiming-then-failing is visible rather than silent.
+State-file guards: a `.task` sidecar makes reusing a state file recorded for a *different* task fail loudly; a leftover `STOP` file is cleared at startup; a `.lock` (flock) rejects a second concurrent loop and releases when the process exits. For claude, iterations run with `--output-format json` so cost is real and `--budget-usd` is enforced; other agents get a one-time no-budget warning. `--background` detaches the whole loop; `--session` is rejected (fresh context is the point).
 
-`--spec PATH` adds a standing spec file that is **re-read every iteration and never rewritten** — distinct from the mutable `--state` file. The state file tells the agent where it is; the spec tells it where to go and what not to do. Because each iteration's state rewrite is lossy, "don't touch `src/payments/`"-style constraints drift away over a long loop; a spec the worker (and the checker) reads fresh every iteration holds them in place.
+**Cost levers:** a fresh `claude -p` session loads tens of thousands of tokens of harness context per call. For mechanical work, pass `--model sonnet` (or keep Opus with `--agent-arg=--effort=low`), and add `--agent-arg=--setting-sources=project` to drop user-level config from already-steered workers (one measured setup: $0.94 → $0.15 per iteration).
 
-Three guards protect the state file. A `<state>.task` sidecar records the task verbatim when the loop seeds state; starting a loop against a state file recorded for a *different* task fails loudly (same task resumes normally; pass a fresh `--state` path or delete both files to start over). A leftover `STOP` file from an earlier loop is deleted at startup with a notice — STOP is a runtime kill switch, not configuration, so touching it only stops a loop that is already running. And a `<state>.lock` file held via `flock` makes concurrent loops on the same state file impossible: the second loop exits with an error while the first holds the lock. The kernel releases the lock when the holding process exits — even on a crash — so stale locks cannot occur; the lockfile itself stays on disk by design and is harmless.
+## Background runs
 
-Per-iteration cost is dominated by the agent harness's own context, re-read on every API call inside the iteration — a default `claude -p` session loads tens of thousands of tokens before any work happens (measured ~40k on one 2026-06 setup, ~17k of it user-level configuration — global CLAUDE.md, user skills; your numbers will vary with your config). Two levers cut it: `--model sonnet` (Sonnet 4.6) — or keep Opus and lower thinking with `--agent-arg=--effort=low` — for mechanical iteration work, and `--agent-arg=--setting-sources=project` to drop user-level configuration from workers that are already steered by `--role`/`--skill` (same setup, same model, same one-iteration task: $0.94 default vs $0.15 with the flag).
-
-For claude, iterations run with `--output-format json`, so each per-iteration console line reports real cost and token usage and `--budget-usd` is enforced. Agents that don't report cost (codex, pi, custom) get a one-time warning and no budget enforcement; a malformed envelope degrades to raw text with unknown cost rather than killing the loop, with a loud per-iteration warning when a budget is set (an iteration with unparseable cost is invisible to `--budget-usd`). Every iteration is recorded in the run ledger stamped with a shared loop id (`yoyo runs list` shows `loop_id:iteration`), and `--json` emits a final machine-readable summary. `yoyo loop ... --background` detaches the whole loop exactly like `ask --background`: `yoyo wait <run_id>` blocks on the loop itself, while iterations still get their own ledger entries. `--session` is rejected loudly — fresh context per iteration is the point.
-
-## Review
-
-`yoyo review` runs a cross-vendor consensus code review of the current git diff:
-
-```bash
-yoyo review --cwd "$PWD"                            # codex + claude review in parallel
-yoyo review --agents codex,claude,grok --json       # three vendors, machine-readable envelope (review needs read-only, so not agy)
-yoyo review --base main --pr                        # review committed work, post the result as a PR comment via gh
-```
-
-Each named agent reviews the same diff independently, in parallel, read-only, with `--role review`. If the working tree is dirty the diff is `git diff HEAD` (staged + unstaged); on a clean tree it is `<base>...HEAD`, where `--base` defaults to the auto-detected origin HEAD, then `main`, then `master`. The diff is the review focus; the repo at `--cwd` stays available as the source of truth. Untracked files are never part of a git diff, so they are listed in the review prompt (with a stderr warning) for reviewers to read from the repo — `git add` them to make them part of the reviewed diff itself.
-
-With two or more successful reviews, a synthesizer agent (`--synthesizer`, default: the first of `--agents`) merges them into one report split into **CONSENSUS** findings (raised by two or more reviewers) and **SINGLE-REVIEWER** findings — agreement across vendors is the signal that a finding is real. One reviewer failing is reported and the rest proceed; if synthesis fails the raw reviews are printed instead; only all reviewers failing exits non-zero. `--pr` posts the consolidated review as a GitHub PR comment through the `gh` CLI.
-
-Reviewers must support read-only mode (built-in agents do; custom agents need `read_only_args`). The diff is capped at `--max-input-bytes` with a loud truncation warning.
-
-## Background Runs
-
-A real review or worker task can outlive the calling agent's own tool budget. `--background` detaches the run and records it in a durable run ledger, so the caller returns immediately and collects the result later:
+A real review or worker task can outlive the caller's tool budget. `--background` detaches the run into a durable ledger and returns immediately:
 
 ```bash
 run_id=$(yoyo ask codex --role review --cwd "$PWD" --background "Audit the auth module.")
 yoyo runs list
 yoyo wait "$run_id"            # blocks until done, exits with the run's exit code
 yoyo runs show "$run_id" --json
-yoyo runs prune --days 7       # delete old finished runs
+yoyo runs prune --days 7
 ```
 
-Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`): `meta.json` (agent, pid, trace id, argv), `result.json` (the standard JSON envelope), `log.txt` (stderr/heartbeats), and `stdin.txt` when context was piped. Status is derived, never stored: `done` (result.json parses), `running` (pid alive), `dead` (pid gone, no result). Argument validation still happens before detaching, so a bad agent name or cwd fails loudly in the foreground. One caveat inherent to pid-based liveness: if the OS recycles a dead child's pid, a crashed run can read as `running` until the impostor pid exits; `wait` then times out rather than reporting `dead`.
+`yoyo wait` exit codes: 124 = still running (wait again); 0 = success (result on stdout); anything else = failed or died. Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`). Argument validation still happens in the foreground, so a bad agent name fails loudly before detaching.
 
 ## Sessions
 
-`yoyo ask` is one-shot by default. `--session <name>` gives a named durable conversation with the target agent — the first call creates it, later calls continue it with full context:
+`--session <name>` gives a named durable conversation: the first call creates it, later calls continue it with full context.
 
 ```bash
 yoyo ask codex --session auth-review --role review --cwd "$PWD" "Review the auth changes."
-yoyo ask codex --session auth-review "Is the issue you flagged in middleware.py fixed by the latest commit?"
+yoyo ask codex --session auth-review "Is the middleware.py issue you flagged fixed now?"
 yoyo sessions list
 yoyo sessions rm codex:auth-review
 ```
 
-Per agent: claude uses `--session-id` on create and `--resume` on follow-up (session persistence re-enabled for these calls); codex creates a persistent `codex exec` session and yoyo records the session id from its banner, then resumes with `codex exec resume <id>` (sandbox passed via `-c sandbox_mode=...` because the resume subcommand has no `--sandbox` flag); pi uses `--session-id`, which creates or resumes with the same flag. The mapping name -> backend session id lives in `$YOYO_STATE_DIR/sessions.json`; `yoyo sessions rm` removes only the mapping, not the backend's stored conversation. The on-demand agents (cursor, agy, grok) and custom agents without a built-in flavor reject `--session` loudly. If a codex create call fails before the banner is captured, yoyo warns that the session was not recorded — a retry then starts a fresh conversation rather than resuming.
+The name → backend-session-id mapping lives in `$YOYO_STATE_DIR/sessions.json`; `sessions rm` removes only the mapping, not the backend's stored conversation. Sessions work with `codex`, `claude`, and `pi` (and `chat`); on-demand and custom agents reject `--session`.
 
-`--session` also works with `chat` for interactive follow-ups (codex chat can only resume an existing recorded session).
+## Image generation
 
-## Image Generation
-
-`yoyo imagegen` generates a real raster image with GPT-image. For the default agent (codex) it runs codex's bundled deterministic image CLI (`image_gen.py`, backed by `gpt-image-2`) as a single subprocess that writes the file straight to `--out` in ~15–25s:
+`yoyo imagegen` generates a real raster image with GPT-image via codex's bundled image CLI (`gpt-image-2`), written straight to `--out` in ~15–25s:
 
 ```bash
-yoyo imagegen "Hand-drawn flowchart in black marker on white, four boxes labeled 'SPEC', 'BUILD', 'GATE', 'REVIEW', bold arrows. No other text." --out flow.png --size 1536x1024 --quality high
+yoyo imagegen "Hand-drawn flowchart, four boxes SPEC/BUILD/GATE/REVIEW, bold arrows. No other text." --out flow.png --size 1536x1024 --quality high
 yoyo imagegen "make the background white" --edit flow.png --out flow-v2.png
-yoyo imagegen "..." --out hero.png --json
 ```
 
-This needs `OPENAI_API_KEY` (the call bills via the OpenAI Images API) and `uv` on PATH (it supplies the `openai` package in an ephemeral env). The codex built-in `image_gen` tool is deliberately **not** used: it is unavailable in headless `codex exec` and never persists a file there, so a delegated agent would burn minutes and produce nothing. The CLI path is fast, deterministic, and persists reliably.
+Needs `OPENAI_API_KEY` (bills via the OpenAI Images API) and `uv` on PATH. yoyo verifies the artifact deterministically: the file must exist, have changed, start with the right magic bytes for its extension (`.png`/`.jpg`/`.jpeg`/`.webp`), and have a plausible size. `--quality low|medium|high|auto` and `--size WxH` pass through. The bundled `yoyo-imagegen` skill teaches when and how to use it.
 
-Yoyo verifies the artifact deterministically: the file must exist at `--out`, have changed since before the call, start with the correct magic bytes for its extension (`.png`, `.jpg`, `.jpeg`, `.webp`), and have a plausible size. A renamed SVG or a stale leftover file fails the run loudly.
+## Doctor
 
-`--size WIDTHxHEIGHT` and `--quality low|medium|high|auto` pass through to the model; `--edit existing.png` switches to edit mode with that image as the reference. Use `--quality low` to iterate on composition, then regenerate the final at `high`. `--agent <other>` delegates to a different configured agent that has its own image capability instead of using the CLI.
-
-The bundled `yoyo-imagegen` skill teaches calling agents when to reach for images (flow diagrams in plans, whimsical explainer notes, architecture sketches) and how to write prompts that produce document-quality results. It installs only when codex is on PATH, since codex bundles the `image_gen.py` CLI it drives.
-
-## Live Doctor
-
-`yoyo doctor` checks that agent binaries exist. `yoyo doctor --live` goes further: it fires a real one-line probe through each found agent in both read-only and full-access mode, exercising the exact hardcoded flag paths yoyo depends on. Run it after upgrading claude/codex/pi to catch flag drift before it surfaces as a confusing mid-task failure:
+`yoyo doctor` checks that agent binaries exist. `yoyo doctor --live` fires a real one-line probe through each agent in both read-only and full-access mode, exercising the exact flag paths yoyo depends on — run it after upgrading a CLI to catch flag drift.
 
 ```bash
 yoyo doctor --live
@@ -265,245 +180,82 @@ yoyo doctor --live --agent codex --timeout 60 --json
 yoyo doctor --live --strict   # exit 1 on any failed probe or missing agent
 ```
 
-Probes run from a temporary directory, cost a few tokens each, and run in parallel across agents. Custom agents without `read_only_args` get their read-only probe skipped and reported as such.
-
 ## Workflows
 
-`yoyo workflow` runs a saved multi-agent workflow from a JSON spec. Use it when one agent call is not enough: fan out research across files, ask different agents/models for independent audits, run an implementation phase followed by a review phase, or cross-check several findings before acting.
-
-Workflows are deliberately local and auditable. Yoyo does not add a daemon or hidden planner. It reads the spec, expands jobs, runs each phase in order, runs jobs inside a phase in parallel up to `max_concurrency`, and returns a JSON result with commands, trace IDs, exit codes, duration, stdout/stderr, and truncation flags.
-
-Run a reusable multi-agent workflow:
-
-```bash
-yoyo workflow ./workflow.json --input "audit auth routes" --json
-```
-
-Run a bundled template by name:
+`yoyo workflow` runs a saved multi-agent workflow from a JSON spec — for when one call isn't enough: fan research across files, ask different agents for independent audits, or run an implement-then-review pipeline. It reads the spec, runs phases in order, runs jobs within a phase in parallel up to `max_concurrency`, and returns a JSON result.
 
 ```bash
 yoyo workflow --list
 yoyo workflow cross-review --input "review the current branch diff" --json
-```
-
-A bare name (no path, no `.json`) is resolved against `YOYO_WORKFLOW_PATH` (colon-separated dirs), then `~/.config/yoyo/workflows/` (populated by `install.sh`), then the source checkout's `workflows/` directory. Bundled templates:
-
-- `cross-review`: Codex and Claude review independently in parallel, then a synthesis judge verifies each finding against the code and rejects weak claims.
-- `adversarial-audit`: three parallel single-lens audits (correctness, security, maintainability), then an adversarial verifier that tries to refute every finding and keeps only survivors.
-- `frontend-impl-review`: a Codex worker implements a frontend task with the `frontend-design` skill injected, then an independent read-only review checks the result against the same skill. Requires a `frontend-design` skill to be discoverable.
-
-Dry-run a workflow before spending model calls:
-
-```bash
 yoyo workflow ./workflow.json --input "audit auth routes" --dry-run --json
 ```
 
-Workflow jobs default to read-only mode. Set `read_only: false` only for tightly scoped worker jobs that should edit files.
+A bare name resolves against `YOYO_WORKFLOW_PATH`, then `~/.config/yoyo/workflows/`, then the source `workflows/` dir. Bundled templates:
 
-Minimal workflow spec:
+- `cross-review` — Codex and Claude review in parallel, then a judge verifies each finding against the code.
+- `adversarial-audit` — three single-lens audits (correctness, security, maintainability), then a verifier that keeps only findings it can't refute.
+- `frontend-impl-review` — a Codex worker implements with the `frontend-design` skill, then an independent review checks the result.
+
+Minimal spec:
 
 ```json
 {
   "name": "review-and-cross-check",
-  "max_concurrency": 4,
-  "defaults": {
-    "agent": "claude",
-    "role": "opinion",
-    "read_only": true,
-    "model": "haiku"
-  },
+  "defaults": { "agent": "claude", "role": "opinion", "read_only": true },
   "phases": [
-    {
-      "name": "fanout",
-      "jobs": [
-        {
-          "id": "readme",
-          "agent": "codex",
-          "model": "gpt-5",
-          "prompt": "Audit README.md for correctness gaps.",
-          "files": ["README.md"]
-        },
-        {
-          "id": "cli",
-          "prompt": "Audit bin/yoyo for correctness and safety issues.",
-          "files": ["bin/yoyo"]
-        }
-      ]
-    },
-    {
-      "name": "cross-check",
-      "jobs": [
-        {
-          "id": "reviewer",
-          "role": "review",
-          "include_previous": true,
-          "prompt": "Cross-check the previous findings. Reject weak claims and list only concrete issues."
-        }
-      ]
-    }
+    { "name": "fanout", "jobs": [
+      { "id": "readme", "agent": "codex", "prompt": "Audit README.md.", "files": ["README.md"] },
+      { "id": "cli", "prompt": "Audit bin/yoyo for safety issues.", "files": ["bin/yoyo"] }
+    ]},
+    { "name": "cross-check", "jobs": [
+      { "id": "reviewer", "role": "review", "include_previous": true,
+        "prompt": "Cross-check the findings. Reject weak claims; list only concrete issues." }
+    ]}
   ]
 }
 ```
 
-Common workflow fields:
+Common job fields: `agent`, `model`, `role`, `files`, `skill`, `for_each` (expand one template into many), `include_previous` / `include_phases` (feed prior outputs into a later job), `retries`, and `expect` (a stdout marker check). Phase-level `gates` run shell commands after a phase's jobs succeed. Jobs default to read-only; set `read_only: false` only for tightly scoped worker jobs.
 
-- `phases`: ordered groups of work. Later phases can include earlier results.
-- `jobs`: agent calls inside a phase. Jobs in the same phase may run in parallel.
-- `agent`: `codex`, `claude`, `pi`, or a configured custom agent.
-- `model`: model name passed through to agents that support `--model`.
-- `role`: `opinion`, `review`, or `worker`.
-- `files`: context files attached to the job prompt.
-- `for_each`: expands one job template into many jobs.
-- `include_previous`: includes all prior phase outputs in the job prompt.
-- `include_phases`: includes only named prior phases.
-- `max_concurrency`: caps parallel jobs.
-- `max_jobs`: caps expanded jobs before any agent call starts.
-- `context_bytes`: caps prior-output context injected into later jobs.
-- `skill`: skill name(s) injected into the job prompt as guidance (job, phase, or defaults level).
-- `retries`: re-run a job up to N extra times when it fails its exit code or `expect` contract.
-- `expect`: optional output marker check (`contains` and/or `regex`) against job stdout.
-- `gates` (phase level): optional shell commands run after the phase's jobs.
+### Verification hooks (opt-in)
 
-## Verification Hooks (opt-in)
+yoyo does not grade agent output by default — the calling agent states what it wants and judges the result. Three opt-in hooks exist for cases where *code*, not a model, is the right verifier:
 
-Yoyo does not constrain or grade agent output by default. The calling agent states the output it wants in its prompt and judges the result itself — that judgment is what the model is for. Three opt-in hooks exist for the narrow cases where code, not a model, is the right verifier:
+- **Gates** run real checks (tests, linters, builds) after a phase's jobs succeed; the first failure stops the workflow. Use them for closed-form questions ("do the tests pass?").
+- **`retries`** re-runs a failed job up to N times (transient failures).
+- **`expect`** checks stdout for a `contains` string or `regex`. Use only for a marker the prompt explicitly demanded (e.g. `VERDICT: PASS`); never to grade free-form prose, which produces false failures.
 
-**Gates** are shell commands attached to a phase. They never inspect agent output; they run real checks — tests, linters, builds — after all the phase's jobs succeed, in order, from the workflow `cwd` (or a gate-level `cwd`). The first failing gate stops the entire workflow with that gate's exit code, regardless of `--fail-fast`. If any job in the phase failed, gates are recorded as skipped. Use a gate when the question has a closed-form answer ("do the tests pass?"); do not delegate that question to another agent:
+Feeding one agent's output into a write-capable or raw-`agent_args` job requires `allow_untrusted_context: true` — previous output is untrusted text. Misconfigured specs fail loudly at validation, before any tokens are spent.
 
-```json
-{
-  "name": "implement",
-  "jobs": [{"id": "fix", "role": "worker", "read_only": false, "prompt": "Fix the failing test."}],
-  "gates": [{"name": "tests", "run": "python3 -m pytest -q"}]
-}
-```
+## Custom agents
 
-**`retries`** re-runs a job (same prompt) when it fails, up to N extra attempts. The JSON result records `attempts` per job. Use it for transient failures (crashes, rate limits, truncated runs).
-
-**`expect`** is a per-job stdout marker check. If the agent exits 0 but stdout is missing a `contains` string or does not match `regex`, the job fails with exit code 3 and `output contract not met` in stderr. Use it sparingly, and only for a marker the prompt explicitly told the agent to emit (for example "end with a line `VERDICT: PASS` or `VERDICT: FAIL`"). Never use it to grade free-form prose — a regex over an answer the agent phrased its own way produces false failures and pushes quality down, which is worse than no check at all. When in doubt, leave `expect` off and let the supervising agent read the output.
-
-Misconfigured specs — unknown skills, invalid `expect`, invalid gates — fail loudly when the spec is validated, before any agent call spends tokens.
-
-Use `for_each` to fan out one job template:
-
-```json
-{
-  "id": "audit-{index}",
-  "for_each": ["README.md", "bin/yoyo", "tests/test_yoyo.py"],
-  "prompt": "Audit {item}.",
-  "files": ["{item}"]
-}
-```
-
-Use `include_previous` for a review or synthesis phase:
-
-```json
-{
-  "name": "review",
-  "jobs": [
-    {
-      "id": "cross-check",
-      "role": "review",
-      "include_previous": true,
-      "prompt": "Cross-check the previous findings. Reject weak claims and list only concrete issues."
-    }
-  ]
-}
-```
-
-## Agents
-
-Built-in agents:
-
-- `codex`: runs `codex exec`
-- `claude`: runs `claude -p --no-session-persistence`
-- `pi`: runs `pi -p --no-session --mode text`
-
-Built-in agents depend on specific flags of the underlying CLIs: codex's `exec`, `--sandbox`, `--ask-for-approval`, `--output-last-message`, `-C`, `--skip-git-repo-check`, `--ephemeral`; claude's `-p`, `--permission-mode`, `--tools`, `--model`; pi's `-p`, `--no-session`, `--mode`, `--tools`, `--model`. yoyo does not detect CLI versions, so if one of these tools renames or changes a flag, the call will fail as a confusing agent error rather than a yoyo error. If a built-in agent suddenly breaks after a CLI upgrade, check its flags here first. To pin an exact path or adjust flags without code changes, override the command via `~/.config/yoyo/agents.json` (use `kind` to keep built-in flag behavior, or define `read_only_args`/`full_access_args` for a fully custom command).
-
-Custom agents can be added with `~/.config/yoyo/agents.json`:
+Override or add agents in `~/.config/yoyo/agents.json`:
 
 ```json
 {
   "agents": {
-    "local": {
-      "command": ["python3", "/path/to/my-agent.py"],
-      "read_only_args": ["--read-only"],
-      "full_access_args": ["--write"]
-    },
+    "local": { "command": ["python3", "/path/to/agent.py"], "read_only_args": ["--read-only"], "full_access_args": ["--write"] },
+    "codex": { "kind": "codex", "command": ["/custom/path/codex", "exec"] },
     "echoer": "cat"
   }
 }
 ```
 
-For configured agents, `read_only_args` and `full_access_args` are appended automatically based on `--read-only`. If a custom agent has no `read_only_args`, `yoyo ask custom --read-only ...` fails loudly instead of pretending the custom agent is constrained.
+`read_only_args`/`full_access_args` are appended based on `--read-only`; a custom agent with no `read_only_args` makes `--read-only` fail loudly rather than pretend. Use `kind` to keep a built-in's flag behavior with a custom path. Or set `YOYO_AGENT_<NAME>=<command>` in the environment. Custom agents receive the rendered prompt on stdin. `--agent-arg` appends a raw argument — powerful; verify with `--dry-run` when combined with `--read-only`.
 
-To override a built-in command while keeping built-in flag behavior, set `kind`:
+## Access model
 
-```json
-{
-  "agents": {
-    "codex": {
-      "kind": "codex",
-      "command": ["/custom/path/codex", "exec"]
-    }
-  }
-}
-```
+`yoyo ask` and `yoyo research` default to full access so agent-to-agent calls don't stop for approval:
 
-Or with environment variables:
+- Codex: `--sandbox danger-full-access --ask-for-approval never`
+- Claude: `--permission-mode bypassPermissions`
+- Pi: read, grep, find, ls, bash, edit, write tools
 
-```bash
-export YOYO_AGENT_ECHOER=cat
-yoyo ask echoer "hello"
-```
-
-Custom agents receive the rendered prompt on stdin.
-
-`--agent-arg` is intentionally raw and powerful. It exists for provider-specific flags and advanced routing. If you use it with constrained modes such as `--read-only`, verify the final command with `--dry-run`; a raw argument may change the target agent's effective behavior.
-
-## Access Model
-
-`yoyo ask` defaults to full access so agent-to-agent calls do not stop for approval prompts:
-
-- Codex receives `--sandbox danger-full-access --ask-for-approval never`
-- Claude receives `--permission-mode bypassPermissions`
-- Pi receives read, grep, find, ls, bash, edit, and write tools
-
-Use `--read-only` when you want a bounded reviewer:
-
-- Codex receives `--sandbox read-only`
-- Claude receives read-oriented tools only
-- Pi receives read-oriented tools only
-
-`--read-only` is enforced by the target agent's own mechanism, not by yoyo, and the strength varies: Codex applies an actual filesystem sandbox, while Claude and Pi apply tool allowlists. yoyo guarantees the constraining flags are passed (and fails loudly for custom agents that have no `read_only_args`), not that the downstream CLI honors them perfectly. Treat read-only as a strong default, not an airtight sandbox.
-
-This is intentionally powerful. Agent output is not truth; verify it with code, tests, docs, or live state before acting.
-
-## Workflow Safety
-
-Workflow jobs default to `read_only: true`. Feeding previous agent output into later prompts with `include_previous` or `include_phases` is useful for cross-checking, but that output is untrusted text. Yoyo blocks previous-output injection into a write-capable job or a job with raw `agent_args` unless the workflow explicitly sets `allow_untrusted_context: true`.
-
-Reviewer jobs never gate control flow by themselves. The supervising agent or human must inspect the result and verify claims with tests, code, docs, or live state.
+`--read-only` constrains a reviewer — Codex gets `--sandbox read-only`, Claude and Pi get read-oriented tool allowlists. It's enforced by the target agent's own mechanism (a real sandbox for codex, allowlists for claude/pi), not by yoyo; treat it as a strong default, not an airtight sandbox. This is intentionally powerful. Agent output is not truth — verify it with code, tests, docs, or live state before acting. A reviewer or checker never gates control flow on its own.
 
 ## Durability
 
-- Each `ask` call carries a trace ID in the prompt metadata and JSON result.
-- Plain output also emits `trace_id=...` on stderr.
-- Subprocess stdout/stderr is captured through temporary files instead of unbounded in-memory pipes.
-- Output is capped by `--max-output-bytes` or `YOYO_MAX_OUTPUT_BYTES` and reports truncation in JSON mode.
-- Stdin and `--file` context share an aggregate cap from `--max-input-bytes` or `YOYO_MAX_INPUT_BYTES`.
-- Temporary Codex output files live inside a per-call temporary directory and are cleaned up automatically.
-- `--cwd` is validated before launching the target agent.
-- stdin is read only when input is actually available, so an open-but-idle stdin cannot hang the call before the agent starts (`--stdin-wait` waits for slow producers; `--no-stdin` ignores stdin).
-- Long calls emit a periodic progress heartbeat on stderr; `--idle-timeout`/`YOYO_IDLE_TIMEOUT` adds an optional no-output hang guard.
-- Timeouts kill the target process group on POSIX systems.
-- SIGINT/SIGTERM/SIGHUP and normal exit terminate any in-flight agent process groups, so an interrupted or killed yoyo does not orphan nested agents.
-- `yoyo workflow` records a run trace ID, per-job trace IDs, agent commands, exit codes, durations, and truncation flags in its JSON result.
-- Agent and workflow jobs default to a one-hour timeout and fail loudly on timeout.
-- Workflows enforce `max_concurrency`, `max_jobs`, per-job timeouts, per-job output caps, and a bounded previous-output context size.
-
-If a real agent review times out, treat the review as unavailable and say so. Do not count a timed-out review as completed, and do not hide the timeout by summarizing local checks as an external review.
+Every call carries a trace ID (in the prompt metadata, JSON result, and stderr). Subprocess output is captured to temp files and capped by `--max-output-bytes`; stdin + `--file` share `--max-input-bytes`. stdin is read only when input is actually available, so an idle stdin can't hang a call (`--stdin-wait` for slow producers, `--no-stdin` to ignore). Timeouts kill the process group; SIGINT/SIGTERM/SIGHUP and normal exit terminate in-flight agents so an interrupted yoyo doesn't orphan children. If a real review times out, treat it as unavailable — never count it as completed.
 
 ## Test
 

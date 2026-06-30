@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.13.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.14.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -3489,6 +3489,269 @@ class YoyoTests(unittest.TestCase):
             code, _, stderr = self.run_cli(["review", "--cwd", str(repo), "--agents", "claude,claude"])
             self.assertEqual(code, 2)
             self.assertIn("must not repeat", stderr)
+
+    # --- research ---------------------------------------------------------
+
+    def _research_config(self, tmp, names, *, read_only_args=None, broken=()):
+        """Configure stub researcher agents plus an echo 'merge' synthesizer.
+
+        Each named agent prints a name-tagged finding so perspectives are
+        distinguishable; the merge agent echoes its stdin so the synthesis
+        prompt can be inspected. Names in `broken` exit non-zero.
+        """
+        agents = {}
+        for name in names:
+            if name in broken:
+                body = "import sys\nsys.stdin.read()\nsys.exit(3)\n"
+            else:
+                body = f"import sys\nsys.stdin.read()\nprint({('finding from ' + name)!r})\n"
+            command = self._loop_stub_command(tmp, body, name=f"{name}.py")
+            spec = {"command": shlex.split(command)}
+            if read_only_args is not None:
+                spec["read_only_args"] = read_only_args
+            agents[name] = spec
+        echo_body = "import sys\nsys.stdout.write(sys.stdin.read())\n"
+        echo_command = self._loop_stub_command(tmp, echo_body, name="merge.py")
+        merge_spec = {"command": shlex.split(echo_command)}
+        if read_only_args is not None:
+            merge_spec["read_only_args"] = read_only_args
+        agents["merge"] = merge_spec
+        config = Path(tmp) / "research-agents.json"
+        config.write_text(json.dumps({"agents": agents}), encoding="utf-8")
+        return config
+
+    def test_research_fans_out_lenses_and_synthesizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1", "r2"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1,r2", "--lenses", "proponent,skeptic",
+                 "--synthesizer", "merge", "--json", "Should we adopt X?"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["topic"], "Should we adopt X?")
+            self.assertEqual(payload["agents"], ["r1", "r2"])
+            self.assertEqual(payload["lenses"], ["proponent", "skeptic"])
+            self.assertEqual(len(payload["perspectives"]), 2)
+            # The echo synthesizer reflects its prompt: both perspectives, tagged
+            # with lens AND agent, plus the decision-brief instructions.
+            self.assertIn('<perspective lens="proponent" agent="r1">', payload["report"])
+            self.assertIn('<perspective lens="skeptic" agent="r2">', payload["report"])
+            self.assertIn("finding from r1", payload["report"])
+            self.assertIn("finding from r2", payload["report"])
+            self.assertIn("CONVERGENCE", payload["report"])
+            self.assertIn("TENSION", payload["report"])
+
+    def test_research_single_lens_skips_synthesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent", "--json", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIsNone(payload["synthesis"])
+            self.assertEqual(payload["report"], "finding from r1")
+
+    def test_research_round_robins_agents_across_lenses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["a", "b"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "a,b", "--lenses", "l1,l2,l3",
+                 "--synthesizer", "merge", "--json", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            # 3 lenses over 2 agents -> a, b, a (perspectives keep lens order).
+            assignment = [(p["lens"], p["agent"]) for p in payload["perspectives"]]
+            self.assertEqual(assignment, [("l1", "a"), ("l2", "b"), ("l3", "a")])
+
+    def test_research_custom_lens_becomes_adhoc_angle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "regulatory", "--dry-run", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("Research lens: REGULATORY", stdout)
+            self.assertIn("through the lens of regulatory", stdout)
+
+    def test_research_file_context_embedded_in_every_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            doc = Path(tmp) / "background.md"
+            doc.write_text("DISTINCTIVE-CONTEXT-TOKEN\n", encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "analyst",
+                 "--file", str(doc), "--dry-run", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("Context from the caller:", stdout)
+            self.assertIn("DISTINCTIVE-CONTEXT-TOKEN", stdout)
+
+    def test_research_continues_when_one_researcher_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1", "bad"], broken=("bad",))
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1,bad", "--lenses", "proponent,skeptic",
+                 "--synthesizer", "merge", "--json", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("via bad failed", stderr)
+            payload = json.loads(stdout)
+            # Only the surviving perspective reaches synthesis.
+            self.assertIn("finding from r1", payload["report"])
+            self.assertNotIn('agent="bad"', payload["report"])
+
+    def test_research_all_researchers_failing_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["bad"], broken=("bad",))
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "bad", "--lenses", "proponent", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("all researchers failed", stderr)
+
+    def test_research_synthesis_failure_falls_back_to_raw_perspectives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # synthesizer 'broken' fails, so the raw per-lens perspectives print.
+            config = self._research_config(tmp, ["r1", "r2", "broken"], broken=("broken",))
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1,r2", "--lenses", "proponent,skeptic",
+                 "--synthesizer", "broken", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("synthesis via broken failed", stderr.replace("'", ""))
+            self.assertIn("=== proponent (via r1) ===", stdout)
+            self.assertIn("=== skeptic (via r2) ===", stdout)
+            self.assertIn("finding from r1", stdout)
+
+    def test_research_dry_run_executes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent", "--dry-run", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("r1.py", stdout)
+            self.assertIn("Research lens: PROPONENT", stdout)
+            self.assertNotIn("finding from r1", stdout)
+
+    def test_research_read_only_constrains_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"], read_only_args=["--ro"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent",
+                 "--read-only", "--dry-run", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("--ro", stdout)
+            self.assertIn("mode=read-only", stderr)
+
+    def test_research_requires_a_topic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent"],
+                env=env,
+            )
+
+            self.assertEqual(code, 2)
+            self.assertIn("research needs a topic", stderr)
+
+    def test_research_does_not_probe_unscheduled_pool_agents(self):
+        # Fewer lenses than agents -> the trailing agent is never scheduled, so a
+        # read-only run must not be rejected because that unused agent lacks
+        # read_only_args. 'used' supports read-only; 'unused' does not.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["used", "unused"])
+            spec = json.loads(Path(config).read_text(encoding="utf-8"))
+            spec["agents"]["used"]["read_only_args"] = ["--ro"]
+            # 'unused' deliberately has no read_only_args.
+            Path(config).write_text(json.dumps(spec), encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "used,unused", "--lenses", "proponent",
+                 "--read-only", "--json", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["report"], "finding from used")
+
+    def test_research_warns_on_full_access_file_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"], read_only_args=["--ro"])
+            doc = Path(tmp) / "background.md"
+            doc.write_text("context\n", encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            # Full-access (default) with --file -> warns.
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent",
+                 "--file", str(doc), "--dry-run", "topic"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("full-access delegation includes --file context", stderr)
+
+            # Read-only with --file -> no warning.
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent",
+                 "--file", str(doc), "--read-only", "--dry-run", "topic"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("full-access delegation includes --file context", stderr)
+
+    def test_research_rejects_duplicate_lenses_and_unknown_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent,proponent", "topic"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("must not repeat a lens", stderr)
+
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "nope", "--lenses", "proponent", "topic"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Unknown agent", stderr)
 
 
 if __name__ == "__main__":

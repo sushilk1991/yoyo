@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -3528,6 +3528,263 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+# Each lens is a distinct investigative angle. The point of research is diverse
+# perspectives, not a vote — so every researcher is told to go deep from ONE
+# angle and ignore the others, and the synthesis surfaces the disagreement
+# rather than averaging it away.
+RESEARCH_LENSES: dict[str, str] = {
+    "proponent": (
+        "Research lens: PROPONENT. Build the strongest evidence-based case FOR the proposition in "
+        "the question and surface the biggest opportunities. What does success look like, what is "
+        "the upside, and under what conditions is this clearly the right move? Do not hedge toward "
+        "balance — other researchers cover the downside."
+    ),
+    "skeptic": (
+        "Research lens: SKEPTIC. Build the strongest case AGAINST. Hunt for failure modes, hidden "
+        "costs, risks, and the conditions under which this would be a mistake. Find who has tried "
+        "something similar and failed, and why. Be specific and evidence-led, not merely cynical."
+    ),
+    "analyst": (
+        "Research lens: ANALYST (first principles). Establish the load-bearing facts and "
+        "fundamentals from primary sources. Separate what is actually known from what is assumed or "
+        "asserted, and quantify wherever possible — show your numbers and where they came from."
+    ),
+    "explorer": (
+        "Research lens: EXPLORER (prior art and alternatives). Map the landscape: comparable "
+        "approaches, prior art, and alternatives that may not yet be on the table. For each, note "
+        "what its adopters chose it for and what they traded away."
+    ),
+    "pragmatist": (
+        "Research lens: PRAGMATIST (execution). Focus on how this would actually get done: concrete "
+        "steps, effort, dependencies, cost, and the realistic path with its tradeoffs. Distinguish "
+        "the cheap reversible first move from the expensive irreversible one."
+    ),
+}
+
+
+RESEARCH_DEFAULT_LENSES = "proponent,skeptic,analyst,explorer,pragmatist"
+
+
+def research_lens_preamble(name: str) -> str:
+    preset = RESEARCH_LENSES.get(name)
+    if preset:
+        return preset
+    # Unknown name -> treat the string as an ad-hoc angle so callers can research
+    # any domain-specific lens (e.g. --lenses "regulatory,market,security").
+    return (
+        f"Research lens: {name.upper()}. Investigate the question specifically through the lens of "
+        f"{name}: what does this angle reveal that a generic answer would miss? Stay in this lens "
+        f"and go deep rather than broad."
+    )
+
+
+RESEARCH_BRIEF_PROMPT = """You are one of several independent researchers investigating the same
+question, each assigned a DIFFERENT lens so the group surfaces genuinely diverse perspectives. Stay
+in your lens — do not try to be balanced or cover every angle; the others are handled by other
+researchers. Going deep from one angle is the whole point.
+
+{lens}
+
+Question / topic:
+{topic}{context}
+
+Investigate thoroughly with whatever sources you can reach — the repository at {cwd}, web search,
+documentation, code, and primary sources. Do not invent facts: every finding must trace to evidence
+you can name. This is investigation only; do not modify files.
+
+Return concise sections:
+- Key findings (each with the evidence or source that backs it)
+- Strongest point from this lens
+- Confidence, and what would change your view
+- Open questions this lens raises"""
+
+
+RESEARCH_SYNTHESIS_PROMPT = """You are synthesizing {count} independent research perspectives on the
+same question, each produced by a different agent working from a different lens. The goal is to
+inform a decision about what to do next — surface the diversity, do not flatten it into bland
+consensus.
+
+Question / topic:
+{topic}
+
+Write a decision brief with these sections:
+1. CONVERGENCE — points that two or more perspectives independently support (name them); treat
+   these as higher-confidence.
+2. TENSION — where perspectives genuinely disagree or trade off. This is the most important
+   section: state each side, who argued it, and what evidence would settle it.
+3. KEY EVIDENCE — the most load-bearing facts and sources surfaced, with their origin. Flag
+   anything asserted without support.
+4. OPEN QUESTIONS — what remains unknown or unverified before a confident decision.
+5. OPTIONS & NEXT STEPS — 2-4 distinct paths forward, each with its main tradeoff, plus the
+   smallest next action that would most reduce the remaining uncertainty.
+
+Attribute claims to the lens/agent that raised them. Do not invent findings no perspective raised.
+
+{perspectives}"""
+
+
+def research_call_args(args: argparse.Namespace, agent_name: str, prompt_text: str, trace_suffix: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        cwd=str(resolve_cwd(args.cwd)),
+        agent=agent_name,
+        role=None,
+        read_only=args.read_only,
+        caller=args.caller,
+        trace_id=f"{args.trace_id}:{trace_suffix}",
+        timeout=args.timeout,
+        max_input_bytes=args.max_input_bytes,
+        max_output_bytes=args.max_output_bytes,
+        model=args.model,
+        agent_arg=None,
+        session=None,
+        session_info=None,
+        dry_run=args.dry_run,
+        quiet=args.quiet,
+        idle_timeout=None,
+        prompt=[prompt_text],
+        file=[],
+        skill=[],
+        use_stdin_context=False,
+    )
+
+
+def cmd_research(args: argparse.Namespace) -> int:
+    agents = load_agents()
+    agent_names = [item.strip() for item in args.agents.split(",") if item.strip()]
+    if not agent_names:
+        raise YoyoError("--agents must name at least one agent")
+    lenses = [item.strip() for item in args.lenses.split(",") if item.strip()]
+    if not lenses:
+        raise YoyoError("--lenses must name at least one research lens")
+    if len(lenses) != len(set(lenses)):
+        raise YoyoError("--lenses must not repeat a lens; diverse perspectives need distinct lenses")
+    synthesizer = args.synthesizer or agent_names[0]
+    for name in [*agent_names, synthesizer]:
+        if name not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown agent {name!r}. Known agents: {known}")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    topic = " ".join(args.prompt).strip()
+    if not topic:
+        raise YoyoError("research needs a topic or question. Pass it as positional text.")
+
+    cwd = resolve_cwd(args.cwd)
+    # Assign each lens an agent round-robin so perspectives span both lenses and
+    # vendors; with the default agents the for/against split lands on different
+    # vendors, which makes the disagreement more credible.
+    jobs = [(lens, agent_names[index % len(agent_names)]) for index, lens in enumerate(lenses)]
+
+    # Fail loudly before spending tokens if any agent that will actually run
+    # cannot build its command (e.g. agy under --read-only has no headless
+    # read-only mode). Probe only the scheduled researcher agents, plus the
+    # synthesizer when there are enough lenses for synthesis to run — probing an
+    # unscheduled pool agent would reject an otherwise-valid reduced-lens run.
+    probe_targets = {name for _, name in jobs}
+    if len(jobs) >= 2:
+        probe_targets.add(synthesizer)
+    for name in probe_targets:
+        command_for_agent(agents[name], research_call_args(args, name, "probe", "probe"))
+
+    # Read caller context once, here, so parallel researchers never race on the
+    # same input; it is embedded into each researcher's prompt text directly.
+    # research defaults to full-access, so warn on --file context exactly like
+    # build_prompt does for ask — file content may be untrusted.
+    context = ""
+    if args.file:
+        if not args.read_only and not os.environ.get("YOYO_SUPPRESS_FULL_ACCESS_WARNING"):
+            eprint("warning: full-access delegation includes --file context; use --read-only for untrusted input")
+        context = "\n\nContext from the caller:\n" + read_file_context(args.file, cwd, args.max_input_bytes)
+
+    def run_researcher(lens: str, name: str) -> dict[str, Any]:
+        prompt_text = RESEARCH_BRIEF_PROMPT.format(
+            lens=research_lens_preamble(lens), topic=topic, context=context, cwd=cwd
+        )
+        call_args = research_call_args(args, name, prompt_text, f"{lens}.{name}")
+        return execute_agent_call(name, call_args, build_prompt(call_args), agents)
+
+    mode = "read-only" if args.read_only else "full-access"
+    eprint(
+        f"research {args.trace_id}: lenses={','.join(lenses)} agents={','.join(agent_names)} "
+        f"synthesizer={synthesizer} mode={mode}"
+    )
+
+    if args.dry_run:
+        for lens, name in jobs:
+            emit_dry_run_result(run_researcher(lens, name), args.json)
+        return 0
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {pool.submit(run_researcher, lens, name): index for index, (lens, name) in enumerate(jobs)}
+        indexed: dict[int, dict[str, Any]] = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            lens, name = jobs[index]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {"agent": name, "exit_code": 2, "stdout": "", "stderr": str(exc), "stderr_plain": str(exc)}
+            result["lens"] = lens
+            indexed[index] = result
+            status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
+            eprint(f"research {args.trace_id}: {lens} via {name} {status}")
+        perspectives = [indexed[index] for index in range(len(jobs))]
+
+    successful = [p for p in perspectives if int(p.get("exit_code", 1)) == 0 and str(p.get("stdout", "")).strip()]
+    failed = [p for p in perspectives if p not in successful]
+    for result in failed:
+        eprint(
+            f"research {args.trace_id}: {result.get('lens')} via {result.get('agent')} failed: "
+            f"{str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}"
+        )
+    if not successful:
+        eprint(f"research {args.trace_id}: all researchers failed")
+        return 1
+
+    synthesis: dict[str, Any] | None = None
+    if len(successful) == 1:
+        final_text = str(successful[0]["stdout"]).strip()
+    else:
+        perspectives_block = "\n\n".join(
+            f'<perspective lens="{p["lens"]}" agent="{p["agent"]}">\n{str(p["stdout"]).strip()}\n</perspective>'
+            for p in successful
+        )
+        synth_prompt = RESEARCH_SYNTHESIS_PROMPT.format(count=len(successful), topic=topic, perspectives=perspectives_block)
+        synth_args = research_call_args(args, synthesizer, synth_prompt, "synthesis")
+        synthesis = execute_agent_call(synthesizer, synth_args, build_prompt(synth_args), agents)
+        if int(synthesis.get("exit_code", 1)) == 0 and str(synthesis.get("stdout", "")).strip():
+            final_text = str(synthesis["stdout"]).strip()
+        else:
+            eprint(f"research {args.trace_id}: synthesis via {synthesizer} failed; printing the raw perspectives instead")
+            final_text = "\n\n".join(
+                f"=== {p['lens']} (via {p['agent']}) ===\n{str(p['stdout']).strip()}" for p in successful
+            )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "trace_id": args.trace_id,
+                    "topic": topic,
+                    "agents": agent_names,
+                    "lenses": lenses,
+                    "perspectives": perspectives,
+                    "synthesis": synthesis,
+                    "report": final_text,
+                    "exit_code": 0,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(final_text)
+    return 0
+
+
 def wait_run(args: argparse.Namespace) -> int:
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
@@ -4111,6 +4368,38 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--json", action="store_true", help="Emit a JSON result envelope with per-agent reviews and the synthesis")
     review.add_argument("--dry-run", action="store_true", help="Print the reviewer commands and prompts without running them")
     review.set_defaults(func=cmd_review)
+
+    research = sub.add_parser("research", help="Deep research: fan a topic out to agents under distinct lenses, then synthesize a decision brief")
+    research.add_argument("prompt", nargs="*", help="The research topic or question")
+    research.add_argument(
+        "--agents",
+        default="codex,claude,pi",
+        help="Comma-separated agent pool; lenses are assigned to agents round-robin (default: codex,claude,pi)",
+    )
+    research.add_argument(
+        "--lenses",
+        default=RESEARCH_DEFAULT_LENSES,
+        help=(
+            "Comma-separated research lenses, one parallel call each. Catalog: "
+            + ", ".join(RESEARCH_LENSES)
+            + ". Unknown names become ad-hoc angles (e.g. regulatory,market). Default: "
+            + RESEARCH_DEFAULT_LENSES
+        ),
+    )
+    research.add_argument("--synthesizer", default=None, help="Agent that merges the perspectives into a decision brief (default: first of --agents)")
+    research.add_argument("--file", action="append", default=[], help="Add a file as shared context for every researcher; repeatable")
+    research.add_argument("--read-only", action="store_true", help="Constrain researchers to read-only mode (limits web/tool access on some agents; default is full-access so investigation tools work)")
+    research.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
+    research.add_argument("--cwd", default=os.getcwd())
+    research.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))), help="Per-agent timeout in seconds")
+    research.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
+    research.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
+    research.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
+    research.add_argument("--model", help="Pass a model name to agents that support --model")
+    research.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
+    research.add_argument("--json", action="store_true", help="Emit a JSON result envelope with per-lens perspectives and the synthesis")
+    research.add_argument("--dry-run", action="store_true", help="Print the researcher commands and prompts without running them")
+    research.set_defaults(func=cmd_research, collect_unknown_prompt=True)
 
     runs = sub.add_parser("runs", help="List, show, and prune background run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")

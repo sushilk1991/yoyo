@@ -62,6 +62,49 @@ yoyo review --agents codex,claude,grok --base main --json   # review needs read-
 
 `yoyo review` reviews the current git diff (uncommitted changes if the tree is dirty, otherwise `--base...HEAD`) with each named agent independently, read-only, in parallel, then a synthesizer agent (default: first of `--agents`) merges them into CONSENSUS findings (raised by ≥2 reviewers — the trustworthy ones) and SINGLE-REVIEWER findings (unconfirmed). Prefer it over hand-rolled fan-out when reviewing a diff before commit/PR; `--pr` posts the result as a GitHub PR comment via `gh`. Treat consensus findings as worth verifying first, not as automatically true.
 
+## Deep research
+
+```bash
+yoyo research --cwd "$PWD" --caller claude "Should we move the core engine to Rust?"
+yoyo research --lenses proponent,skeptic,analyst --agents codex,claude --json "Is WebGPU ready for our renderer?"
+yoyo research --lenses regulatory,market,security --file rfc.md "Adopt passkeys for login?"
+```
+
+Use `yoyo research` to gather **diverse perspectives before deciding what to do next** — not to find one right answer. Each lens runs as one parallel agent call investigating from a single angle, then a synthesizer (default: first of `--agents`) produces a decision brief: where perspectives converge, where they're in TENSION (the most useful section), key evidence, open questions, and options for next steps. Lenses are assigned to `--agents` round-robin, so the for/against split lands on different vendors by default — a genuine disagreement, not the same model arguing with itself.
+
+Default lenses: `proponent,skeptic,analyst,explorer,pragmatist` (case FOR / case AGAINST / first-principles facts / prior art & alternatives / execution path). Unknown lens names become ad-hoc angles, so `--lenses regulatory,market,security` works for domain-specific research. Each lens is one call — subset `--lenses` to spend less.
+
+Unlike `review`, research defaults to **full-access** so agents can use web search, fetch, and code execution to investigate; `--read-only` restricts them but limits those tools on some agents. The synthesis surfaces disagreement rather than averaging it — verify the load-bearing claims yourself before acting, and don't read consensus as proof.
+
+## Writing good yoyo prompts
+
+Strong delegated prompts are specific about the outcome and narrow about the scope. Put the instruction first, then separate context with `--file`, stdin, or clear tags. Prefer concrete output contracts over vague quality words: "List correctness bugs with file/line and a reproduction path" beats "review carefully." Say what the agent should do, not only what it should avoid.
+
+Use this checklist before delegating:
+
+1. Name the role and success criterion: opinion, review, worker; what would count as done or useful.
+2. Bound the surface: repo `--cwd`, exact files, target branch/diff, allowed edits, and explicit exclusions.
+3. Provide relevant evidence: logs, failing command, user symptom, screenshots, API docs, or `--file` context.
+4. Request falsification for reviews/opinions: "Find the strongest reason this is wrong" or "Prioritize bugs that would change the ship decision."
+5. Specify the output format only as much as needed: findings first, file/line pointers, commands run, or `VERDICT: PASS/FAIL` for checkers.
+6. Add examples only when format matters; otherwise keep the prompt short and let the repo be the source of truth.
+7. For code work, include the verification path: tests to run, gate command, browser check, or live proof expected.
+
+Skills are the main way to steer *how* work is done. Prefer explicit `--skill name` when you know the skill, because missing explicit skills fail loudly. If another agent wants a delegated call to use a skill, have it produce or call the yoyo command with `--skill`; do not rely on skill names written in prose to change yoyo behavior.
+
+Prompt templates:
+
+```bash
+yoyo ask codex --role review --read-only --cwd "$PWD" --file src/auth.ts --caller claude \
+  "Find correctness or security bugs that would block shipping. Cite file/line and explain the failing path. Ignore style-only issues."
+
+yoyo ask claude --role worker --cwd "$PWD" --skill frontend-design --caller codex \
+  "Implement the account settings empty state. Match existing components, touch only the settings surface, and run the focused frontend test."
+
+yoyo ask pi --role opinion --read-only --cwd "$PWD" --skill api-design-principles --caller codex \
+  "Challenge this API shape; list assumptions, risks, and the smallest better alternative."
+```
+
 ## Background runs and timeouts
 
 A real review or worker call takes minutes. If your own tool budget yields sooner (codex's exec tool yields after ~10–30s), detach instead of running it foreground — and never kill a still-running call (that wastes every token it already spent) or report it as "timed out":
