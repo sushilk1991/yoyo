@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
@@ -1291,7 +1291,186 @@ def start_background_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# Best-of-n: the same task fanned out to several agents in parallel, then an
+# optional judge compares the independent answers. Diversity beats a single
+# sample: different vendors fail differently, so genuine agreement is signal
+# and disagreement marks exactly what to verify. The judge sees only the
+# answers, not who is "usually right" — it must argue from content.
+FANOUT_JUDGE_PROMPT = """You are judging {count} independent answers to the same task. Each was produced
+by a different agent call that could not see the others. Compare them on
+correctness, evidence, and completeness — never on confidence or length.
+
+Task given to every agent:
+<task>
+{task}
+</task>
+
+{candidates}
+
+Reply with:
+1. VERDICT — which answer is best (name it), or say a merge beats any single one.
+2. WHY — the decisive differences, citing the specific claims that mattered.
+3. DISAGREEMENTS — where answers genuinely conflict, and how to settle each conflict.
+4. BEST ANSWER — the full answer to act on: the winner as-is, or your merged version."""
+
+
+def fanout_call_args(args: argparse.Namespace, agent_name: str, trace_suffix: str) -> argparse.Namespace:
+    clone = argparse.Namespace(**vars(args))
+    clone.agent = agent_name
+    clone.trace_id = f"{args.trace_id}:{trace_suffix}"
+    clone.session = None
+    clone.session_info = None
+    clone.background = False
+    return clone
+
+
+def fanout_judge_args(args: argparse.Namespace, judge_name: str, prompt_text: str) -> argparse.Namespace:
+    clone = fanout_call_args(args, judge_name, "judge")
+    clone.role = None
+    clone.raw = False
+    clone.prompt = [prompt_text]
+    clone.file = []
+    clone.skill = []
+    clone.use_stdin_context = False
+    # The judge prompt embeds the candidates' raw output — untrusted text. A
+    # write-capable judge would be a prompt-injection target, so it always
+    # runs read-only (agents without a read-only mode fail loudly up front).
+    clone.read_only = True
+    return clone
+
+
+def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
+    if getattr(args, "session", None):
+        raise YoyoError("--session needs a single agent; fan-out calls are one-shot")
+    if getattr(args, "raw", False):
+        if args.role is not None:
+            raise YoyoError("--raw sends the prompt verbatim; it cannot be combined with --role")
+        if not args.prompt:
+            raise YoyoError("--raw requires positional prompt text")
+    elif args.role is None:
+        args.role = "opinion"
+    if args.max_output_bytes < 1:
+        raise YoyoError("--max-output-bytes must be at least 1")
+    if args.max_input_bytes < 1:
+        raise YoyoError("--max-input-bytes must be at least 1")
+    if args.timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    agents = load_agents()
+    judge = getattr(args, "judge", None)
+    unknown = sorted({name for name in [*names, *([judge] if judge else [])] if name not in agents})
+    if unknown:
+        known = ", ".join(sorted(agents))
+        raise YoyoError(f"Unknown agent(s): {', '.join(unknown)}. Known agents: {known}")
+    cwd = resolve_cwd(args.cwd)
+    for item in args.file:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        if not path.is_file():
+            raise YoyoError(f"Context file not found: {path}")
+    for skill_name in getattr(args, "skill", None) or []:
+        resolve_skill(skill_name)
+    # Fail loudly on flag problems (e.g. --read-only on an agent without a
+    # read-only mode) before spending tokens on any call.
+    for name in dict.fromkeys(names):
+        command_for_agent(agents[name], fanout_call_args(args, name, "probe"))
+    if judge:
+        command_for_agent(agents[judge], fanout_judge_args(args, judge, "probe"))
+    elif getattr(args, "judge_prompt", None):
+        raise YoyoError("--judge-prompt has no effect without --judge; pass a judge agent too")
+
+    if getattr(args, "background", False) and not args.dry_run:
+        return start_background_run(args)
+
+    prompt = build_prompt(args)
+    calls = [(index, name) for index, name in enumerate(names)]
+    eprint(f"ask {args.trace_id}: fan-out agents={','.join(names)}" + (f" judge={judge}" if judge else ""))
+
+    if args.dry_run:
+        for index, name in calls:
+            call_args = fanout_call_args(args, name, f"{name}.{index + 1}")
+            emit_dry_run_result(execute_agent_call(name, call_args, prompt, agents), args.json)
+        return 0
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        futures = {}
+        for index, name in calls:
+            call_args = fanout_call_args(args, name, f"{name}.{index + 1}")
+            futures[pool.submit(execute_agent_call, name, call_args, prompt, agents)] = index
+        indexed: dict[int, dict[str, Any]] = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            name = names[index]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {"agent": name, "exit_code": 2, "stdout": "", "stderr": str(exc), "stderr_plain": str(exc)}
+            indexed[index] = result
+            status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
+            eprint(f"ask {args.trace_id}: {name} {status}")
+        results = [indexed[index] for index in range(len(calls))]
+
+    successful = [r for r in results if int(r.get("exit_code", 1)) == 0 and str(r.get("stdout", "")).strip()]
+    for result in results:
+        if result not in successful:
+            eprint(
+                f"ask {args.trace_id}: {result.get('agent')} failed: "
+                f"{str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}"
+            )
+    if not successful:
+        eprint(f"ask {args.trace_id}: all fan-out agents failed")
+        return 1
+
+    verdict: dict[str, Any] | None = None
+    if judge and len(successful) >= 2:
+        candidates = "\n\n".join(
+            f'<answer agent="{r["agent"]}" call="{index + 1}">\n{str(r["stdout"]).strip()}\n</answer>'
+            for index, r in enumerate(successful)
+        )
+        if args.judge_prompt:
+            # Custom instructions are used verbatim (no .format, so braces are
+            # safe); the task and candidate answers are appended after them.
+            judge_text = (
+                f"{args.judge_prompt.strip()}\n\nTask given to every agent:\n<task>\n{prompt.strip()}\n</task>\n\n{candidates}"
+            )
+        else:
+            judge_text = FANOUT_JUDGE_PROMPT.format(count=len(successful), task=prompt.strip(), candidates=candidates)
+        judge_args = fanout_judge_args(args, judge, judge_text)
+        verdict = execute_agent_call(judge, judge_args, build_prompt(judge_args), agents)
+        if int(verdict.get("exit_code", 1)) != 0 or not str(verdict.get("stdout", "")).strip():
+            eprint(f"ask {args.trace_id}: judge via {judge} failed; printing the raw answers")
+    elif judge:
+        eprint(f"ask {args.trace_id}: only one answer succeeded; skipping the judge")
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "trace_id": args.trace_id,
+                    "agents": names,
+                    "results": results,
+                    "judge": verdict,
+                    "exit_code": 0,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        blocks = [f"=== {r['agent']} ===\n{str(r['stdout']).strip()}" for r in successful]
+        if verdict is not None and int(verdict.get("exit_code", 1)) == 0 and str(verdict.get("stdout", "")).strip():
+            blocks.append(f"=== judge ({judge}) ===\n{str(verdict['stdout']).strip()}")
+        print("\n\n".join(blocks))
+    return 0
+
+
 def run_agent(args: argparse.Namespace) -> int:
+    fanout_names = [name.strip() for name in args.agent.split(",") if name.strip()]
+    if len(fanout_names) > 1:
+        return run_fanout(args, fanout_names)
+    if fanout_names:
+        args.agent = fanout_names[0]  # tolerate a stray comma or whitespace
+    if getattr(args, "judge", None) or getattr(args, "judge_prompt", None):
+        raise YoyoError("--judge/--judge-prompt need a fan-out: pass several agents, e.g. `yoyo ask codex,claude --judge grok`")
     agents = validate_ask_args(args)
     if getattr(args, "background", False) and not args.dry_run:
         return start_background_run(args)
@@ -1880,40 +2059,6 @@ def run_phase_gates(
     return results, 0
 
 
-def workflow_job_expect(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> dict[str, Any] | None:
-    expect = inherited_workflow_value(spec, phase, job, "expect")
-    if expect is None:
-        return None
-    if not isinstance(expect, dict):
-        raise YoyoError(f"Workflow job {job.get('id')!r} field 'expect' must be an object")
-    unknown = set(expect) - {"contains", "regex"}
-    if unknown:
-        raise YoyoError(f"Workflow job {job.get('id')!r} 'expect' has unknown keys: {', '.join(sorted(unknown))}")
-    contains = coerce_str_list(expect.get("contains"), field="expect.contains")
-    regex = expect.get("regex")
-    if regex is not None:
-        if not isinstance(regex, str) or not regex:
-            raise YoyoError(f"Workflow job {job.get('id')!r} field 'expect.regex' must be a non-empty string")
-        try:
-            re.compile(regex)
-        except re.error as exc:
-            raise YoyoError(f"Workflow job {job.get('id')!r} has invalid 'expect.regex': {exc}") from exc
-    if not contains and regex is None:
-        raise YoyoError(f"Workflow job {job.get('id')!r} 'expect' must set 'contains' and/or 'regex'")
-    return {"contains": contains, "regex": regex}
-
-
-def expect_failure(stdout: str, expect: dict[str, Any] | None) -> str | None:
-    if expect is None:
-        return None
-    for needle in expect["contains"]:
-        if needle not in stdout:
-            return f"missing required text {needle!r}"
-    if expect["regex"] is not None and not re.search(expect["regex"], stdout):
-        return f"output did not match regex {expect['regex']!r}"
-    return None
-
-
 def workflow_job_retries(spec: dict[str, Any], phase: dict[str, Any], job: dict[str, Any]) -> int:
     return coerce_int(
         inherited_workflow_value(spec, phase, job, "retries"),
@@ -1953,7 +2098,6 @@ def run_workflow_job(
 
     prompt = build_workflow_prompt(spec, phase, agent_args, job, results_by_phase, workflow_input, context_limit)
     retries = workflow_job_retries(spec, phase, job)
-    expect = workflow_job_expect(spec, phase, job)
 
     attempts = 0
     while True:
@@ -1961,16 +2105,9 @@ def run_workflow_job(
         result = execute_agent_call(agent, agent_args, prompt, agents)
         if cli_args.dry_run:
             break
-        contract_failure = expect_failure(str(result.get("stdout", "")), expect)
-        if int(result.get("exit_code", 1)) == 0 and contract_failure is None:
+        if int(result.get("exit_code", 1)) == 0:
             break
         if attempts > retries:
-            if int(result.get("exit_code", 1)) == 0 and contract_failure is not None:
-                result["exit_code"] = 3
-                note = f"output contract not met: {contract_failure}"
-                for key in ("stderr", "stderr_plain"):
-                    existing = str(result.get(key, ""))
-                    result[key] = (existing + "\n" + note).strip()
             break
 
     result.update(
@@ -2051,7 +2188,12 @@ def run_workflow(args: argparse.Namespace) -> int:
         # Fail loudly on misconfigured jobs before any tokens are spent.
         for job in jobs:
             workflow_job_retries(spec, phase, job)
-            workflow_job_expect(spec, phase, job)
+            if inherited_workflow_value(spec, phase, job, "expect") is not None:
+                raise YoyoError(
+                    f"Workflow job {job.get('id')!r} uses 'expect', which was removed in 0.15.0 "
+                    "(deterministic output-grading produced false failures). State the required "
+                    "output in the prompt, or use a phase gate for closed-form checks."
+                )
             for skill_name in workflow_job_skills(spec, phase, job):
                 skill_path = resolve_skill(skill_name)
                 positive_env_int("YOYO_SKILL_MAX_BYTES", DEFAULT_SKILL_MAX_BYTES)
@@ -2196,6 +2338,18 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
     if not stdout and result.get("loop_id") and result.get("end_reason"):
         # A background loop's parent result is a loop summary, not an ask envelope.
         stdout = loop_summary_line(result) + "\n"
+    if not stdout and isinstance(result.get("results"), list):
+        # A background fan-out's result is a fan-out envelope, not an ask
+        # envelope; render it the way a foreground fan-out prints.
+        blocks = []
+        for item in result["results"]:
+            if isinstance(item, dict) and int(item.get("exit_code", 1)) == 0 and str(item.get("stdout", "")).strip():
+                blocks.append(f"=== {item.get('agent')} ===\n{str(item['stdout']).strip()}")
+        judge = result.get("judge")
+        if isinstance(judge, dict) and int(judge.get("exit_code", 1)) == 0 and str(judge.get("stdout", "")).strip():
+            blocks.append(f"=== judge ({judge.get('agent')}) ===\n{str(judge['stdout']).strip()}")
+        if blocks:
+            stdout = "\n\n".join(blocks) + "\n"
     if stdout:
         print(stdout, end="" if stdout.endswith("\n") else "\n")
     stderr = result.get("stderr_plain", result.get("stderr") or "")
@@ -2309,6 +2463,238 @@ IMAGE_MAGIC: dict[str, bytes] = {
 }
 IMAGE_SIZE_RE = re.compile(r"^\d{2,4}x\d{2,4}$")
 MIN_IMAGE_BYTES = 1024
+
+
+# --- cron: schedule yoyo commands through the user's crontab. No daemon, no
+# new runtime — the system cron fires a plain yoyo invocation and the output
+# lands in a log file. Paired with `yoyo loop` (whose state file carries
+# continuity and whose flock prevents overlap), a scheduled loop keeps making
+# progress across runs and goes quiet once its task is verified DONE.
+
+CRON_TAG_PREFIX = "# yoyo-cron:"
+CRON_MACROS = {"@reboot", "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly"}
+
+
+def cron_registry_path() -> Path:
+    return state_dir() / "cron.json"
+
+
+def read_cron_registry() -> dict[str, Any]:
+    data = load_json_file(cron_registry_path())
+    if data is None:
+        return {}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        raise YoyoError(f"Invalid cron registry in {cron_registry_path()}; expected an entries object")
+    return entries
+
+
+def write_cron_registry(entries: dict[str, Any]) -> None:
+    path = cron_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"entries": entries}, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def validate_cron_name(name: str | None) -> str:
+    if not name or not SESSION_NAME_RE.match(name):
+        raise YoyoError("cron entry name must be non-empty and match [A-Za-z0-9._-]+")
+    return name
+
+
+def validate_cron_schedule(raw: str) -> str:
+    schedule = raw.strip()
+    if not schedule:
+        raise YoyoError("--schedule must not be empty")
+    if schedule.startswith("@"):
+        if schedule not in CRON_MACROS:
+            raise YoyoError(f"Unknown cron macro {schedule!r}; known: {', '.join(sorted(CRON_MACROS))}")
+        return schedule
+    fields = schedule.split()
+    if len(fields) != 5:
+        raise YoyoError("--schedule must be five cron fields (min hour day month weekday) or a macro like @hourly")
+    return " ".join(fields)
+
+
+def crontab_read() -> list[str]:
+    try:
+        proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True, errors="replace")
+    except FileNotFoundError as exc:
+        raise YoyoError("crontab command not found; yoyo cron needs cron (standard on macOS and Linux)") from exc
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if "no crontab" in stderr.lower():
+            return []
+        raise YoyoError(f"crontab -l failed: {stderr or proc.returncode}")
+    return proc.stdout.splitlines()
+
+
+def crontab_write(lines: list[str]) -> None:
+    text = "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    proc = subprocess.run(["crontab", "-"], input=text, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise YoyoError(f"crontab update failed: {(proc.stderr or '').strip() or proc.returncode}")
+
+
+def cron_line_name(line: str) -> str | None:
+    """The yoyo entry name a crontab line is tagged with, or None."""
+    idx = line.rfind(CRON_TAG_PREFIX)
+    if idx == -1:
+        return None
+    return line[idx + len(CRON_TAG_PREFIX):].strip() or None
+
+
+def build_cron_line(entry: dict[str, Any]) -> str:
+    # PATH is captured at add time because cron's own environment is minimal
+    # and the target agent CLIs (claude, codex, ...) must still resolve. The
+    # trailing tag is a shell comment at execution time but survives in
+    # `crontab -l`, which is how list/rm find yoyo-managed lines.
+    command = (
+        f"cd {shlex.quote(entry['cwd'])} && "
+        f"PATH={shlex.quote(entry['path_env'])} YOYO_CALLER=cron "
+        f"{shlex.quote(entry['yoyo'])} {shlex.join(entry['argv'])} "
+        f">> {shlex.quote(entry['log'])} 2>&1"
+    )
+    # % is special inside a crontab command (line separator); escape it.
+    command = command.replace("%", r"\%")
+    line = f"{entry['schedule']} {command} {CRON_TAG_PREFIX}{entry['name']}"
+    if "\n" in line or "\r" in line:
+        raise YoyoError(
+            "cron entries must be a single line; remove newlines from the scheduled command, cwd, or log path"
+        )
+    return line
+
+
+def yoyo_subcommands() -> set[str]:
+    for action in build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices)
+    return set()
+
+
+def cron_add(args: argparse.Namespace) -> int:
+    name = validate_cron_name(args.name)
+    if not args.schedule:
+        raise YoyoError("cron add requires --schedule ('0 2 * * *' or a macro like @daily)")
+    schedule = validate_cron_schedule(args.schedule)
+    command = list(getattr(args, "cron_command", None) or [])
+    if command and command[0] == "yoyo":
+        command = command[1:]
+    if not command:
+        raise YoyoError(
+            "cron add needs the yoyo command to schedule after '--', e.g. "
+            "yoyo cron add nightly --schedule '@daily' -- loop claude \"Work through TODO.md\""
+        )
+    if command[0] not in yoyo_subcommands():
+        raise YoyoError(f"scheduled command must start with a yoyo subcommand, got {command[0]!r}")
+    if command[0] == "cron":
+        raise YoyoError("scheduling `yoyo cron` itself is not supported")
+    entries = read_cron_registry()
+    if name in entries and not args.force:
+        raise YoyoError(f"cron entry {name!r} already exists; pass --force to replace it")
+    log_path = Path(args.log).expanduser() if args.log else state_dir() / "cron" / f"{name}.log"
+    if not log_path.is_absolute():
+        log_path = resolve_cwd(args.cwd) / log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "name": name,
+        "schedule": schedule,
+        "cwd": str(resolve_cwd(args.cwd)),
+        "argv": command,
+        "log": str(log_path),
+        "yoyo": str(Path(__file__).resolve()),
+        "path_env": os.environ.get("PATH", ""),
+        "created_at": iso_utc(utc_now()),
+    }
+    lines = [line for line in crontab_read() if cron_line_name(line) != name]
+    lines.append(build_cron_line(entry))
+    crontab_write(lines)
+    entries[name] = entry
+    write_cron_registry(entries)
+    if args.json:
+        print(json.dumps({"name": name, "schedule": schedule, "argv": command, "log": str(log_path)}, ensure_ascii=False))
+    else:
+        print(f"scheduled {name}: {schedule} -> yoyo {shlex.join(command)}")
+        eprint(f"log: {log_path}")
+        eprint(f"remove with: yoyo cron rm {name}")
+    return 0
+
+
+def cron_list(args: argparse.Namespace) -> int:
+    entries = read_cron_registry()
+    installed = {cron_line_name(line) for line in crontab_read()} - {None}
+    rows = []
+    for name in sorted(entries):
+        entry = entries[name]
+        rows.append(
+            {
+                "name": name,
+                "schedule": entry.get("schedule"),
+                "argv": entry.get("argv"),
+                "cwd": entry.get("cwd"),
+                "log": entry.get("log"),
+                "installed": name in installed,
+            }
+        )
+    untracked = sorted(installed - set(entries))
+    if args.json:
+        print(json.dumps({"entries": rows, "untracked_crontab_names": untracked}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no yoyo cron entries")
+    for row in rows:
+        marker = "" if row["installed"] else "  [missing from crontab — re-add with --force]"
+        print(f"{row['name']}  {row['schedule']}  yoyo {shlex.join(row['argv'] or [])}{marker}")
+    for name in untracked:
+        eprint(f"warning: crontab line tagged yoyo-cron:{name} has no registry entry; remove with: yoyo cron rm {name}")
+    return 0
+
+
+def cron_rm(args: argparse.Namespace) -> int:
+    name = validate_cron_name(args.name)
+    entries = read_cron_registry()
+    lines = crontab_read()
+    kept = [line for line in lines if cron_line_name(line) != name]
+    removed_cron = len(kept) != len(lines)
+    removed_registry = entries.pop(name, None) is not None
+    if not removed_cron and not removed_registry:
+        raise YoyoError(f"no cron entry named {name!r}")
+    if removed_cron:
+        crontab_write(kept)
+    if removed_registry:
+        write_cron_registry(entries)
+    print(f"removed {name}")
+    return 0
+
+
+def cron_run(args: argparse.Namespace) -> int:
+    name = validate_cron_name(args.name)
+    entry = read_cron_registry().get(name)
+    if entry is None:
+        raise YoyoError(f"no cron entry named {name!r}; see yoyo cron list")
+    argv = [str(entry["yoyo"]), *[str(part) for part in entry.get("argv", [])]]
+    eprint(f"cron {name}: running yoyo {shlex.join(argv[1:])}")
+    env = os.environ.copy()
+    env.setdefault("YOYO_CALLER", "cron")
+    try:
+        proc = subprocess.run(argv, cwd=str(entry.get("cwd") or os.getcwd()), env=env)
+    except FileNotFoundError as exc:
+        raise YoyoError(f"recorded yoyo executable not found: {argv[0]}") from exc
+    return proc.returncode
+
+
+def cmd_cron(args: argparse.Namespace) -> int:
+    action = args.cron_action
+    if action == "add":
+        return cron_add(args)
+    if action == "rm":
+        return cron_rm(args)
+    if action == "run":
+        return cron_run(args)
+    return cron_list(args)
 
 
 def image_fingerprint(path: Path) -> tuple[bool, int, int]:
@@ -2970,6 +3356,7 @@ def loop_iteration_args(
     state_path: Path,
     spec_text: str | None = None,
     verifiers: str | None = None,
+    agent_name: str | None = None,
 ) -> argparse.Namespace:
     parts: list[str] = []
     if spec_text:
@@ -2980,7 +3367,7 @@ def loop_iteration_args(
     body = "\n\n".join(parts)
     return argparse.Namespace(
         cwd=str(resolve_cwd(args.cwd)),
-        agent=args.agent,
+        agent=agent_name or args.agent,
         role=args.role,
         read_only=args.read_only,
         caller=args.caller,
@@ -3008,6 +3395,7 @@ def record_loop_iteration_run(
     iteration: int,
     started: datetime,
     result: dict[str, Any],
+    agent_name: str | None = None,
 ) -> str | None:
     try:
         root = runs_root()
@@ -3017,7 +3405,7 @@ def record_loop_iteration_run(
         run_dir.mkdir(mode=0o700)
         meta = {
             "run_id": run_id,
-            "agent": args.agent,
+            "agent": agent_name or args.agent,
             "role": args.role,
             "cwd": str(resolve_cwd(args.cwd)),
             "trace_id": trace_id,
@@ -3095,9 +3483,16 @@ def print_loop_iteration_line(
 
 def cmd_loop(args: argparse.Namespace) -> int:
     agents = load_agents()
-    if args.agent not in agents:
-        known = ", ".join(sorted(agents))
-        raise YoyoError(f"Unknown agent {args.agent!r}. Known agents: {known}")
+    # A comma-separated agent list rotates vendors across iterations: each
+    # fresh context gets a different model's eyes on the same state file, so
+    # one vendor's blind spots don't compound over a long loop.
+    loop_agents = [name.strip() for name in args.agent.split(",") if name.strip()]
+    if not loop_agents:
+        raise YoyoError("loop requires at least one agent")
+    for name in loop_agents:
+        if name not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown agent {name!r}. Known agents: {known}")
     if getattr(args, "session", None):
         raise YoyoError(
             "loop does not support --session; every iteration is intentionally a fresh-context session "
@@ -3120,7 +3515,6 @@ def cmd_loop(args: argparse.Namespace) -> int:
     for skill_name in args.skill or []:
         resolve_skill(skill_name)
 
-    spec = agents[args.agent]
     task = loop_task_text(args)
     state_path = resolve_loop_state_path(args)
     policy = resolve_done_policy(args)
@@ -3132,8 +3526,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
     spec_text = read_loop_spec(spec_path, args.max_input_bytes)
     verifiers = loop_verifiers_label(policy, gate_cmds, args.checker)
     # Fail loudly on flag problems (e.g. --read-only on a custom agent without
-    # read_only_args) before seeding state or detaching.
-    command_for_agent(spec, loop_iteration_args(args, 1, spec, task, state_path, spec_text, verifiers))
+    # read_only_args) before seeding state or detaching — for every rotation agent.
+    for name in dict.fromkeys(loop_agents):
+        rotation_spec = agents[name]
+        command_for_agent(
+            rotation_spec,
+            loop_iteration_args(args, 1, rotation_spec, task, state_path, spec_text, verifiers, agent_name=name),
+        )
     if args.checker:
         if args.checker not in agents:
             known = ", ".join(sorted(agents))
@@ -3146,17 +3545,25 @@ def cmd_loop(args: argparse.Namespace) -> int:
     guard_loop_state_task(state_path, task)
 
     if args.dry_run:
-        iter_args = loop_iteration_args(args, 1, spec, task, state_path, spec_text, verifiers)
+        first_agent = loop_agents[0]
+        iter_args = loop_iteration_args(
+            args, 1, agents[first_agent], task, state_path, spec_text, verifiers, agent_name=first_agent
+        )
         prompt = build_prompt(iter_args)
-        result = execute_agent_call(args.agent, iter_args, prompt, agents)
+        result = execute_agent_call(first_agent, iter_args, prompt, agents)
         emit_dry_run_result(result, args.json)
         return 0
 
     if getattr(args, "background", False):
         return start_background_run(args)
 
-    if args.budget_usd is not None and not loop_reports_cost(spec):
-        eprint(f"warning: agent {args.agent!r} does not report cost; --budget-usd will not be enforced")
+    if args.budget_usd is not None:
+        costless = [name for name in dict.fromkeys(loop_agents) if not loop_reports_cost(agents[name])]
+        if costless:
+            scope = "will not be enforced" if len(costless) == len(set(loop_agents)) else "is only partially enforced"
+            eprint(
+                f"warning: agent(s) {', '.join(costless)} do not report cost; --budget-usd {scope}"
+            )
     if args.read_only:
         eprint(
             "warning: a read-only loop cannot rewrite its own state file; "
@@ -3226,15 +3633,19 @@ def cmd_loop(args: argparse.Namespace) -> int:
                 end_reason = "done"
                 break
 
-            iter_args = loop_iteration_args(args, iteration, spec, task, state_path, current_spec_text, verifiers)
+            iter_agent = loop_agents[(iteration - 1) % len(loop_agents)]
+            iter_spec = agents[iter_agent]
+            iter_args = loop_iteration_args(
+                args, iteration, iter_spec, task, state_path, current_spec_text, verifiers, agent_name=iter_agent
+            )
             prompt = build_prompt(iter_args)
             started = utc_now()
-            result = execute_agent_call(args.agent, iter_args, prompt, agents)
+            result = execute_agent_call(iter_agent, iter_args, prompt, agents)
             iterations_run = iteration
 
             cost: float | None = None
             usage: dict[str, Any] = {}
-            extracted = extract_loop_usage(spec, str(result.get("stdout", "")))
+            extracted = extract_loop_usage(iter_spec, str(result.get("stdout", "")))
             if extracted is not None:
                 text, cost, usage = extracted
                 result["stdout"] = text
@@ -3245,13 +3656,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
                 if usage:
                     result["usage"] = usage
 
-            if extracted is None and args.budget_usd is not None and loop_reports_cost(spec):
+            if extracted is None and args.budget_usd is not None and loop_reports_cost(iter_spec):
                 eprint(
                     f"warning: iteration {iteration} output was not a parseable cost envelope; "
                     "its cost is unknown and not counted toward --budget-usd"
                 )
 
-            run_id = record_loop_iteration_run(args, iter_args.trace_id, iteration, started, result)
+            run_id = record_loop_iteration_run(args, iter_args.trace_id, iteration, started, result, agent_name=iter_agent)
             ok = int(result.get("exit_code", 1)) == 0
             consecutive_failures = 0 if ok else consecutive_failures + 1
 
@@ -3565,17 +3976,27 @@ RESEARCH_LENSES: dict[str, str] = {
 RESEARCH_DEFAULT_LENSES = "proponent,skeptic,analyst,explorer,pragmatist"
 
 
-def research_lens_preamble(name: str) -> str:
+def research_lens_preamble(name: str, freeform: bool = False) -> str:
     preset = RESEARCH_LENSES.get(name)
     if preset:
         return preset
-    # Unknown name -> treat the string as an ad-hoc angle so callers can research
-    # any domain-specific lens (e.g. --lenses "regulatory,market,security").
+    # Free-text lens (--lens "..."): the caller wrote the full investigative
+    # angle; use it verbatim so nothing is forced through a canned template.
+    if freeform:
+        return f"Research lens: {name.strip()}"
+    # Unknown --lenses name -> treat the string as an ad-hoc angle so callers
+    # can research any domain-specific lens (e.g. --lenses "regulatory,market").
     return (
         f"Research lens: {name.upper()}. Investigate the question specifically through the lens of "
         f"{name}: what does this angle reveal that a generic answer would miss? Stay in this lens "
         f"and go deep rather than broad."
     )
+
+
+def research_lens_label(name: str, index: int) -> str:
+    """A short, trace-safe label for a lens (free-text lenses get a slug)."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name.strip()).strip("-")[:24].rstrip("-")
+    return slug or f"lens{index + 1}"
 
 
 RESEARCH_BRIEF_PROMPT = """You are one of several independent researchers investigating the same
@@ -3653,11 +4074,17 @@ def cmd_research(args: argparse.Namespace) -> int:
     agent_names = [item.strip() for item in args.agents.split(",") if item.strip()]
     if not agent_names:
         raise YoyoError("--agents must name at least one agent")
-    lenses = [item.strip() for item in args.lenses.split(",") if item.strip()]
-    if not lenses:
-        raise YoyoError("--lenses must name at least one research lens")
-    if len(lenses) != len(set(lenses)):
-        raise YoyoError("--lenses must not repeat a lens; diverse perspectives need distinct lenses")
+    # Lenses come from --lenses (comma-separated names, canned or ad-hoc) plus
+    # repeatable --lens (free text used verbatim; commas allowed). Duplicates
+    # are deliberate: the same lens assigned round-robin to different agents is
+    # a best-of-n sample across vendors — the point of multi-agent research.
+    lens_specs = [(item.strip(), False) for item in (args.lenses or "").split(",") if item.strip()]
+    lens_specs.extend((item.strip(), True) for item in (args.lens or []) if item.strip())
+    if not lens_specs:
+        lens_specs = [(item.strip(), False) for item in RESEARCH_DEFAULT_LENSES.split(",")]
+    lenses = [lens for lens, _ in lens_specs]
+    if args.no_synthesis and args.synthesizer:
+        raise YoyoError("--no-synthesis and --synthesizer are mutually exclusive")
     synthesizer = args.synthesizer or agent_names[0]
     for name in [*agent_names, synthesizer]:
         if name not in agents:
@@ -3677,15 +4104,18 @@ def cmd_research(args: argparse.Namespace) -> int:
     # Assign each lens an agent round-robin so perspectives span both lenses and
     # vendors; with the default agents the for/against split lands on different
     # vendors, which makes the disagreement more credible.
-    jobs = [(lens, agent_names[index % len(agent_names)]) for index, lens in enumerate(lenses)]
+    jobs = [
+        (index, lens, freeform, research_lens_label(lens, index), agent_names[index % len(agent_names)])
+        for index, (lens, freeform) in enumerate(lens_specs)
+    ]
 
     # Fail loudly before spending tokens if any agent that will actually run
     # cannot build its command (e.g. agy under --read-only has no headless
     # read-only mode). Probe only the scheduled researcher agents, plus the
-    # synthesizer when there are enough lenses for synthesis to run — probing an
-    # unscheduled pool agent would reject an otherwise-valid reduced-lens run.
-    probe_targets = {name for _, name in jobs}
-    if len(jobs) >= 2:
+    # synthesizer when synthesis will actually run — probing an unscheduled
+    # pool agent would reject an otherwise-valid reduced-lens run.
+    probe_targets = {name for _, _, _, _, name in jobs}
+    if len(jobs) >= 2 and not args.no_synthesis:
         probe_targets.add(synthesizer)
     for name in probe_targets:
         command_for_agent(agents[name], research_call_args(args, name, "probe", "probe"))
@@ -3700,30 +4130,35 @@ def cmd_research(args: argparse.Namespace) -> int:
             eprint("warning: full-access delegation includes --file context; use --read-only for untrusted input")
         context = "\n\nContext from the caller:\n" + read_file_context(args.file, cwd, args.max_input_bytes)
 
-    def run_researcher(lens: str, name: str) -> dict[str, Any]:
+    def run_researcher(index: int, lens: str, freeform: bool, label: str, name: str) -> dict[str, Any]:
         prompt_text = RESEARCH_BRIEF_PROMPT.format(
-            lens=research_lens_preamble(lens), topic=topic, context=context, cwd=cwd
+            lens=research_lens_preamble(lens, freeform), topic=topic, context=context, cwd=cwd
         )
-        call_args = research_call_args(args, name, prompt_text, f"{lens}.{name}")
+        call_args = research_call_args(args, name, prompt_text, f"{index + 1}.{label}.{name}")
         return execute_agent_call(name, call_args, build_prompt(call_args), agents)
 
     mode = "read-only" if args.read_only else "full-access"
+    labels = [label for _, _, _, label, _ in jobs]
+    synth_note = "none (caller synthesizes)" if args.no_synthesis else synthesizer
     eprint(
-        f"research {args.trace_id}: lenses={','.join(lenses)} agents={','.join(agent_names)} "
-        f"synthesizer={synthesizer} mode={mode}"
+        f"research {args.trace_id}: lenses={','.join(labels)} agents={','.join(agent_names)} "
+        f"synthesizer={synth_note} mode={mode}"
     )
 
     if args.dry_run:
-        for lens, name in jobs:
-            emit_dry_run_result(run_researcher(lens, name), args.json)
+        for index, lens, freeform, label, name in jobs:
+            emit_dry_run_result(run_researcher(index, lens, freeform, label, name), args.json)
         return 0
 
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {pool.submit(run_researcher, lens, name): index for index, (lens, name) in enumerate(jobs)}
+        futures = {
+            pool.submit(run_researcher, index, lens, freeform, label, name): index
+            for index, lens, freeform, label, name in jobs
+        }
         indexed: dict[int, dict[str, Any]] = {}
         for future in as_completed(futures):
             index = futures[future]
-            lens, name = jobs[index]
+            _, lens, _, label, name = jobs[index]
             try:
                 result = future.result()
             except Exception as exc:
@@ -3731,7 +4166,7 @@ def cmd_research(args: argparse.Namespace) -> int:
             result["lens"] = lens
             indexed[index] = result
             status = "ok" if int(result.get("exit_code", 1)) == 0 else f"exit {result.get('exit_code')}"
-            eprint(f"research {args.trace_id}: {lens} via {name} {status}")
+            eprint(f"research {args.trace_id}: {label} via {name} {status}")
         perspectives = [indexed[index] for index in range(len(jobs))]
 
     successful = [p for p in perspectives if int(p.get("exit_code", 1)) == 0 and str(p.get("stdout", "")).strip()]
@@ -3746,23 +4181,37 @@ def cmd_research(args: argparse.Namespace) -> int:
         return 1
 
     synthesis: dict[str, Any] | None = None
+    raw_report = "\n\n".join(
+        f"=== {p['lens']} (via {p['agent']}) ===\n{str(p['stdout']).strip()}" for p in successful
+    )
     if len(successful) == 1:
         final_text = str(successful[0]["stdout"]).strip()
+    elif args.no_synthesis:
+        # The caller keeps synthesis for itself: it usually has the decision
+        # context the perspectives lack, so it is often the better judge.
+        final_text = raw_report
     else:
         perspectives_block = "\n\n".join(
             f'<perspective lens="{p["lens"]}" agent="{p["agent"]}">\n{str(p["stdout"]).strip()}\n</perspective>'
             for p in successful
         )
-        synth_prompt = RESEARCH_SYNTHESIS_PROMPT.format(count=len(successful), topic=topic, perspectives=perspectives_block)
+        if args.synthesis_prompt:
+            # Custom instructions are used verbatim (no .format, so braces are
+            # safe); the topic and perspectives are appended after them.
+            synth_prompt = (
+                f"{args.synthesis_prompt.strip()}\n\nQuestion / topic:\n{topic}\n\n{perspectives_block}"
+            )
+        else:
+            synth_prompt = RESEARCH_SYNTHESIS_PROMPT.format(
+                count=len(successful), topic=topic, perspectives=perspectives_block
+            )
         synth_args = research_call_args(args, synthesizer, synth_prompt, "synthesis")
         synthesis = execute_agent_call(synthesizer, synth_args, build_prompt(synth_args), agents)
         if int(synthesis.get("exit_code", 1)) == 0 and str(synthesis.get("stdout", "")).strip():
             final_text = str(synthesis["stdout"]).strip()
         else:
             eprint(f"research {args.trace_id}: synthesis via {synthesizer} failed; printing the raw perspectives instead")
-            final_text = "\n\n".join(
-                f"=== {p['lens']} (via {p['agent']}) ===\n{str(p['stdout']).strip()}" for p in successful
-            )
+            final_text = raw_report
 
     if args.json:
         print(
@@ -4197,9 +4646,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    ask = sub.add_parser("ask", help="Call another agent non-interactively")
-    ask.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
+    ask = sub.add_parser("ask", help="Call another agent non-interactively; a comma-separated list fans the same prompt out in parallel")
+    ask.add_argument(
+        "agent",
+        help="Agent name (codex, claude, pi, or a configured custom agent), or a comma-separated list to fan the same prompt out to several agents in parallel",
+    )
     ask.add_argument("prompt", nargs="*", help="Prompt text. Also accepts piped stdin.")
+    ask.add_argument(
+        "--judge",
+        help="With a fan-out (comma-separated agents): an agent that compares the independent answers and recommends the best one",
+    )
+    ask.add_argument(
+        "--judge-prompt",
+        help="Custom judging instructions for --judge (the task and candidate answers are appended)",
+    )
     ask.add_argument("--role", choices=sorted(ROLE_PROMPTS), default=None, help="Role preamble (default: opinion; incompatible with --raw)")
     ask.add_argument(
         "--raw",
@@ -4277,7 +4737,10 @@ def build_parser() -> argparse.ArgumentParser:
     imagegen.set_defaults(func=cmd_imagegen)
 
     loop = sub.add_parser("loop", help="Run a task as repeated fresh-context agent iterations with a shared state file")
-    loop.add_argument("agent", help="Agent name: codex, claude, pi, or configured custom agent")
+    loop.add_argument(
+        "agent",
+        help="Agent name (codex, claude, pi, or a configured custom agent), or a comma-separated list rotated across iterations so each fresh context gets a different vendor's eyes",
+    )
     loop.add_argument("prompt", nargs="*", help="The overall loop goal. Or use --input FILE.")
     loop.add_argument("--input", help="Read the loop task from a file instead of positional text")
     loop.add_argument(
@@ -4378,15 +4841,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     research.add_argument(
         "--lenses",
-        default=RESEARCH_DEFAULT_LENSES,
+        default=None,
         help=(
             "Comma-separated research lenses, one parallel call each. Catalog: "
             + ", ".join(RESEARCH_LENSES)
-            + ". Unknown names become ad-hoc angles (e.g. regulatory,market). Default: "
+            + ". Unknown names become ad-hoc angles (e.g. regulatory,market); repeating a lens is allowed "
+            "(same angle, different agents = a best-of-n sample). Default: "
             + RESEARCH_DEFAULT_LENSES
         ),
     )
+    research.add_argument(
+        "--lens",
+        action="append",
+        default=[],
+        help="A free-text lens written as full investigative instructions (commas and spaces allowed); repeatable and combinable with --lenses",
+    )
     research.add_argument("--synthesizer", default=None, help="Agent that merges the perspectives into a decision brief (default: first of --agents)")
+    research.add_argument(
+        "--no-synthesis",
+        action="store_true",
+        help="Skip the synthesis call and print the raw per-lens perspectives (the caller synthesizes them itself)",
+    )
+    research.add_argument(
+        "--synthesis-prompt",
+        help="Custom synthesis instructions replacing the default decision-brief format (the topic and perspectives are appended)",
+    )
     research.add_argument("--file", action="append", default=[], help="Add a file as shared context for every researcher; repeatable")
     research.add_argument("--read-only", action="store_true", help="Constrain researchers to read-only mode (limits web/tool access on some agents; default is full-access so investigation tools work)")
     research.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
@@ -4424,6 +4903,16 @@ def build_parser() -> argparse.ArgumentParser:
     sessions.add_argument("--all", action="store_true", help="Remove all recorded session mappings")
     sessions.set_defaults(func=cmd_sessions)
 
+    cron = sub.add_parser("cron", help="Schedule yoyo commands via the user's crontab: add, list, rm, run")
+    cron.add_argument("cron_action", nargs="?", choices=["add", "list", "rm", "run"], default="list")
+    cron.add_argument("name", nargs="?", help="Entry name (required for add/rm/run)")
+    cron.add_argument("--schedule", help="Cron schedule: five fields ('0 2 * * *') or a macro (@hourly, @daily, @weekly, ...)")
+    cron.add_argument("--cwd", default=os.getcwd(), help="Working directory the scheduled command runs from")
+    cron.add_argument("--log", help="Append the scheduled run's output to this file (default: state dir cron/<name>.log)")
+    cron.add_argument("--force", action="store_true", help="Replace an existing entry with the same name")
+    cron.add_argument("--json", action="store_true")
+    cron.set_defaults(func=cmd_cron)
+
     agents = sub.add_parser("agents", help="List configured agents")
     agents.add_argument("--json", action="store_true")
     agents.set_defaults(func=list_agents)
@@ -4456,6 +4945,14 @@ def main(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # `yoyo cron add <name> --schedule ... -- <yoyo command...>`: everything
+    # after the first standalone `--` is the command to schedule, kept out of
+    # argparse so its own flags are never parsed here.
+    cron_command: list[str] = []
+    if raw_argv[:1] == ["cron"] and "--" in raw_argv:
+        split_at = raw_argv.index("--")
+        cron_command = raw_argv[split_at + 1 :]
+        raw_argv = raw_argv[:split_at]
     try:
         try:
             args, extras = parser.parse_known_args(raw_argv)
@@ -4467,6 +4964,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 raise YoyoError("unrecognized arguments: " + " ".join(extras))
         args._raw_argv = raw_argv
+        args.cron_command = cron_command
         return int(args.func(args))
     except BrokenPipeError:
         return 141

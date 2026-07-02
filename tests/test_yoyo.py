@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.14.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.15.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -2234,77 +2234,6 @@ class YoyoTests(unittest.TestCase):
         gate = payload["phases"][0]["gates"][0]
         self.assertEqual(gate["skipped"], "phase jobs failed")
 
-    def test_workflow_expect_contract_failure_sets_exit_3(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "contract",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [
-                                    {
-                                        "id": "j1",
-                                        "prompt": "First",
-                                        "expect": {"contains": "TEXT_THAT_NEVER_APPEARS"},
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 3, stderr)
-        payload = json.loads(stdout)
-        job = payload["phases"][0]["jobs"][0]
-        self.assertEqual(job["exit_code"], 3)
-        self.assertEqual(job["attempts"], 1)
-        self.assertIn("output contract not met", job["stderr"])
-
-    def test_workflow_expect_pass_keeps_exit_zero(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "contract-ok",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [
-                                    {
-                                        "id": "j1",
-                                        "prompt": "MARKER_ABC",
-                                        "expect": {"contains": ["MARKER_ABC"], "regex": "Task:"},
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["phases"][0]["jobs"][0]["attempts"], 1)
-
     def test_workflow_retries_until_success_and_records_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
             counter = Path(tmp) / "counter"
@@ -2990,7 +2919,7 @@ class YoyoTests(unittest.TestCase):
             )
 
             self.assertEqual(code, 0)
-            self.assertIn("does not report cost", stderr)
+            self.assertIn("do not report cost", stderr)
             summary = json.loads(stdout)
             self.assertEqual(summary["iterations"], 2)
             self.assertEqual(summary["end_reason"], "max-iter")
@@ -3735,23 +3664,482 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertNotIn("full-access delegation includes --file context", stderr)
 
-    def test_research_rejects_duplicate_lenses_and_unknown_agents(self):
+    def test_research_allows_duplicate_lenses_across_agents(self):
+        # Same lens, different vendors = a deliberate best-of-n sample.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1", "r2"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                [
+                    "research", "--cwd", tmp, "--agents", "r1,r2", "--lenses", "analyst,analyst",
+                    "--synthesizer", "merge", "--json", "topic",
+                ],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual([p["lens"] for p in payload["perspectives"]], ["analyst", "analyst"])
+            self.assertEqual([p["agent"] for p in payload["perspectives"]], ["r1", "r2"])
+
+    def test_research_rejects_unknown_agents(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._research_config(tmp, ["r1"])
             env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
-            code, _, stderr = self.run_cli(
-                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent,proponent", "topic"],
-                env=env,
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("must not repeat a lens", stderr)
-
             code, _, stderr = self.run_cli(
                 ["research", "--cwd", tmp, "--agents", "nope", "--lenses", "proponent", "topic"],
                 env=env,
             )
             self.assertEqual(code, 2)
             self.assertIn("Unknown agent", stderr)
+
+    # --- ask fan-out (best-of-n) ---
+
+    def _fanout_env(self, **extra):
+        env = {
+            "YOYO_AGENT_A": "python3 -c \"import sys; sys.stdin.read(); print('alpha-answer')\"",
+            "YOYO_AGENT_B": "python3 -c \"import sys; sys.stdin.read(); print('beta-answer')\"",
+        }
+        env.update(extra)
+        return env
+
+    def _judge_config(self, tmp):
+        """A judge agent that echoes its stdin and supports read-only mode.
+
+        The judge always runs read-only (it consumes untrusted candidate
+        text), so it must advertise read_only_args.
+        """
+        config = Path(tmp) / "judge-agents.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "agents": {
+                        "j": {
+                            "command": ["python3", "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+                            "read_only_args": ["--ro-marker"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    def test_ask_fanout_runs_all_agents_and_prints_sections(self):
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "compare this"], env=self._fanout_env())
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("=== a ===", stdout)
+        self.assertIn("alpha-answer", stdout)
+        self.assertIn("=== b ===", stdout)
+        self.assertIn("beta-answer", stdout)
+
+    def test_ask_fanout_judge_sees_all_candidates_and_the_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(YOYO_CONFIG=str(self._judge_config(tmp)))
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--judge", "j", "--json", "pick the best refactor"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["agents"], ["a", "b"])
+            self.assertEqual([r["agent"] for r in payload["results"]], ["a", "b"])
+            # The judge consumes untrusted candidate text, so it runs read-only.
+            self.assertIn("--ro-marker", payload["judge"]["command"])
+            judge_out = payload["judge"]["stdout"]
+            self.assertIn('answer agent="a"', judge_out)
+            self.assertIn("alpha-answer", judge_out)
+            self.assertIn("beta-answer", judge_out)
+            self.assertIn("pick the best refactor", judge_out)
+
+    def test_ask_fanout_judge_without_read_only_support_fails_loudly(self):
+        env = self._fanout_env(
+            YOYO_AGENT_J="python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+        )
+        code, _, stderr = self.run_cli(["ask", "a,b", "--judge", "j", "task"], env=env)
+        self.assertEqual(code, 2)
+        self.assertIn("read_only_args", stderr)
+
+    def test_ask_fanout_custom_judge_prompt_is_verbatim_and_brace_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(YOYO_CONFIG=str(self._judge_config(tmp)))
+            code, stdout, stderr = self.run_cli(
+                [
+                    "ask", "a,b", "--judge", "j", "--json",
+                    "--judge-prompt", "Rank by {rubric} strictly",
+                    "task text",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("Rank by {rubric} strictly", payload["judge"]["stdout"])
+            self.assertIn("alpha-answer", payload["judge"]["stdout"])
+
+    def test_ask_fanout_judge_prompt_without_judge_fails_loudly(self):
+        code, _, stderr = self.run_cli(
+            ["ask", "a,b", "--judge-prompt", "Rank strictly", "task"],
+            env=self._fanout_env(),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--judge-prompt has no effect without --judge", stderr)
+
+    def test_ask_fanout_partial_failure_keeps_survivors_and_skips_judge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(
+                YOYO_CONFIG=str(self._judge_config(tmp)),
+                YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); sys.exit(3)\"",
+            )
+            code, stdout, stderr = self.run_cli(["ask", "a,b", "--judge", "j", "task"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("alpha-answer", stdout)
+            self.assertNotIn("beta-answer", stdout)
+            self.assertIn("b failed", stderr)
+            self.assertIn("skipping the judge", stderr)
+
+    def test_ask_fanout_all_failed_exits_nonzero(self):
+        env = {
+            "YOYO_AGENT_A": "python3 -c \"import sys; sys.stdin.read(); sys.exit(3)\"",
+            "YOYO_AGENT_B": "python3 -c \"import sys; sys.stdin.read(); sys.exit(4)\"",
+        }
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "task"], env=env)
+
+        self.assertEqual(code, 1)
+        self.assertIn("all fan-out agents failed", stderr)
+
+    def test_ask_fanout_background_wait_prints_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(YOYO_STATE_DIR=tmp)
+            code, stdout, stderr = self.run_cli(["ask", "a,b", "--background", "task"], env=env)
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "5", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== a ===", stdout)
+            self.assertIn("alpha-answer", stdout)
+            self.assertIn("beta-answer", stdout)
+
+    def test_ask_fanout_rejects_session(self):
+        code, _, stderr = self.run_cli(
+            ["ask", "a,b", "--session", "s1", "task"],
+            env=self._fanout_env(),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("fan-out calls are one-shot", stderr)
+
+    def test_ask_judge_requires_a_fanout(self):
+        code, _, stderr = self.run_cli(["ask", "a", "--judge", "b", "task"], env=self._fanout_env())
+        self.assertEqual(code, 2)
+        self.assertIn("need a fan-out", stderr)
+
+        code, _, stderr = self.run_cli(["ask", "a", "--judge-prompt", "x", "task"], env=self._fanout_env())
+        self.assertEqual(code, 2)
+        self.assertIn("need a fan-out", stderr)
+
+    def test_ask_fanout_unknown_agent_fails_loudly(self):
+        code, _, stderr = self.run_cli(["ask", "a,nope", "task"], env=self._fanout_env())
+        self.assertEqual(code, 2)
+        self.assertIn("Unknown agent(s): nope", stderr)
+
+    # --- research flexibility ---
+
+    def test_research_free_text_lens_is_used_verbatim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                [
+                    "research", "--cwd", tmp, "--agents", "r1",
+                    "--lens", "Investigate GDPR fines, focusing on 2024 rulings",
+                    "--dry-run", "--json", "topic",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("Research lens: Investigate GDPR fines, focusing on 2024 rulings", payload["prompt"])
+            # Free-text lenses replace the defaults; nothing canned sneaks in.
+            self.assertNotIn("PROPONENT", payload["prompt"])
+
+    def test_research_no_synthesis_returns_raw_perspectives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1", "r2"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                [
+                    "research", "--cwd", tmp, "--agents", "r1,r2",
+                    "--lenses", "proponent,skeptic", "--no-synthesis", "--json", "topic",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIsNone(payload["synthesis"])
+            self.assertIn("=== proponent (via r1) ===", payload["report"])
+            self.assertIn("finding from r2", payload["report"])
+
+    def test_research_no_synthesis_conflicts_with_synthesizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, _, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--no-synthesis", "--synthesizer", "merge", "topic"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("mutually exclusive", stderr)
+
+    def test_research_custom_synthesis_prompt_is_verbatim_and_brace_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1", "r2"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                [
+                    "research", "--cwd", tmp, "--agents", "r1,r2", "--lenses", "proponent,skeptic",
+                    "--synthesizer", "merge",
+                    "--synthesis-prompt", "Rank the findings by {impact} only",
+                    "--json", "topic",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("Rank the findings by {impact} only", payload["synthesis"]["stdout"])
+            self.assertIn("finding from r1", payload["synthesis"]["stdout"])
+            self.assertNotIn("CONVERGENCE", payload["synthesis"]["stdout"])
+
+    # --- loop agent rotation ---
+
+    def test_loop_rotates_agents_across_iterations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = Path(tmp) / "order.txt"
+            body_template = (
+                "import sys\n"
+                "sys.stdin.read()\n"
+                f"open({str(order)!r}, 'a').write('{{name}}\\n')\n"
+                "print('ok')\n"
+            )
+            env = {
+                "YOYO_STATE_DIR": str(Path(tmp) / "state"),
+                "YOYO_AGENT_WA": self._loop_stub_command(tmp, body_template.format(name="wa"), name="wa.py"),
+                "YOYO_AGENT_WB": self._loop_stub_command(tmp, body_template.format(name="wb"), name="wb.py"),
+            }
+            code, stdout, stderr = self.run_cli(
+                ["loop", "wa,wb", "--cwd", tmp, "--max-iter", "3", "--json", "rotate work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(order.read_text().split(), ["wa", "wb", "wa"])
+            summary = json.loads(stdout)
+            self.assertEqual(summary["iterations"], 3)
+            self.assertEqual(summary["agent"], "wa,wb")
+
+    def test_loop_unknown_rotation_agent_fails_loudly(self):
+        code, _, stderr = self.run_cli(
+            ["loop", "wa,nope", "task"],
+            env={"YOYO_AGENT_WA": "python3 -c \"import sys; sys.stdin.read()\""},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("Unknown agent 'nope'", stderr)
+
+    # --- cron ---
+
+    def _cron_env(self, tmp):
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir(exist_ok=True)
+        store = Path(tmp) / "crontab-store.txt"
+        stub = bindir / "crontab"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'STORE="{store}"\n'
+            'if [ "$1" = "-l" ]; then\n'
+            '  if [ -f "$STORE" ]; then cat "$STORE"; else echo "no crontab for user" >&2; exit 1; fi\n'
+            "else\n"
+            '  cat > "$STORE"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        env = {
+            "PATH": f"{bindir}:{os.environ.get('PATH', '')}",
+            "YOYO_STATE_DIR": str(Path(tmp) / "state"),
+        }
+        return env, store
+
+    def test_cron_add_list_rm_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, store = self._cron_env(tmp)
+            code, stdout, stderr = self.run_cli(
+                [
+                    "cron", "add", "nightly", "--schedule", "0 2 * * *", "--cwd", tmp,
+                    "--", "loop", "claude", "Work through TODO.md",
+                ],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            line = store.read_text().strip()
+            self.assertTrue(line.startswith("0 2 * * *"), line)
+            self.assertIn("loop claude", line)
+            self.assertIn("YOYO_CALLER=cron", line)
+            self.assertTrue(line.endswith("# yoyo-cron:nightly"), line)
+
+            code, stdout, stderr = self.run_cli(["cron", "list", "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(len(payload["entries"]), 1)
+            entry = payload["entries"][0]
+            self.assertEqual(entry["name"], "nightly")
+            self.assertEqual(entry["schedule"], "0 2 * * *")
+            self.assertTrue(entry["installed"])
+            self.assertEqual(payload["untracked_crontab_names"], [])
+
+            code, stdout, stderr = self.run_cli(["cron", "rm", "nightly"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("yoyo-cron:nightly", store.read_text())
+
+            code, stdout, _ = self.run_cli(["cron", "list", "--json"], env=env)
+            self.assertEqual(json.loads(stdout)["entries"], [])
+
+    def test_cron_add_validates_name_schedule_and_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _ = self._cron_env(tmp)
+            code, _, stderr = self.run_cli(["cron", "add", "x", "--", "loop", "claude", "t"], env=env)
+            self.assertEqual(code, 2)
+            self.assertIn("requires --schedule", stderr)
+
+            code, _, stderr = self.run_cli(
+                ["cron", "add", "x", "--schedule", "1 2 3", "--", "loop", "claude", "t"], env=env
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("five cron fields", stderr)
+
+            code, _, stderr = self.run_cli(
+                ["cron", "add", "x", "--schedule", "@daily", "--", "rm", "-rf", "/"], env=env
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("must start with a yoyo subcommand", stderr)
+
+            code, _, stderr = self.run_cli(["cron", "add", "x", "--schedule", "@daily"], env=env)
+            self.assertEqual(code, 2)
+            self.assertIn("after '--'", stderr)
+
+    def test_cron_add_duplicate_requires_force(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, store = self._cron_env(tmp)
+            argv = ["cron", "add", "job", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "hello"]
+            code, _, stderr = self.run_cli(argv, env=env)
+            self.assertEqual(code, 0, stderr)
+
+            code, _, stderr = self.run_cli(argv, env=env)
+            self.assertEqual(code, 2)
+            self.assertIn("already exists", stderr)
+
+            forced = ["cron", "add", "job", "--schedule", "@daily", "--cwd", tmp, "--force", "--", "ask", "claude", "hello"]
+            code, _, stderr = self.run_cli(forced, env=env)
+            self.assertEqual(code, 0, stderr)
+            # Replaced, not duplicated: exactly one tagged line remains.
+            tagged = [line for line in store.read_text().splitlines() if line.endswith("# yoyo-cron:job")]
+            self.assertEqual(len(tagged), 1)
+
+    def test_cron_run_executes_recorded_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _ = self._cron_env(tmp)
+            code, _, stderr = self.run_cli(
+                ["cron", "add", "job", "--schedule", "@hourly", "--cwd", tmp, "--", "ask", "claude", "hi"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            recorded = Path(tmp) / "ran.txt"
+            fake_yoyo = Path(tmp) / "bin" / "fake-yoyo"
+            fake_yoyo.write_text(f"#!/bin/sh\necho \"$@\" > {recorded}\n", encoding="utf-8")
+            fake_yoyo.chmod(0o755)
+            registry = Path(tmp) / "state" / "cron.json"
+            data = json.loads(registry.read_text())
+            data["entries"]["job"]["yoyo"] = str(fake_yoyo)
+            registry.write_text(json.dumps(data), encoding="utf-8")
+
+            code, _, stderr = self.run_cli(["cron", "run", "job"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(recorded.read_text().strip(), "ask claude hi")
+
+    def test_cron_line_escapes_percent_for_crontab(self):
+        line = yoyo.build_cron_line(
+            {
+                "name": "pct",
+                "schedule": "@daily",
+                "cwd": "/tmp",
+                "argv": ["ask", "claude", "is this 100% done?"],
+                "log": "/tmp/x.log",
+                "yoyo": "/usr/local/bin/yoyo",
+                "path_env": "/usr/bin",
+            }
+        )
+        self.assertIn(r"100\%", line)
+        self.assertTrue(line.endswith("# yoyo-cron:pct"))
+
+    def test_cron_add_rejects_newlines_in_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, store = self._cron_env(tmp)
+            code, _, stderr = self.run_cli(
+                ["cron", "add", "nl", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "line one\nline two"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("single line", stderr)
+            self.assertFalse(store.exists())
+
+    def test_workflow_removed_expect_field_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._echo_agent_config(tmp)
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "legacy",
+                        "defaults": {"agent": "echo"},
+                        "phases": [
+                            {"name": "one", "jobs": [
+                                {"id": "j1", "prompt": "First", "expect": {"contains": ["X"]}}
+                            ]}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, _, stderr = self.run_cli(["workflow", str(spec)], env={"YOYO_CONFIG": str(config)})
+
+            self.assertEqual(code, 2)
+            self.assertIn("removed in 0.15.0", stderr)
+
+    def test_research_multiword_lenses_item_keeps_adhoc_scaffold(self):
+        # Provenance matters: --lenses items (even multi-word) get the ad-hoc
+        # scaffold; only explicit --lens text is used verbatim.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                [
+                    "research", "--cwd", tmp, "--agents", "r1",
+                    "--lenses", "developer experience", "--dry-run", "--json", "topic",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("through the lens of developer experience", payload["prompt"])
 
 
 if __name__ == "__main__":
