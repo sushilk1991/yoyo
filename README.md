@@ -48,6 +48,11 @@ yoyo research --lens "Investigate only the licensing risk, citing license texts"
 # so cost stays flat. Rotate vendors so blind spots don't compound.
 yoyo loop codex,claude --cwd "$PWD" --max-iter 30 --gate "pytest -q" "Fix the failing tests, one per iteration."
 
+# Queue mode: a markdown checklist becomes N verifiable increments — one item per
+# iteration, DONE rejected while any box is unchecked. --brief injects shared
+# repo knowledge so fresh contexts stop re-deriving it.
+yoyo loop claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --gate "pytest -q" "Work the queue."
+
 # Schedule it. The loop picks up where it left off, every night, until it's verifiably done.
 yoyo cron add nightly --schedule "0 2 * * *" --cwd "$PWD" -- loop claude --max-iter 5 --gate "pytest -q" "Work through TODO.md"
 

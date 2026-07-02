@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.15.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.16.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -445,8 +445,8 @@ class YoyoTests(unittest.TestCase):
         ask_args = parser.parse_args(["ask", "codex", "hello"])
         workflow_args = parser.parse_args(["workflow", "workflow.json"])
 
-        self.assertEqual(ask_args.timeout, 3600.0)
-        self.assertEqual(workflow_args.timeout, 3600.0)
+        self.assertEqual(ask_args.timeout, 14400.0)
+        self.assertEqual(workflow_args.timeout, 14400.0)
 
     def test_stdin_is_truncated_at_configured_limit(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -795,7 +795,7 @@ class YoyoTests(unittest.TestCase):
         payload = json.loads(stdout)
         self.assertEqual(payload["exit_code"], 124)
         self.assertIn("Timed out after 0.1s", payload["stderr"])
-        self.assertIn("Timed out after 0.1s", payload["stderr_plain"])
+        self.assertNotIn("stderr_plain", payload)
 
     def test_custom_agent_full_access_args_are_appended(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -812,7 +812,10 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("cat --write", stdout)
 
-    def test_codex_last_message_replaces_stdout_and_keeps_raw_stderr_in_json(self):
+    def test_codex_last_message_replaces_stdout_and_drops_transcript_stderr_in_json(self):
+        # The emitted envelope carries one stderr field — the informative one.
+        # On codex success the raw capture is the reasoning transcript, which
+        # must never ride into the calling agent's context.
         def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout, **kwargs):
             output_index = cmd.index("--output-last-message") + 1
             Path(cmd[output_index]).write_text("final answer", encoding="utf-8")
@@ -828,8 +831,8 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
         self.assertEqual(payload["stdout"], "final answer")
-        self.assertEqual(payload["stderr"], "codex stderr")
-        self.assertEqual(payload["stderr_plain"], "")
+        self.assertEqual(payload["stderr"], "")
+        self.assertNotIn("stderr_plain", payload)
 
     def test_plain_output_uses_stderr_plain(self):
         result = {
@@ -1910,7 +1913,7 @@ class YoyoTests(unittest.TestCase):
         payload = json.loads(stdout)
         self.assertEqual(payload["exit_code"], 124)
         self.assertIn("Idle timeout", payload["stderr"])
-        self.assertIn("Idle timeout", payload["stderr_plain"])
+        self.assertNotIn("stderr_plain", payload)
 
     def test_invalid_idle_timeout_fails_loudly(self):
         code, stdout, stderr = self.run_cli(
@@ -2056,14 +2059,52 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("Skill not found", stderr)
 
-    def test_ask_rejects_path_like_skill_names(self):
+    def test_ask_skill_missing_path_fails_loudly(self):
         code, stdout, stderr = self.run_cli(
             ["ask", "echo", "--skill", "../evil", "--dry-run", "Build."],
             env={"YOYO_AGENT_ECHO": "true"},
         )
 
         self.assertEqual(code, 2)
-        self.assertIn("Invalid skill name", stderr)
+        self.assertIn("Skill path not found", stderr)
+
+    def test_ask_skill_accepts_explicit_rules_file_path(self):
+        # A ponytail-style overlay is just a markdown rules file; a path-based
+        # --skill injects it without installing anything.
+        with tempfile.TemporaryDirectory() as tmp:
+            rules = Path(tmp) / "ponytail.md"
+            rules.write_text("Write the least code that works.", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--skill", str(rules), "--dry-run", "Build."],
+                env={"YOYO_AGENT_ECHO": "true"},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('<skill name="ponytail">', stdout)
+        self.assertIn("Write the least code that works.", stdout)
+
+    def test_ask_skill_accepts_directory_with_skill_md(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp) / "senior-mode"
+            pack.mkdir()
+            (pack / "SKILL.md").write_text("Prefer stdlib over new dependencies.", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--skill", str(pack), "--dry-run", "Build."],
+                env={"YOYO_AGENT_ECHO": "true"},
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn('<skill name="senior-mode">', stdout)
+            self.assertIn("Prefer stdlib", stdout)
+
+            empty = Path(tmp) / "empty-pack"
+            empty.mkdir()
+            code, _, stderr = self.run_cli(
+                ["ask", "echo", "--skill", str(empty), "--dry-run", "Build."],
+                env={"YOYO_AGENT_ECHO": "true"},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("no SKILL.md", stderr)
 
     def test_skills_command_lists_discovered_skills_first_root_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2852,7 +2893,8 @@ class YoyoTests(unittest.TestCase):
             )
 
             self.assertEqual(code, 0, stderr)
-            self.assertIn("=== LOOP PROTOCOL (yoyo loop iteration 1/20) ===", stdout)
+            self.assertIn("=== LOOP PROTOCOL (yoyo loop) ===", stdout)
+            self.assertIn("Loop position: iteration 1 of at most 20.", stdout)
             self.assertIn(str(Path(tmp).resolve() / ".yoyo" / "loop-state.md"), stdout)
             self.assertIn('<skill name="frontend">', stdout)
             self.assertIn("Use 8px spacing", stdout)
@@ -3085,6 +3127,180 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(summary["gate_failures"], 0)
             self.assertEqual(summary["iterations"], 2)
 
+    def test_loop_queue_rejects_done_while_items_unchecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            queue = Path(tmp) / "tasks.md"
+            queue.write_text("# work\n- [ ] first item\n- [x] already done\n- [ ] second item\n", encoding="utf-8")
+            command = self._done_each_call_stub(tmp, state)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--queue", "tasks.md", "--json", "work the queue"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            # DONE claims never end the loop while boxes stay unchecked.
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(summary["queue_rejections"], 3)
+            self.assertEqual(Path(summary["queue"]).resolve(), queue.resolve())
+            # The worker owns the queue file, so a queue alone is not
+            # independent verification.
+            self.assertFalse(summary["verified"])
+            final_state = state.read_text(encoding="utf-8")
+            self.assertFalse(any(line.strip() == "STATUS: DONE" for line in final_state.splitlines()))
+            self.assertIn("work queue", final_state)
+            self.assertIn("first item", final_state)
+            self.assertNotIn("already done", final_state)
+
+    def test_loop_queue_accepts_done_when_all_items_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            queue = Path(tmp) / "tasks.md"
+            queue.write_text("- [ ] only item\n", encoding="utf-8")
+            done_body = (
+                f"state = {str(state)!r}\n"
+                f"queue = {str(queue)!r}\n"
+                "open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
+                "if calls == 2:\n"
+                "    open(queue, 'w').write('- [x] only item\\n')\n"
+            )
+            command, counter = self._counting_stub(tmp, done_body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--queue", str(queue), "--json", "work the queue"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["queue_rejections"], 1)
+
+    def test_loop_queue_block_appears_in_iteration_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Path(tmp) / "tasks.md"
+            queue.write_text("- [ ] rename the module\n- [ ] update the docs\n", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--queue", "tasks.md", "--dry-run", "work the queue"],
+                env={},
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== WORK QUEUE", stdout)
+            self.assertIn("rename the module", stdout)
+            self.assertIn("Queue rules:", stdout)
+            self.assertIn("the work queue", stdout)  # verifiers label in COMPLETION CHECK
+            # Per-iteration content stays after the stable blocks for prefix caching.
+            self.assertLess(stdout.index("=== LOOP PROTOCOL"), stdout.index("=== WORK QUEUE"))
+            self.assertLess(stdout.index("=== WORK QUEUE"), stdout.index("Loop position:"))
+
+    def test_loop_brief_block_appears_in_stable_prompt_region(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brief = Path(tmp) / "brief.md"
+            brief.write_text("Repo map: everything lives in bin/yoyo. Tests: python3 -m unittest.", encoding="utf-8")
+            code, stdout, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--brief", "brief.md", "--dry-run", "do the work"],
+                env={},
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== BACKGROUND BRIEF", stdout)
+            self.assertIn("everything lives in bin/yoyo", stdout)
+            self.assertIn("DO NOT edit", stdout)
+            # The brief is stable across iterations, so it sits in the
+            # cacheable prefix, before the per-iteration blocks.
+            self.assertLess(stdout.index("=== BACKGROUND BRIEF"), stdout.index("=== LOOP PROTOCOL"))
+            self.assertLess(stdout.index("=== BACKGROUND BRIEF"), stdout.index("Loop position:"))
+
+    def test_loop_brief_missing_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--brief", "missing.md", "work"],
+                env={},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("--brief file not found", stderr)
+
+    def test_loop_queue_done_fails_closed_when_worker_guts_the_queue(self):
+        # A worker that rewrites the queue to prose (or deletes every checklist
+        # line) must not be able to slip a DONE past verification.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            queue = Path(tmp) / "tasks.md"
+            queue.write_text("- [ ] real work\n", encoding="utf-8")
+            body = (
+                f"state = {str(state)!r}\n"
+                f"queue = {str(queue)!r}\n"
+                "open(queue, 'w').write('all done, nothing left!')\n"
+                "open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
+            )
+            command, counter = self._counting_stub(tmp, body)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--queue", str(queue), "--json", "work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "max-iter")
+            self.assertEqual(summary["queue_rejections"], 2)
+            self.assertIn("no longer contains any checklist items", state.read_text(encoding="utf-8"))
+
+    def test_parse_queue_items_skips_fences_and_accepts_plus_bullets(self):
+        text = (
+            "- [ ] real item\n"
+            "```\n"
+            "- [ ] example inside a fence, not real work\n"
+            "```\n"
+            "+ [x] plus-bullet item\n"
+            "* [ ] star item\n"
+        )
+        items = yoyo.parse_queue_items(text)
+        self.assertEqual(
+            items,
+            [(False, "real item"), (True, "plus-bullet item"), (False, "star item")],
+        )
+
+    def test_spill_fanout_answers_maps_dot_trace_ids_to_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": tmp}):
+                answers_dir = yoyo.spill_fanout_answers("..", [{"agent": "a", "stdout": "x"}])
+            self.assertEqual(answers_dir, Path(tmp) / "fanout" / "fanout")
+            self.assertTrue((answers_dir / "1-a.md").is_file())
+
+    def test_workflow_json_slims_nested_job_results(self):
+        payload = {
+            "phases": [
+                {"name": "p1", "jobs": [{"agent": "a", "stdout": "hi", "stderr": "raw", "stderr_plain": ""}]}
+            ],
+        }
+        slim = yoyo.slim_result_for_emission(payload)
+        job = slim["phases"][0]["jobs"][0]
+        self.assertNotIn("stderr_plain", job)
+        self.assertEqual(job["stderr"], "")
+
+    def test_loop_queue_missing_or_itemless_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--queue", "missing.md", "work"],
+                env={},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("--queue file not found", stderr)
+
+            empty = Path(tmp) / "notes.md"
+            empty.write_text("just prose, no checklist\n", encoding="utf-8")
+            code, _, stderr = self.run_cli(
+                ["loop", "claude", "--cwd", tmp, "--queue", "notes.md", "work"],
+                env={},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("no checklist items", stderr)
+
     def test_loop_gate_does_not_run_until_done_is_claimed(self):
         with tempfile.TemporaryDirectory() as tmp:
             # The worker never claims done; the gate writes a marker if it ever runs.
@@ -3193,6 +3409,21 @@ class YoyoTests(unittest.TestCase):
         self.assertNotIn("Calling context", stdout)
         self.assertNotIn("Task:", stdout)
         self.assertNotIn("second-opinion", stdout)
+
+    def test_ask_prompt_puts_calling_context_last(self):
+        # The per-call-unique trace_id must ride at the prompt tail so the
+        # stable prefix (role, skills, task) stays cacheable across calls.
+        env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\""}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "echo", "--role", "review", "--no-stdin", "Audit the module."],
+            env=env,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        lines = [line for line in stdout.strip().splitlines() if line.strip()]
+        self.assertTrue(lines[-1].startswith("Calling context:"), lines[-1])
+        self.assertIn("Task:\nAudit the module.", stdout)
+        self.assertLess(stdout.index("Task:"), stdout.index("Calling context:"))
 
     def test_ask_raw_rejects_role_and_requires_prompt(self):
         env = {"YOYO_AGENT_ECHO": "cat"}
@@ -3785,6 +4016,89 @@ class YoyoTests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("--judge-prompt has no effect without --judge", stderr)
+
+    def test_ask_fanout_judge_only_without_judge_fails_loudly(self):
+        code, _, stderr = self.run_cli(
+            ["ask", "a,b", "--judge-only", "task"],
+            env=self._fanout_env(),
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--judge-only has no effect without --judge", stderr)
+
+    def test_ask_fanout_judge_only_spills_answers_and_returns_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            env = self._fanout_env(
+                YOYO_CONFIG=str(self._judge_config(tmp)),
+                YOYO_STATE_DIR=str(state),
+            )
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--judge", "j", "--judge-only", "--json", "pick one"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            # Raw answers left the envelope and live in files instead.
+            self.assertIn("answers_dir", payload)
+            for item in payload["results"]:
+                self.assertEqual(item["stdout"], "")
+                answer_path = Path(item["stdout_file"])
+                self.assertTrue(answer_path.is_file(), answer_path)
+                self.assertTrue(str(answer_path).startswith(str(state)), answer_path)
+            self.assertIn("alpha-answer", Path(payload["results"][0]["stdout_file"]).read_text(encoding="utf-8"))
+            # The judge saw the full candidates and its verdict stays inline.
+            self.assertIn("alpha-answer", payload["judge"]["stdout"])
+            self.assertIn("beta-answer", payload["judge"]["stdout"])
+
+    def test_ask_fanout_judge_only_text_mode_prints_verdict_and_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(
+                YOYO_CONFIG=str(self._judge_config(tmp)),
+                YOYO_STATE_DIR=str(Path(tmp) / "state"),
+            )
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--judge", "j", "--judge-only", "pick one"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== judge (j) ===", stdout)
+            self.assertIn("=== raw answers (spilled to files) ===", stdout)
+            self.assertNotIn("=== a ===", stdout)
+            self.assertIn("1-a.md", stdout)
+            self.assertIn("2-b.md", stdout)
+
+    def test_ask_fanout_judge_only_falls_back_to_raw_answers_when_judge_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "j": {
+                                "command": ["python3", "-c", "import sys; sys.exit(3)"],
+                                "read_only_args": ["--ro-marker"],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = self._fanout_env(
+                YOYO_CONFIG=str(config),
+                YOYO_STATE_DIR=str(Path(tmp) / "state"),
+            )
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--judge", "j", "--judge-only", "pick one"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("judge via j failed", stderr)
+            self.assertIn("=== a ===", stdout)
+            self.assertIn("alpha-answer", stdout)
+            self.assertIn("beta-answer", stdout)
 
     def test_ask_fanout_partial_failure_keeps_survivors_and_skips_judge(self):
         with tempfile.TemporaryDirectory() as tmp:

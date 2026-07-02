@@ -26,8 +26,11 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.15.0"
-DEFAULT_TIMEOUT_SECONDS = 3600
+VERSION = "0.16.0"
+# A deadman guard against hung subprocesses, not a work budget: real agent
+# tasks can legitimately run for hours, so the ceiling is high. Use
+# --idle-timeout to catch stalls early on agents that stream output.
+DEFAULT_TIMEOUT_SECONDS = 14400
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
 DEFAULT_WORKFLOW_MAX_CONCURRENCY = 4
@@ -71,7 +74,7 @@ Return concise sections:
 }
 
 
-LOOP_PROTOCOL = """=== LOOP PROTOCOL (yoyo loop iteration {iteration}/{max_iter}) ===
+LOOP_PROTOCOL = """=== LOOP PROTOCOL (yoyo loop) ===
 You are one iteration of a fresh-context loop. You have NO memory of prior
 iterations; the state file is your only continuity.
 
@@ -86,6 +89,12 @@ State file: {state_path}
 
 TASK:
 {task}"""
+
+
+# Kept out of the protocol header on purpose: the counter changes every
+# iteration, and anything before it can never be a stable, cacheable prompt
+# prefix across iterations. It rides at the end of the iteration prompt.
+LOOP_POSITION = "Loop position: iteration {iteration} of at most {max_iter}."
 
 
 LOOP_STATE_SEED = """# yoyo loop state
@@ -119,6 +128,32 @@ STATUS: DONE line, appends the failure to the state file, and a fresh iteration
 continues. Do not write STATUS: DONE until the work genuinely passes these
 checks — declaring done early only wastes an iteration.
 === END COMPLETION CHECK ==="""
+
+
+# Shared context a fresh iteration would otherwise re-derive (repo map,
+# conventions, build/test commands, prior findings). Written by the caller —
+# typically one agent call before the loop — re-read every iteration, and
+# never rewritten by the worker. Injected in the stable prefix region: its
+# content should not change during a loop, so it can prefix-cache.
+LOOP_BRIEF_BLOCK = """=== BACKGROUND BRIEF (shared knowledge; re-read every iteration; DO NOT edit) ===
+{brief}
+=== END BACKGROUND BRIEF ===
+The brief is context gathered before this loop started. Trust it as a starting
+point, verify against the worktree when it matters, and do not spend the
+iteration re-deriving what it already records."""
+
+
+# The queue file is the loop's work list. The worker edits it (checking items
+# off); yoyo only counts unchecked boxes when DONE is claimed — mechanical
+# file inspection like a gate, never grading prose. Injected near the prompt
+# tail because its content changes every iteration.
+LOOP_QUEUE_BLOCK = """=== WORK QUEUE (file: {queue_path}) ===
+{queue}
+=== END WORK QUEUE ===
+Queue rules: this iteration, pick exactly ONE unchecked item ("- [ ]") —
+normally the first — and complete it. Then edit the queue file to mark that
+item "- [x]". Never check off an item you did not complete this iteration.
+STATUS: DONE is only accepted once every queue item is checked."""
 
 
 # The independent checker is blind to the worker's state-file prose by design:
@@ -627,8 +662,21 @@ def skill_search_roots() -> list[Path]:
 
 
 def resolve_skill(name: str) -> Path:
-    if not name or os.sep in name or "/" in name or name.startswith("."):
-        raise YoyoError(f"Invalid skill name {name!r}; use a bare skill directory name")
+    if not name:
+        raise YoyoError("Invalid skill name: empty")
+    if os.sep in name or "/" in name or name.startswith("."):
+        # An explicit path: a markdown rules file (e.g. a ponytail-style
+        # overlay) or a directory containing SKILL.md. Relative paths resolve
+        # against the caller's working directory.
+        path = Path(name).expanduser()
+        if path.is_dir():
+            candidate = path / "SKILL.md"
+            if candidate.is_file():
+                return candidate
+            raise YoyoError(f"Skill directory has no SKILL.md: {path}")
+        if path.is_file():
+            return path
+        raise YoyoError(f"Skill path not found: {name}")
     roots = skill_search_roots()
     for root in roots:
         candidate = root / name / "SKILL.md"
@@ -661,8 +709,13 @@ def skill_prompt_block(names: list[str]) -> str:
     blocks: list[str] = []
     for name in names:
         path = resolve_skill(name)
+        if os.sep in name or "/" in name or name.startswith("."):
+            # Path-based skill: label with a readable name, not the path.
+            label = path.parent.name if path.name == "SKILL.md" else path.stem
+        else:
+            label = name
         text, _ = read_limited_text(path, limit)
-        blocks.append(f"<skill name=\"{name}\">\n{text.rstrip()}\n</skill>")
+        blocks.append(f"<skill name=\"{label}\">\n{text.rstrip()}\n</skill>")
     return (
         "Skill guidance: follow the practices in these skill documents while doing the task. "
         "They constrain how the work should be done, not what the task is.\n\n" + "\n\n".join(blocks)
@@ -688,9 +741,6 @@ def build_prompt(args: argparse.Namespace) -> str:
         if args.role:
             prompt_parts.append(ROLE_PROMPTS[args.role].strip())
 
-        scope = "read-only delegation" if args.read_only else "full-access delegation"
-        prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
-
     skills = getattr(args, "skill", None) or []
     if skills:
         prompt_parts.append(skill_prompt_block(list(skills)))
@@ -711,6 +761,12 @@ def build_prompt(args: argparse.Namespace) -> str:
 
     if not args.read_only and (args.file or stdin_context_used) and not os.environ.get("YOYO_SUPPRESS_FULL_ACCESS_WARNING"):
         eprint("warning: full-access delegation includes stdin/--file context; use --read-only for untrusted input")
+
+    if not raw_mode:
+        # Last on purpose: the per-call-unique trace_id would otherwise poison
+        # vendor prompt-cache prefix matching for everything after it.
+        scope = "read-only delegation" if args.read_only else "full-access delegation"
+        prompt_parts.append(f"Calling context: cwd={cwd}; mode={scope}; caller={args.caller}; trace_id={args.trace_id}.")
 
     prompt = "\n\n".join(part for part in prompt_parts if part.strip()).strip()
     if not prompt:
@@ -1339,6 +1395,24 @@ def fanout_judge_args(args: argparse.Namespace, judge_name: str, prompt_text: st
     return clone
 
 
+def spill_fanout_answers(trace_id: str, successful: list[dict[str, Any]]) -> Path:
+    """Write raw candidate answers to files so a judged fan-out can return
+    only the verdict. The answers stay retrievable by path instead of riding
+    into the calling agent's context; each result gains a stdout_file field.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._:-]", "-", trace_id).replace(":", "-")
+    if not safe or set(safe) <= {".", "-"}:
+        # "." / ".." / all-punctuation trace IDs must not escape the fanout dir.
+        safe = "fanout"
+    answers_dir = state_dir() / "fanout" / safe
+    answers_dir.mkdir(parents=True, exist_ok=True)
+    for index, result in enumerate(successful):
+        path = answers_dir / f"{index + 1}-{result.get('agent', 'agent')}.md"
+        path.write_text(str(result.get("stdout", "")), encoding="utf-8")
+        result["stdout_file"] = str(path)
+    return answers_dir
+
+
 def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
     if getattr(args, "session", None):
         raise YoyoError("--session needs a single agent; fan-out calls are one-shot")
@@ -1378,6 +1452,8 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
         command_for_agent(agents[judge], fanout_judge_args(args, judge, "probe"))
     elif getattr(args, "judge_prompt", None):
         raise YoyoError("--judge-prompt has no effect without --judge; pass a judge agent too")
+    elif getattr(args, "judge_only", False):
+        raise YoyoError("--judge-only has no effect without --judge; pass a judge agent too")
 
     if getattr(args, "background", False) and not args.dry_run:
         return start_background_run(args)
@@ -1442,22 +1518,34 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
     elif judge:
         eprint(f"ask {args.trace_id}: only one answer succeeded; skipping the judge")
 
+    judge_ok = verdict is not None and int(verdict.get("exit_code", 1)) == 0 and str(verdict.get("stdout", "")).strip()
+    answers_dir: Path | None = None
+    if getattr(args, "judge_only", False) and judge_ok:
+        # Spill after the judge has read the raw answers; a failed or skipped
+        # judge keeps the raw answers inline (the caller still needs them).
+        answers_dir = spill_fanout_answers(args.trace_id, successful)
+        for result in successful:
+            result["stdout"] = ""
+
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "trace_id": args.trace_id,
-                    "agents": names,
-                    "results": results,
-                    "judge": verdict,
-                    "exit_code": 0,
-                },
-                ensure_ascii=False,
-            )
-        )
+        envelope: dict[str, Any] = {
+            "trace_id": args.trace_id,
+            "agents": names,
+            "results": results,
+            "judge": verdict,
+            "exit_code": 0,
+        }
+        if answers_dir is not None:
+            envelope["answers_dir"] = str(answers_dir)
+        print(json.dumps(slim_result_for_emission(envelope), ensure_ascii=False))
+    elif answers_dir is not None:
+        blocks = [f"=== judge ({judge}) ===\n{str(verdict['stdout']).strip()}"]
+        listing = "\n".join(f"{r['agent']}: {r['stdout_file']}" for r in successful)
+        blocks.append(f"=== raw answers (spilled to files) ===\n{listing}")
+        print("\n\n".join(blocks))
     else:
         blocks = [f"=== {r['agent']} ===\n{str(r['stdout']).strip()}" for r in successful]
-        if verdict is not None and int(verdict.get("exit_code", 1)) == 0 and str(verdict.get("stdout", "")).strip():
+        if judge_ok:
             blocks.append(f"=== judge ({judge}) ===\n{str(verdict['stdout']).strip()}")
         print("\n\n".join(blocks))
     return 0
@@ -1469,8 +1557,8 @@ def run_agent(args: argparse.Namespace) -> int:
         return run_fanout(args, fanout_names)
     if fanout_names:
         args.agent = fanout_names[0]  # tolerate a stray comma or whitespace
-    if getattr(args, "judge", None) or getattr(args, "judge_prompt", None):
-        raise YoyoError("--judge/--judge-prompt need a fan-out: pass several agents, e.g. `yoyo ask codex,claude --judge grok`")
+    if getattr(args, "judge", None) or getattr(args, "judge_prompt", None) or getattr(args, "judge_only", False):
+        raise YoyoError("--judge/--judge-prompt/--judge-only need a fan-out: pass several agents, e.g. `yoyo ask codex,claude --judge grok`")
     agents = validate_ask_args(args)
     if getattr(args, "background", False) and not args.dry_run:
         return start_background_run(args)
@@ -2304,9 +2392,9 @@ def run_workflow(args: argparse.Namespace) -> int:
 
     output["exit_code"] = exit_code
     if args.json:
-        print(json.dumps(output, ensure_ascii=False))
+        print(json.dumps(slim_result_for_emission(output), ensure_ascii=False))
     else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+        print(json.dumps(slim_result_for_emission(output), indent=2, ensure_ascii=False))
     return exit_code
 
 
@@ -2330,9 +2418,32 @@ def chat_agent(args: argparse.Namespace) -> int:
         raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
 
 
+def slim_result_for_emission(result: dict[str, Any]) -> dict[str, Any]:
+    """Caller-facing copy of a result envelope with one informative stderr.
+
+    In memory and in the runs ledger a result keeps both the raw stderr
+    capture and stderr_plain — the version worth reading (for codex, the raw
+    capture is the agent's whole reasoning transcript: megabytes of noise on
+    success). A printed envelope lands in the calling agent's context, so it
+    carries a single stderr field, the informative one, never both.
+    """
+    slim = {key: value for key, value in result.items() if key != "stderr_plain"}
+    if "stderr_plain" in result:
+        slim["stderr"] = result["stderr_plain"]
+    for key in ("results", "perspectives", "reviews", "phases", "jobs"):
+        if isinstance(slim.get(key), list):
+            slim[key] = [
+                slim_result_for_emission(item) if isinstance(item, dict) else item for item in slim[key]
+            ]
+    for key in ("judge", "synthesis"):
+        if isinstance(slim.get(key), dict):
+            slim[key] = slim_result_for_emission(slim[key])
+    return slim
+
+
 def emit_result(result: dict[str, Any], as_json: bool) -> None:
     if as_json:
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(slim_result_for_emission(result), ensure_ascii=False))
         return
     stdout = result.get("stdout") or ""
     if not stdout and result.get("loop_id") and result.get("end_reason"):
@@ -2345,6 +2456,8 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
         for item in result["results"]:
             if isinstance(item, dict) and int(item.get("exit_code", 1)) == 0 and str(item.get("stdout", "")).strip():
                 blocks.append(f"=== {item.get('agent')} ===\n{str(item['stdout']).strip()}")
+            elif isinstance(item, dict) and item.get("stdout_file"):
+                blocks.append(f"=== {item.get('agent')} ===\n(answer spilled to {item['stdout_file']})")
         judge = result.get("judge")
         if isinstance(judge, dict) and int(judge.get("exit_code", 1)) == 0 and str(judge.get("stdout", "")).strip():
             blocks.append(f"=== judge ({judge.get('agent')}) ===\n{str(judge['stdout']).strip()}")
@@ -3143,15 +3256,17 @@ def resolve_done_policy(args: argparse.Namespace) -> str:
     return policy
 
 
-def loop_verifiers_label(policy: str, gate_cmds: list[str], checker_name: str | None) -> str | None:
-    if policy == "worker":
-        return None
+def loop_verifiers_label(
+    policy: str, gate_cmds: list[str], checker_name: str | None, queue_path: Path | None = None
+) -> str | None:
     parts: list[str] = []
+    if queue_path is not None:
+        parts.append(f"the work queue ({queue_path}) having every item checked off")
     if "gate" in policy:
         parts.append("the gate command(s) " + "; ".join(f"`{cmd}`" for cmd in gate_cmds))
     if "checker" in policy:
         parts.append(f"an independent checker agent ({checker_name})")
-    return " and ".join(parts)
+    return " and ".join(parts) if parts else None
 
 
 def resolve_loop_spec_path(args: argparse.Namespace) -> Path | None:
@@ -3170,6 +3285,106 @@ def read_loop_spec(spec_path: Path | None, max_bytes: int) -> str | None:
     if spec_path is None:
         return None
     text, _, _ = read_input_file(spec_path, max_bytes)
+    return text.strip()
+
+
+def resolve_loop_brief_path(args: argparse.Namespace) -> Path | None:
+    if not getattr(args, "brief", None):
+        return None
+    path = Path(args.brief).expanduser()
+    if not path.is_absolute():
+        path = resolve_cwd(args.cwd) / path
+    if not path.is_file():
+        raise YoyoError(f"--brief file not found: {path}")
+    return path
+
+
+def read_loop_brief(brief_path: Path | None, max_bytes: int) -> str | None:
+    """Read the shared brief fresh (so a caller-side regeneration is picked up).
+
+    A transient read failure skips the block for this iteration instead of
+    killing a possibly long-running loop.
+    """
+    if brief_path is None:
+        return None
+    try:
+        text, _, _ = read_input_file(brief_path, max_bytes)
+    except OSError as exc:
+        eprint(f"warning: brief file unreadable this iteration ({exc}); omitting the brief block")
+        return None
+    return text.strip()
+
+
+QUEUE_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(\S.*)$")
+
+
+def parse_queue_items(text: str) -> list[tuple[bool, str]]:
+    """Checklist items as (checked, text) pairs; every other line is free text.
+
+    Fenced code blocks are skipped so example checklists in the queue's prose
+    can neither block DONE forever nor count as real work.
+    """
+    items: list[tuple[bool, str]] = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = QUEUE_ITEM_RE.match(line)
+        if match:
+            items.append((match.group(1).lower() == "x", match.group(2).strip()))
+    return items
+
+
+def unchecked_queue_or_error(queue_path: Path) -> tuple[list[str] | None, str | None]:
+    """Full, uncapped queue read for DONE verification — fails closed.
+
+    The prompt-injection read is capped by --max-input-bytes, but verification
+    must see the whole file: a truncated or unreadable queue, or one the
+    worker rewrote without any checklist items, must reject DONE rather than
+    silently pass it.
+    """
+    try:
+        text = queue_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return None, f"the queue file could not be read ({exc})"
+    items = parse_queue_items(text)
+    if not items:
+        return None, "the queue file no longer contains any checklist items"
+    return [item for checked, item in items if not checked], None
+
+
+def resolve_loop_queue_path(args: argparse.Namespace) -> Path | None:
+    if not getattr(args, "queue", None):
+        return None
+    path = Path(args.queue).expanduser()
+    if not path.is_absolute():
+        path = resolve_cwd(args.cwd) / path
+    if not path.is_file():
+        raise YoyoError(f"--queue file not found: {path}")
+    text, _, _ = read_input_file(path, DEFAULT_MAX_INPUT_BYTES)
+    if not parse_queue_items(text):
+        raise YoyoError(f"--queue file has no checklist items (lines like '- [ ] task'): {path}")
+    return path
+
+
+def read_loop_queue(queue_path: Path | None, max_bytes: int) -> str | None:
+    """Read the queue fresh each iteration — the worker checks items off in it.
+
+    A transient read failure (worker renaming the file mid-write, non-atomic
+    regeneration) skips the block for this iteration instead of killing the
+    loop; DONE verification still fails closed on its own uncapped read.
+    """
+    if queue_path is None:
+        return None
+    try:
+        text, _, _ = read_input_file(queue_path, max_bytes)
+    except OSError as exc:
+        eprint(f"warning: queue file unreadable this iteration ({exc}); omitting the queue block")
+        return None
     return text.strip()
 
 
@@ -3286,6 +3501,17 @@ def format_gate_rejection(failed: dict[str, Any]) -> str:
     )
 
 
+def format_queue_rejection(queue_path: Path, remaining: list[str]) -> str:
+    preview = "\n".join(f"- [ ] {item}" for item in remaining[:10])
+    extra = f"\n(+{len(remaining) - 10} more)" if len(remaining) > 10 else ""
+    return (
+        "## VERIFICATION REJECTED — your STATUS: DONE was not accepted\n"
+        f"The work queue {queue_path} still has {len(remaining)} unchecked item(s):\n"
+        f"{preview}{extra}\n"
+        "Complete every queue item (checking each off as you go) before declaring done."
+    )
+
+
 def format_checker_rejection(verdict: dict[str, Any]) -> str:
     if verdict.get("verdict") is None:
         reason = f"the checker emitted no VERDICT line (treated as FAIL; checker exit {verdict.get('exit_code')})"
@@ -3357,13 +3583,23 @@ def loop_iteration_args(
     spec_text: str | None = None,
     verifiers: str | None = None,
     agent_name: str | None = None,
+    queue_path: Path | None = None,
+    queue_text: str | None = None,
+    brief_text: str | None = None,
 ) -> argparse.Namespace:
+    # Stable blocks first, per-iteration content last: everything before the
+    # queue block is byte-identical across iterations, so it can prefix-cache.
     parts: list[str] = []
     if spec_text:
         parts.append(LOOP_SPEC_BLOCK.format(spec=spec_text))
-    parts.append(LOOP_PROTOCOL.format(iteration=iteration, max_iter=args.max_iter, state_path=state_path, task=task))
+    if brief_text:
+        parts.append(LOOP_BRIEF_BLOCK.format(brief=brief_text))
+    parts.append(LOOP_PROTOCOL.format(state_path=state_path, task=task))
     if verifiers:
         parts.append(LOOP_COMPLETION_CHECK.format(verifiers=verifiers))
+    if queue_path is not None and queue_text:
+        parts.append(LOOP_QUEUE_BLOCK.format(queue_path=queue_path, queue=queue_text))
+    parts.append(LOOP_POSITION.format(iteration=iteration, max_iter=args.max_iter))
     body = "\n\n".join(parts)
     return argparse.Namespace(
         cwd=str(resolve_cwd(args.cwd)),
@@ -3524,7 +3760,9 @@ def cmd_loop(args: argparse.Namespace) -> int:
             raise YoyoError("--gate command must not be empty")
     spec_path = resolve_loop_spec_path(args)
     spec_text = read_loop_spec(spec_path, args.max_input_bytes)
-    verifiers = loop_verifiers_label(policy, gate_cmds, args.checker)
+    queue_path = resolve_loop_queue_path(args)
+    brief_path = resolve_loop_brief_path(args)
+    verifiers = loop_verifiers_label(policy, gate_cmds, args.checker, queue_path)
     # Fail loudly on flag problems (e.g. --read-only on a custom agent without
     # read_only_args) before seeding state or detaching — for every rotation agent.
     for name in dict.fromkeys(loop_agents):
@@ -3547,7 +3785,9 @@ def cmd_loop(args: argparse.Namespace) -> int:
     if args.dry_run:
         first_agent = loop_agents[0]
         iter_args = loop_iteration_args(
-            args, 1, agents[first_agent], task, state_path, spec_text, verifiers, agent_name=first_agent
+            args, 1, agents[first_agent], task, state_path, spec_text, verifiers, agent_name=first_agent,
+            queue_path=queue_path, queue_text=read_loop_queue(queue_path, args.max_input_bytes),
+            brief_text=read_loop_brief(brief_path, args.max_input_bytes),
         )
         prompt = build_prompt(iter_args)
         result = execute_agent_call(first_agent, iter_args, prompt, agents)
@@ -3592,6 +3832,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
         consecutive_failures = 0
         gate_failures = 0
         checker_rejections = 0
+        queue_rejections = 0
         iterations_run = 0
         end_reason = "max-iter"
         rows: list[dict[str, Any]] = []
@@ -3602,9 +3843,31 @@ def cmd_loop(args: argparse.Namespace) -> int:
             On rejection, strip the false DONE, append the reason to the state
             file so the next fresh iteration sees it, count it, and keep going.
             """
-            nonlocal total_cost, cost_known, gate_failures, checker_rejections
+            nonlocal total_cost, cost_known, gate_failures, checker_rejections, queue_rejections
             if not loop_state_done(state_path):
                 return False
+            if queue_path is not None:
+                # Cheapest check first, and it applies under every done-policy:
+                # counting unchecked boxes is mechanical file inspection.
+                remaining, queue_error = unchecked_queue_or_error(queue_path)
+                if queue_error is not None:
+                    queue_rejections += 1
+                    reject_loop_done(
+                        state_path,
+                        "## VERIFICATION REJECTED — your STATUS: DONE was not accepted\n"
+                        f"Queue verification failed closed: {queue_error}.\n"
+                        f"Restore {queue_path} to a checklist that reflects the real work state.",
+                    )
+                    eprint(f"loop {args.trace_id}: STATUS: DONE rejected — {queue_error}; continuing")
+                    return False
+                if remaining:
+                    queue_rejections += 1
+                    reject_loop_done(state_path, format_queue_rejection(queue_path, remaining))
+                    eprint(
+                        f"loop {args.trace_id}: STATUS: DONE rejected — "
+                        f"{len(remaining)} unchecked queue item(s) remain; continuing"
+                    )
+                    return False
             if policy == "worker":
                 return True
             info = verify_loop_done(
@@ -3636,7 +3899,9 @@ def cmd_loop(args: argparse.Namespace) -> int:
             iter_agent = loop_agents[(iteration - 1) % len(loop_agents)]
             iter_spec = agents[iter_agent]
             iter_args = loop_iteration_args(
-                args, iteration, iter_spec, task, state_path, current_spec_text, verifiers, agent_name=iter_agent
+                args, iteration, iter_spec, task, state_path, current_spec_text, verifiers, agent_name=iter_agent,
+                queue_path=queue_path, queue_text=read_loop_queue(queue_path, args.max_input_bytes),
+                brief_text=read_loop_brief(brief_path, args.max_input_bytes),
             )
             prompt = build_prompt(iter_args)
             started = utc_now()
@@ -3708,9 +3973,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
         "iterations": iterations_run,
         "end_reason": end_reason,
         "done_policy": policy,
+        # A queue rejection is mechanical, but the worker owns the queue file
+        # (it can check boxes falsely) — so a queue alone never sets verified.
         "verified": end_reason == "done" and policy != "worker",
         "gate_failures": gate_failures,
         "checker_rejections": checker_rejections,
+        "queue_rejections": queue_rejections,
+        "queue": str(queue_path) if queue_path is not None else None,
         "total_cost_usd": round(total_cost, 4) if cost_known else None,
         "exit_code": exit_code,
         "runs": rows,
@@ -3917,15 +4186,17 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.json:
         print(
             json.dumps(
-                {
-                    "trace_id": args.trace_id,
-                    "scope": scope,
-                    "agents": names,
-                    "reviews": reviews,
-                    "synthesis": synthesis,
-                    "review": final_text,
-                    "exit_code": 0,
-                },
+                slim_result_for_emission(
+                    {
+                        "trace_id": args.trace_id,
+                        "scope": scope,
+                        "agents": names,
+                        "reviews": reviews,
+                        "synthesis": synthesis,
+                        "review": final_text,
+                        "exit_code": 0,
+                    }
+                ),
                 ensure_ascii=False,
             )
         )
@@ -4216,16 +4487,18 @@ def cmd_research(args: argparse.Namespace) -> int:
     if args.json:
         print(
             json.dumps(
-                {
-                    "trace_id": args.trace_id,
-                    "topic": topic,
-                    "agents": agent_names,
-                    "lenses": lenses,
-                    "perspectives": perspectives,
-                    "synthesis": synthesis,
-                    "report": final_text,
-                    "exit_code": 0,
-                },
+                slim_result_for_emission(
+                    {
+                        "trace_id": args.trace_id,
+                        "topic": topic,
+                        "agents": agent_names,
+                        "lenses": lenses,
+                        "perspectives": perspectives,
+                        "synthesis": synthesis,
+                        "report": final_text,
+                        "exit_code": 0,
+                    }
+                ),
                 ensure_ascii=False,
             )
         )
@@ -4660,6 +4933,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--judge-prompt",
         help="Custom judging instructions for --judge (the task and candidate answers are appended)",
     )
+    ask.add_argument(
+        "--judge-only",
+        action="store_true",
+        help="With --judge: return only the judge's verdict; raw candidate answers are spilled to files under the state dir and referenced by path (a failed judge still falls back to the raw answers)",
+    )
     ask.add_argument("--role", choices=sorted(ROLE_PROMPTS), default=None, help="Role preamble (default: opinion; incompatible with --raw)")
     ask.add_argument(
         "--raw",
@@ -4798,6 +5076,16 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument(
         "--spec",
         help="Immutable standing-spec file re-read every iteration and never rewritten (fights goal drift); distinct from the mutable --state file",
+    )
+    loop.add_argument(
+        "--queue",
+        metavar="FILE",
+        help="Markdown checklist ('- [ ] task' lines) used as the loop's work list: each iteration is instructed to do one unchecked item and check it off; STATUS: DONE is rejected while any item is unchecked (fails closed if the queue is unreadable or loses its checklist). Combine with --gate/--checker for independent verification.",
+    )
+    loop.add_argument(
+        "--brief",
+        metavar="FILE",
+        help="Shared-context brief (repo map, conventions, commands, prior findings) injected read-only into every iteration so fresh contexts stop re-deriving it. Generate it with one agent call before the loop; workers never rewrite it.",
     )
     loop.add_argument(
         "--read-only",

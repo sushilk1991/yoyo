@@ -33,13 +33,18 @@ git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff against 
 ```bash
 yoyo ask codex,claude --cwd "$PWD" "Design the rate limiter. Name the riskiest assumption." --judge grok
 yoyo ask codex,claude --json "..."   # results array + judge in one envelope
+yoyo ask codex,claude,grok --judge cursor --judge-only "..."   # verdict only; raw answers go to files
 ```
 
-**Steer output with a skill.** `--skill <name>` (repeatable) injects a named `SKILL.md` into the prompt as guidance — the skill says *how*, the prompt says *what*. Names resolve by directory from `YOYO_SKILL_PATH`, then `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, and Pi's skills dir; a missing skill fails loudly. Discover with `yoyo skills`.
+**`--judge-only`** keeps a judged fan-out from flooding the caller's context: the raw candidate answers are written to files under `$YOYO_STATE_DIR/fanout/<trace>/` and only the judge's verdict (plus the file paths) is returned. In JSON mode each result's inline `stdout` is emptied and a `stdout_file` path is added, and the envelope gains `answers_dir`. A failed or skipped judge falls back to returning the raw answers inline — the caller still needs them.
+
+**Steer output with a skill.** `--skill <name>` (repeatable) injects a named `SKILL.md` into the prompt as guidance — the skill says *how*, the prompt says *what*. Names resolve by directory from `YOYO_SKILL_PATH`, then `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, and Pi's skills dir; a missing skill fails loudly. Discover with `yoyo skills`. A name containing a path separator is treated as an explicit path — a markdown rules file or a directory holding a `SKILL.md` — so overlay rulesets (e.g. a [ponytail](https://github.com/DietrichGebert/ponytail)-style minimal-code ladder as a "senior engineer mode") inject without installing anything: `--skill ./rules/ponytail.md`. Relative skill paths resolve against the process working directory (not `--cwd`) — prefer absolute paths in scripts and background runs.
+
+**Structured findings without a schema.** When the caller wants machine-readable findings, ask for them in the prompt as [TOON](https://github.com/toon-format/toon) rows (`findings[N]{file,line,severity,claim}:` — YAML-style nesting, CSV-style rows, ~40% fewer tokens than JSON on uniform data). This is a prompt convention, not a yoyo feature: yoyo never validates or parses agent output. Use TOON only for tabular lists; prose reads better (and cheaper) as plain markdown.
 
 **Writing good prompts:** put the instruction first; attach context with `--cwd`/`--file`/stdin; state the success criterion, scope, and exclusions; ask reviewers to falsify ("find the strongest reason this is wrong"); replace vague words with observable criteria. Let the worktree be the source of truth.
 
-**Other flags:** `--raw` sends the prompt verbatim (no role/context wrapper) so a leading `/command` reaches the target CLI; `--json` emits a result envelope; `--trace-id` tags a call; `--model` passes a model through; `--max-output-bytes` / `--max-input-bytes` cap output and (stdin + `--file`) input. Calls default to a one-hour timeout — a hung-process guard, not a progress budget. A periodic stderr heartbeat keeps a working agent from looking hung (`--quiet` to disable); `--idle-timeout` adds a no-output hang guard for agents that stream.
+**Other flags:** `--raw` sends the prompt verbatim (no role/context wrapper) so a leading `/command` reaches the target CLI; `--json` emits a result envelope; `--trace-id` tags a call; `--model` passes a model through; `--max-output-bytes` / `--max-input-bytes` cap output and (stdin + `--file`) input. Calls default to a four-hour timeout — a hung-process deadman guard, not a progress budget (`YOYO_TIMEOUT` or `--timeout` to change; workflow specs can also set `timeout` per job/phase, with no overall workflow cap). A periodic stderr heartbeat keeps a working agent from looking hung (`--quiet` to disable); `--idle-timeout` adds a no-output hang guard for agents that stream — the better stall detector for long-running work.
 
 ## Research
 
@@ -80,6 +85,29 @@ yoyo loop codex,claude --cwd "$PWD" "Refactor module by module."   # rotate vend
 ```
 
 A comma-separated agent list rotates vendors iteration by iteration: each fresh context gets a different model's eyes on the same state file, so one vendor's blind spots don't compound. The loop ends on the first of: a `STOP` file beside the state file, an accepted `STATUS: DONE`, `--max-iter` (default 20), `--budget-usd` (enforced for cost-reporting agents — claude), or `--max-fail` consecutive failures (default 3 — the only exit-1 ending). `--role` (default `worker`), `--skill`, `--read-only`, and byte caps pass through; `--background` detaches the whole loop.
+
+### Work queue (`--queue FILE`)
+
+A markdown checklist turns the loop from one fuzzy goal into N crisply checkable increments:
+
+```bash
+yoyo loop claude --cwd "$PWD" --queue tasks.md --gate "pytest -q" "Work through the queue."
+```
+
+`tasks.md` holds `- [ ] item` lines (free text around them is ignored; fenced code blocks are skipped). Each iteration is *instructed* to complete exactly ONE unchecked item and mark it `- [x]` in the file — pacing is guidance, not enforced; what is enforced is completion: a `STATUS: DONE` claim is mechanically rejected while any box is unchecked (the rejection lists the remaining items in the state file). Verification reads the whole file uncapped and **fails closed**: an unreadable queue, or one rewritten without any checklist items, rejects DONE rather than passing it. The queue file must exist and contain at least one checklist item at start. Note the worker owns the queue file — it *could* check boxes falsely — so a queue alone never sets `verified` in the loop summary; pair it with `--gate`/`--checker` for independent verification. The summary reports `queue_rejections`.
+
+### Shared brief (`--brief FILE`)
+
+Fresh-context iterations re-derive the same repo knowledge — conventions, layout, build/test commands — every time. A brief stops that:
+
+```bash
+yoyo ask claude --read-only --cwd "$PWD" \
+  "Write a dense brief for agents working in this repo: layout, conventions, build/test commands, gotchas. Under 150 lines." \
+  > .yoyo/brief.md
+yoyo loop codex,claude --cwd "$PWD" --brief .yoyo/brief.md --queue tasks.md "Work through the queue."
+```
+
+The brief is injected read-only into every iteration (workers are told not to edit it and not to re-derive what it records), re-read each iteration so you can regenerate it between runs, and placed in the stable prompt-prefix region so it can hit vendor prompt caches. Keep it dense — it rides in every iteration's prompt, so its token budget is the design constraint. Regenerating when the repo changes materially is the caller's call, not yoyo's. For one-shot fan-outs (`ask`, `research`), pass the same file with `--file` so parallel agents don't each re-explore the repo.
 
 ### Verified completion (opt-in)
 
@@ -208,7 +236,7 @@ Override or add agents in `~/.config/yoyo/agents.json`:
 
 ## Durability
 
-Every call carries a trace ID (in the prompt metadata, JSON result, and stderr). Subprocess output is captured to temp files and capped by `--max-output-bytes`; stdin + `--file` share `--max-input-bytes`. stdin is read only when input is actually available, so an idle stdin can't hang a call (`--stdin-wait` for slow producers, `--no-stdin` to ignore). Timeouts kill the process group; SIGINT/SIGTERM/SIGHUP and normal exit terminate in-flight agents so an interrupted yoyo doesn't orphan children. If a real review times out, treat it as unavailable — never count it as completed.
+Every call carries a trace ID (in the prompt metadata, JSON result, and stderr). The per-call metadata line rides at the *end* of the prompt so the stable prefix (role, skills, spec/brief, task) can hit vendor prompt caches across repeated calls. Emitted JSON envelopes carry a single `stderr` field — the informative one (on codex success the raw capture is the reasoning transcript and is dropped); the full raw capture stays in the runs ledger for background runs. Subprocess output is captured to temp files and capped by `--max-output-bytes`; stdin + `--file` share `--max-input-bytes`. stdin is read only when input is actually available, so an idle stdin can't hang a call (`--stdin-wait` for slow producers, `--no-stdin` to ignore). Timeouts kill the process group; SIGINT/SIGTERM/SIGHUP and normal exit terminate in-flight agents so an interrupted yoyo doesn't orphan children. If a real review times out, treat it as unavailable — never count it as completed.
 
 ## Doctor
 

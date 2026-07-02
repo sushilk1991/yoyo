@@ -31,6 +31,7 @@ yoyo ask codex --role review --read-only --cwd "$PWD" "Find bugs that would bloc
 # (prefer a judge that isn't a candidate — models favor their own answers;
 # the judge runs read-only, so it can't be agy)
 yoyo ask codex,claude --cwd "$PWD" "Design the migration. Name the riskiest step." --judge grok
+# --judge-only returns just the verdict; raw answers go to files you can read on demand
 
 # Consensus code review of the current git diff
 yoyo review --cwd "$PWD"                      # codex + claude, read-only, synthesized
@@ -41,6 +42,9 @@ yoyo research --cwd "$PWD" "Should we move the engine to Rust?"
 # Fresh-context loop (state file carries continuity; flat per-iteration cost)
 yoyo loop claude --cwd "$PWD" --max-iter 30 --gate "pytest -q" "Fix the failing tests, one per iteration."
 
+# Queue + brief: N checkable increments, shared knowledge injected each iteration
+yoyo loop codex,claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --gate "pytest -q" "Work the queue."
+
 # Schedule anything on cron; a scheduled loop continues from its state file
 yoyo cron add nightly --schedule "0 2 * * *" --cwd "$PWD" -- loop claude --max-iter 5 "Work through TODO.md"
 
@@ -49,7 +53,7 @@ run_id=$(yoyo ask claude --role review --cwd "$PWD" --background "...")
 yoyo wait "$run_id" --timeout 25    # 124 = still running, wait again; 0 = done
 ```
 
-Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*); `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim.
+Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*) — a path (`--skill ./rules/ponytail.md`) injects any rules file as an opt-in overlay, e.g. a minimal-code "senior engineer" ladder for workers; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim.
 
 ## Orchestrate step by step
 
@@ -69,11 +73,15 @@ Prefer being the judge yourself when you hold the decision context; use `--judge
 - Prompt reviewers to falsify, not validate: "find the strongest reason this is wrong" beats "review my plan".
 - Replace vague words ("good", "clean") with observable criteria; ask for file/line pointers and the commands run.
 - Research lenses are yours to define: `--lenses regulatory,market` for named angles, repeatable `--lens "full free-text instructions"` for exact ones, and duplicate lenses across `--agents` for a deliberate best-of-n sample.
+- Shared context beats re-derivation: generate a dense repo brief once (`yoyo ask claude --read-only "Write a brief: layout, conventions, commands, gotchas" > .yoyo/brief.md`) and pass it to fan-outs with `--file` and to loops with `--brief`, so parallel agents and fresh iterations stop re-exploring the same ground.
+- For tabular findings, ask for TOON rows in the prompt (`findings[N]{file,line,severity,claim}:` — leaner than JSON); keep prose as markdown. A convention you set per call, never something yoyo enforces.
 - Don't delegate what a script or test answers deterministically, and don't average contradictory answers — resolve them.
 
 ## Loops and schedules
 
 `yoyo loop` runs a task as independent fresh-context iterations: each one reads the state file (default `.yoyo/loop-state.md`), does one increment, rewrites the state. Cost stays flat instead of compounding with session length. `yoyo loop codex,claude ...` rotates vendors across iterations so one model's blind spots don't compound. Stop conditions: accepted `STATUS: DONE`, a `STOP` file, `--max-iter`, `--budget-usd` (claude only), or `--max-fail`.
+
+For itemizable work, `--queue tasks.md` (a `- [ ] item` checklist) makes each iteration do exactly one item and check it off; DONE is mechanically rejected while any box is unchecked. The worker owns the queue file, so pair it with a gate or checker for independent verification. `--brief FILE` injects a caller-written shared-knowledge brief (repo map, conventions, commands) read-only into every iteration so fresh contexts stop re-deriving it — keep it dense, it rides in every prompt.
 
 For unattended loops, make DONE earn it: `--gate "pytest -q"` (repeatable; closed-form evidence only) and/or `--checker codex` (independent read-only verdict, blind to the worker's prose). `--spec FILE` pins immutable constraints that the lossy state rewrite would otherwise drop. Cost levers for claude workers: `--model sonnet` or `--agent-arg=--effort=low`, plus `--agent-arg=--setting-sources=project`.
 
@@ -85,7 +93,7 @@ For unattended loops, make DONE earn it: `--gate "pytest -q"` (repeatable; close
 2. Use `--read-only` for reviews and untrusted input (enforced by the target's own sandbox/allowlists — strong default, not airtight).
 3. Spot-check artifacts yourself: diffs, tests, logs, live behavior. If two agents disagree, find the factual claim that settles it and inspect directly.
 4. A reviewer or checker reports findings; it never gates control flow on its own. Never present delegated output as confirmed unless you verified it.
-5. A timed-out review is *unavailable*, never *passed*. The default one-hour timeout is a hang guard, not a progress budget — don't shorten it for real work, and never kill a still-running background call (poll with `yoyo wait`).
+5. A timed-out review is *unavailable*, never *passed*. The default four-hour timeout is a hang guard, not a progress budget — don't shorten it for real work, and never kill a still-running background call (poll with `yoyo wait`). Long tasks are welcome: give big work to a worker or workflow job and let it run.
 6. Workers must not do irreversible things (releases, credential changes, destructive git) unless the human explicitly asked.
 
 ## More
