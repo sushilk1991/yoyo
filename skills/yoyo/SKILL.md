@@ -100,4 +100,5 @@ For unattended loops, make DONE earn it: `--gate "pytest -q"` (repeatable; close
 
 - `yoyo workflow <name|path> --input "..."` — a *saved* multi-phase pipeline (JSON) for orchestrations you've stabilized and want to rerun; orchestrate dynamically first, freeze later. See the `yoyo-workflow` skill.
 - `yoyo imagegen "<prompt>" --out file.png` — real raster images via GPT-image; see the `yoyo-imagegen` skill.
+- Video understanding (YouTube/Loom/local recordings): see the `yoyo-watch` skill — run the watch pipeline yourself or delegate with `yoyo ask <agent> --skill watch "..."` to keep frames out of your context.
 - `yoyo runs list` / `sessions` / `agents` / `skills` / `doctor --live` / `update` — ledger, discovery, health, upgrades.
