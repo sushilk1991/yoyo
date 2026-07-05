@@ -722,6 +722,28 @@ def skill_prompt_block(names: list[str]) -> str:
     )
 
 
+def default_skills_from_env() -> list[str]:
+    """Skills injected into every non-raw call, from YOYO_DEFAULT_SKILLS (comma-separated).
+
+    Unresolvable names are skipped with a stderr warning rather than failing the
+    call: a broken default must not take down delegation itself.
+    """
+    raw = os.environ.get("YOYO_DEFAULT_SKILLS", "").strip()
+    if not raw:
+        return []
+    names: list[str] = []
+    for name in (part.strip() for part in raw.split(",")):
+        if not name:
+            continue
+        try:
+            resolve_skill(name)
+        except YoyoError as exc:
+            print(f"yoyo: warning: default skill {name!r} skipped: {exc}", file=sys.stderr)
+            continue
+        names.append(name)
+    return names
+
+
 def build_prompt(args: argparse.Namespace) -> str:
     cwd = resolve_cwd(args.cwd)
     want_stdin = (
@@ -741,9 +763,13 @@ def build_prompt(args: argparse.Namespace) -> str:
         if args.role:
             prompt_parts.append(ROLE_PROMPTS[args.role].strip())
 
-    skills = getattr(args, "skill", None) or []
+    skills = list(getattr(args, "skill", None) or [])
+    if not raw_mode:
+        for name in default_skills_from_env():
+            if name not in skills:
+                skills.append(name)
     if skills:
-        prompt_parts.append(skill_prompt_block(list(skills)))
+        prompt_parts.append(skill_prompt_block(skills))
 
     if not raw_mode and args.prompt:
         prompt_parts.append("Task:\n" + " ".join(args.prompt).strip())
