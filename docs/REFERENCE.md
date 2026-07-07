@@ -172,14 +172,14 @@ The name → backend-session-id mapping lives in `$YOYO_STATE_DIR/sessions.json`
 
 ## Image generation
 
-`yoyo imagegen` generates a real raster image with GPT-image via codex's bundled image CLI (`gpt-image-2`), written straight to `--out` in ~15–25s:
+`yoyo imagegen` generates a real raster image with GPT-image (`gpt-image-2`) by delegating to the agent's native image-generation capability — for the default agent (codex) that is the bundled imagegen skill's built-in `image_gen` tool, which runs headlessly in `codex exec` on the signed-in ChatGPT plan (no API key). A run takes ~1–2 minutes:
 
 ```bash
 yoyo imagegen "Hand-drawn flowchart, four boxes SPEC/BUILD/GATE/REVIEW, bold arrows." --out flow.png --size 1536x1024 --quality high
 yoyo imagegen "make the background white" --edit flow.png --out flow-v2.png
 ```
 
-Needs `OPENAI_API_KEY` and `uv` on PATH. yoyo verifies the artifact deterministically: the file must exist, have changed, start with the right magic bytes for its extension, and have a plausible size.
+No `OPENAI_API_KEY` or `uv` needed — codex renders on its own ChatGPT-subscription auth. yoyo verifies the artifact deterministically: the file must exist, have changed, start with the right magic bytes for its extension, and have a plausible size.
 
 ## Workflows
 
