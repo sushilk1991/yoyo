@@ -82,12 +82,13 @@ Custom agents are a JSON entry away. Check everything works with `yoyo doctor --
 | Command | What it does |
 | --- | --- |
 | `yoyo ask <agent(s)> "..."` | One call — or a parallel best-of-n fan-out with `--judge` |
-| `yoyo review` | Cross-vendor consensus review of the current git diff |
+| `yoyo review` | Cross-vendor consensus review of the current git diff (`--stance unanimous\|any` precision/recall dial) |
 | `yoyo research "..."` | Parallel perspectives (lenses fully yours to define) → decision brief |
 | `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with opt-in gates/checkers |
 | `yoyo cron add/list/rm/run` | Schedule any yoyo command via crontab — no daemon |
 | `yoyo workflow <name>` | Rerun a saved multi-agent pipeline by name |
-| `yoyo chat` / `--session` / `--background` | Interactive, durable, and detached calls |
+| `yoyo chat` / `--session` / `--background` | Interactive, durable, and detached calls (`--background` on every long-running command) |
+| `YOYO_DEFAULT_SKILLS=farfield` | Bundled reasoning-discipline harness injected into every delegation |
 
 Full flags, the access model, custom agents, and design details: **[docs/REFERENCE.md](docs/REFERENCE.md)**.
 

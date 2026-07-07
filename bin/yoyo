@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch stalls early on agents that stream output.
@@ -1393,10 +1393,18 @@ Task given to every agent:
 {candidates}
 
 Reply with:
-1. VERDICT — which answer is best (name it), or say a merge beats any single one.
-2. WHY — the decisive differences, citing the specific claims that mattered.
-3. DISAGREEMENTS — where answers genuinely conflict, and how to settle each conflict.
-4. BEST ANSWER — the full answer to act on: the winner as-is, or your merged version."""
+1. CONVERGENCE — what the answers independently agree on. Agreement across
+   vendors is signal, not proof: models fail in correlated ways, so flag any
+   agreed claim that is surprising or load-bearing enough to deserve a check.
+2. DIVERGENCE — every point where answers genuinely conflict, and every
+   material claim only one answer raises. For each: who says what, and the
+   narrowest check that would settle it. This section is the caller's
+   verification work list — do not average conflicts away.
+3. VERDICT — which answer is best (name it), or say a merge beats any single
+   one, citing the decisive differences.
+4. BEST ANSWER — the full answer to act on: the winner as-is, or your merged
+   version, with any unsettled divergence marked inline rather than silently
+   resolved."""
 
 
 def fanout_call_args(args: argparse.Namespace, agent_name: str, trace_suffix: str) -> argparse.Namespace:
@@ -2721,14 +2729,25 @@ def cron_line_name(line: str) -> str | None:
     return line[idx + len(CRON_TAG_PREFIX):].strip() or None
 
 
+# YOYO_* env that shapes what a call injects/resolves. Captured into cron
+# entries at add time (like PATH) because cron does not source shell rc files —
+# without this, a scheduled run silently loses e.g. the caller's default skills.
+CRON_CAPTURED_ENV = ("YOYO_DEFAULT_SKILLS", "YOYO_SKILL_PATH", "YOYO_CONFIG", "YOYO_STATE_DIR")
+
+
 def build_cron_line(entry: dict[str, Any]) -> str:
     # PATH is captured at add time because cron's own environment is minimal
     # and the target agent CLIs (claude, codex, ...) must still resolve. The
     # trailing tag is a shell comment at execution time but survives in
     # `crontab -l`, which is how list/rm find yoyo-managed lines.
+    captured = "".join(
+        f"{key}={shlex.quote(str(value))} "
+        for key, value in (entry.get("env") or {}).items()
+        if key in CRON_CAPTURED_ENV
+    )
     command = (
         f"cd {shlex.quote(entry['cwd'])} && "
-        f"PATH={shlex.quote(entry['path_env'])} YOYO_CALLER=cron "
+        f"PATH={shlex.quote(entry['path_env'])} {captured}YOYO_CALLER=cron "
         f"{shlex.quote(entry['yoyo'])} {shlex.join(entry['argv'])} "
         f">> {shlex.quote(entry['log'])} 2>&1"
     )
@@ -2781,6 +2800,7 @@ def cron_add(args: argparse.Namespace) -> int:
         "log": str(log_path),
         "yoyo": str(Path(__file__).resolve()),
         "path_env": os.environ.get("PATH", ""),
+        "env": {key: os.environ[key] for key in CRON_CAPTURED_ENV if os.environ.get(key)},
         "created_at": iso_utc(utc_now()),
     }
     lines = [line for line in crontab_read() if cron_line_name(line) != name]
@@ -4084,6 +4104,42 @@ Order findings by severity and keep file/line references.
 {reviews}"""
 
 
+# Optional synthesis stances: a precision/recall dial the caller sets per call.
+# Unanimous juries measurably cut false positives at the cost of recall; "any"
+# maximizes recall for audits where a missed issue costs more than noise.
+REVIEW_STANCE_PROMPTS: dict[str, str] = {
+    "unanimous": """You are consolidating {count} independent code reviews of the same diff, each
+produced by a different AI agent. Take the UNANIMOUS stance: report as findings
+ONLY the issues that every reviewer independently raised — match by underlying
+issue, not wording. This maximizes precision; treat it as the high-confidence
+short list.
+
+Then add a NOT UNANIMOUS section: one line per remaining finding with who
+raised it, so nothing is silently dropped. Drop pure style nits. Order by
+severity and keep file/line references.
+
+<diff>
+{diff}
+</diff>
+
+{reviews}""",
+    "any": """You are consolidating {count} independent code reviews of the same diff, each
+produced by a different AI agent. Take the ANY stance: include every distinct
+issue raised by at least one reviewer — deduplicate by underlying issue, tag
+each finding with how many reviewers raised it (agreement is signal, not
+proof), and resolve contradictions from the diff when possible, otherwise flag
+the disagreement explicitly. This maximizes recall for audits where a missed
+issue costs more than noise. Drop pure style nits. Order by severity and keep
+file/line references.
+
+<diff>
+{diff}
+</diff>
+
+{reviews}""",
+}
+
+
 def git_capture(cmd: list[str], cwd: Path) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, errors="replace")
@@ -4163,6 +4219,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         raise YoyoError("--agents must name at least one agent")
     if len(names) != len(set(names)):
         raise YoyoError("--agents must not repeat an agent; consensus needs independent reviewers")
+    if args.stance and args.synthesis_prompt:
+        raise YoyoError("--stance and --synthesis-prompt are mutually exclusive; the custom prompt owns the stance")
     synthesizer = args.synthesizer or names[0]
     for name in [*names, synthesizer]:
         if name not in agents:
@@ -4235,12 +4293,21 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     synthesis: dict[str, Any] | None = None
     if len(successful) == 1:
+        if args.stance or args.synthesis_prompt:
+            eprint(f"review {args.trace_id}: only one review succeeded; synthesis (and its stance) skipped")
         final_text = str(successful[0]["stdout"]).strip()
     else:
         reviews_block = "\n\n".join(
             f'<review agent="{r["agent"]}">\n{str(r["stdout"]).strip()}\n</review>' for r in successful
         )
-        synth_prompt = REVIEW_SYNTHESIS_PROMPT.format(count=len(successful), diff=diff, reviews=reviews_block)
+        if args.synthesis_prompt:
+            # Custom instructions are used verbatim (no .format, so braces are
+            # safe); the diff and reviews are appended after them.
+            synth_prompt = f"{args.synthesis_prompt.strip()}\n\n<diff>\n{diff}\n</diff>\n\n{reviews_block}"
+        elif args.stance:
+            synth_prompt = REVIEW_STANCE_PROMPTS[args.stance].format(count=len(successful), diff=diff, reviews=reviews_block)
+        else:
+            synth_prompt = REVIEW_SYNTHESIS_PROMPT.format(count=len(successful), diff=diff, reviews=reviews_block)
         synth_args = review_call_args(args, synthesizer, None, synth_prompt, "synthesis")
         synthesis = execute_agent_call(synthesizer, synth_args, build_prompt(synth_args), agents)
         if int(synthesis.get("exit_code", 1)) == 0 and str(synthesis.get("stdout", "")).strip():
@@ -5180,6 +5247,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--base", default=None, help="Base ref for the committed-changes diff when the tree is clean (default: auto-detect origin HEAD, then main, then master)")
     review.add_argument("--synthesizer", default=None, help="Agent that merges the reviews into a consensus report (default: first of --agents)")
+    review.add_argument(
+        "--stance",
+        choices=sorted(REVIEW_STANCE_PROMPTS),
+        default=None,
+        help="Synthesis stance: 'unanimous' reports only findings every reviewer raised (precision), 'any' includes every distinct finding tagged with reviewer count (recall). Default: consensus/single-reviewer sections.",
+    )
+    review.add_argument(
+        "--synthesis-prompt",
+        default=None,
+        help="Custom synthesis instructions replacing the default consensus format (the diff and reviews are appended)",
+    )
     review.add_argument("--pr", action="store_true", help="Post the consolidated review as a GitHub PR comment via gh")
     review.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     review.add_argument("--cwd", default=os.getcwd())

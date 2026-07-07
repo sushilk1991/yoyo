@@ -13,7 +13,7 @@ Why multiple agents at all: different vendors fail differently. Fanning the same
 
 Core trio (battle-tested, support `--session` follow-ups):
 
-- `codex` — OpenAI. Default reviewer/second opinion; powers `yoyo imagegen`.
+- `codex` — OpenAI. Default reviewer/second opinion; powers `yoyo imagegen`. Notably strong at computer use and browser automation — prefer it for tasks that need driving a browser, verifying live UI flows, or operating desktop tooling.
 - `claude` — Anthropic. Default worker; the only agent that reports per-call cost (so `loop --budget-usd` is enforced only here).
 - `pi` — lightweight and cheap; small scoped tasks and quick opinions.
 
@@ -35,6 +35,8 @@ yoyo ask codex,claude --cwd "$PWD" "Design the migration. Name the riskiest step
 
 # Consensus code review of the current git diff
 yoyo review --cwd "$PWD"                      # codex + claude, read-only, synthesized
+yoyo review --stance unanimous                # precision: only findings ALL reviewers raised
+yoyo review --stance any                      # recall: every distinct finding, tagged with reviewer count
 
 # Deep research: parallel perspectives, then a decision brief
 yoyo research --cwd "$PWD" "Should we move the engine to Rust?"
@@ -55,7 +57,7 @@ run_id=$(yoyo research --background "...")
 yoyo wait "$run_id" --timeout 25    # 124 = still running, wait again; 0 = done
 ```
 
-Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*) — a path (`--skill ./rules/ponytail.md`) injects any rules file as an opt-in overlay, e.g. a minimal-code "senior engineer" ladder for workers; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim.
+Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*) — a path (`--skill ./rules/ponytail.md`) injects any rules file as an opt-in overlay, e.g. a minimal-code "senior engineer" ladder for workers; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim. `YOYO_DEFAULT_SKILLS=farfield` (bundled; installed by `yoyo install-skill`) rides a lean reasoning-discipline harness — contract, evidence, done gate — on every delegation without per-call flags.
 
 ## Orchestrate step by step
 
@@ -68,6 +70,8 @@ The powerful pattern is not one big command — it's you in the loop between sma
 5. Repeat. Each step's shape comes from the previous step's result, not from a plan fixed up front.
 
 Prefer being the judge yourself when you hold the decision context; use `--judge` when you want an independent one. For research, `--no-synthesis` returns the raw perspectives so you synthesize them with everything else you know.
+
+**Agent-to-agent communication is you.** Agents don't need a direct channel to each other — the orchestrator is the message bus, and that's a feature: you filter, verify, and decide what crosses. The plumbing: `--session <name>` holds a durable bilateral conversation with one agent; a state/brief file is the shared memory two agents both read (`--file` it into the next call); piping one call's output into the next (`yoyo ask a ... | yoyo ask b --read-only "critique this"`) is a handoff with you able to inspect the seam. Wire agents directly to each other and you've built an unsupervised loop — exactly where delegation drifts.
 
 ## Making each call good
 

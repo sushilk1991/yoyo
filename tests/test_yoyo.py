@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.17.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.18.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -3567,6 +3567,57 @@ class YoyoTests(unittest.TestCase):
             self.assertIsNone(payload["synthesis"])
             self.assertEqual(payload["review"], "solo findings")
 
+    def test_review_stance_unanimous_swaps_synthesis_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "review-one findings", "r2": "review-two findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1,r2", "--synthesizer", "merge",
+                 "--stance", "unanimous", "--json"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            # The echo synthesizer reflects its prompt: the unanimous stance
+            # instructions replace the default consensus format.
+            self.assertIn("UNANIMOUS stance", payload["review"])
+            self.assertIn("NOT UNANIMOUS", payload["review"])
+            self.assertNotIn("1. CONSENSUS", payload["review"])
+            self.assertIn("review-one findings", payload["review"])
+
+    def test_review_custom_synthesis_prompt_is_verbatim_and_brace_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "alpha finding", "r2": "beta finding"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1,r2", "--synthesizer", "merge",
+                 "--synthesis-prompt", "Emit TOON rows findings[N]{file,claim}: only. {braces} stay literal.",
+                 "--json"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("Emit TOON rows", payload["review"])
+            self.assertIn("{braces} stay literal", payload["review"])
+            self.assertNotIn("1. CONSENSUS", payload["review"])
+            self.assertIn("alpha finding", payload["review"])
+
+    def test_review_stance_and_synthesis_prompt_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "x"})
+            code, _, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--stance", "any",
+                 "--synthesis-prompt", "custom"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("mutually exclusive", stderr)
+
     def test_review_background_detaches_and_wait_renders_review(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._review_repo(tmp)
@@ -4091,6 +4142,12 @@ class YoyoTests(unittest.TestCase):
             self.assertIn("alpha-answer", judge_out)
             self.assertIn("beta-answer", judge_out)
             self.assertIn("pick the best refactor", judge_out)
+            # The default judge instructions lead with the convergence /
+            # divergence map — divergence is the caller's verification list.
+            self.assertIn("CONVERGENCE", judge_out)
+            self.assertIn("DIVERGENCE", judge_out)
+            self.assertIn("verification work list", judge_out)
+            self.assertLess(judge_out.index("DIVERGENCE"), judge_out.index("VERDICT"))
 
     def test_ask_fanout_judge_without_read_only_support_fails_loudly(self):
         env = self._fanout_env(
@@ -4510,6 +4567,41 @@ class YoyoTests(unittest.TestCase):
         )
         self.assertIn(r"100\%", line)
         self.assertTrue(line.endswith("# yoyo-cron:pct"))
+
+    def test_cron_line_carries_captured_yoyo_env(self):
+        line = yoyo.build_cron_line(
+            {
+                "name": "envy",
+                "schedule": "@daily",
+                "cwd": "/tmp",
+                "argv": ["ask", "claude", "hi"],
+                "log": "/tmp/x.log",
+                "yoyo": "/usr/local/bin/yoyo",
+                "path_env": "/usr/bin",
+                "env": {"YOYO_DEFAULT_SKILLS": "farfield", "IGNORED_KEY": "nope"},
+            }
+        )
+        self.assertIn("YOYO_DEFAULT_SKILLS=farfield", line)
+        self.assertNotIn("IGNORED_KEY", line)
+        self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
+
+    def test_cron_add_captures_default_skills_env_into_crontab_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "skills" / "farfield"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Farfield\nBe rigorous.\n", encoding="utf-8")
+            env, store = self._cron_env(tmp)
+            env["YOYO_DEFAULT_SKILLS"] = "farfield"
+            env["YOYO_SKILL_PATH"] = str(Path(tmp) / "skills")
+            code, _, stderr = self.run_cli(
+                ["cron", "add", "envy", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "hi"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            line = store.read_text().strip()
+            self.assertIn("YOYO_DEFAULT_SKILLS=farfield", line)
+            self.assertIn("YOYO_SKILL_PATH=", line)
+            self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
 
     def test_cron_add_rejects_newlines_in_command(self):
         with tempfile.TemporaryDirectory() as tmp:
