@@ -1299,16 +1299,18 @@ def background_child_argv(args: argparse.Namespace) -> list[str]:
     if "--json" not in filtered:
         filtered.append("--json")
     has_trace = any(item == "--trace-id" or item.startswith("--trace-id=") for item in filtered)
-    if not has_trace:
+    if not has_trace and getattr(args, "trace_id", None):
         filtered.extend(["--trace-id", args.trace_id])
     return [sys.executable, str(Path(__file__).resolve())] + filtered
 
 
 def start_background_run(args: argparse.Namespace) -> int:
     stdin_bytes = read_background_stdin(args)
-    if (
+    # Commands without a positional prompt (review, workflow) validate their
+    # own inputs before detaching; the guard below is for prompt-taking ones.
+    if hasattr(args, "prompt") and (
         not args.prompt
-        and not args.file
+        and not getattr(args, "file", None)
         and not (getattr(args, "skill", None) or [])
         and not getattr(args, "input", None)
         and not (stdin_bytes and stdin_bytes.strip())
@@ -1330,8 +1332,9 @@ def start_background_run(args: argparse.Namespace) -> int:
     child_argv = background_child_argv(args)
     meta = {
         "run_id": run_id,
-        "agent": args.agent,
-        "role": args.role,
+        # Fan-out commands carry --agents; workflow sets an explicit label.
+        "agent": getattr(args, "agent", None) or getattr(args, "agents", None) or getattr(args, "background_label", None),
+        "role": getattr(args, "role", None),
         "cwd": str(resolve_cwd(args.cwd)),
         "trace_id": args.trace_id,
         "caller": args.caller,
@@ -2319,6 +2322,13 @@ def run_workflow(args: argparse.Namespace) -> int:
     if total_jobs > max_jobs:
         raise YoyoError(f"Workflow expands to {total_jobs} jobs, above max_jobs={max_jobs}")
 
+    if getattr(args, "background", False) and not args.dry_run:
+        # Pin the trace id now so the parent's run record and the detached
+        # child stamp the same one.
+        args.trace_id = args.trace_id or uuid.uuid4().hex
+        args.background_label = f"workflow:{name}"
+        return start_background_run(args)
+
     run_trace_id = args.trace_id or uuid.uuid4().hex
     results_by_phase: dict[str, list[dict[str, Any]]] = {}
     output: dict[str, Any] = {
@@ -2475,6 +2485,31 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
     if not stdout and result.get("loop_id") and result.get("end_reason"):
         # A background loop's parent result is a loop summary, not an ask envelope.
         stdout = loop_summary_line(result) + "\n"
+    if not stdout:
+        # Background research/review results are their own envelopes; the
+        # final synthesized text lives under "report" / "review".
+        for key in ("report", "review"):
+            text = result.get(key)
+            if isinstance(text, str) and text.strip():
+                stdout = text if text.endswith("\n") else text + "\n"
+                break
+    if not stdout and isinstance(result.get("phases"), list):
+        # A background workflow's result envelope: render each job's output
+        # the way a foreground run's --json consumer would read it.
+        blocks = []
+        for phase in result["phases"]:
+            if not isinstance(phase, dict):
+                continue
+            for item in phase.get("jobs") or []:
+                if not isinstance(item, dict):
+                    continue
+                label = f"{phase.get('name')}/{item.get('job_id') or item.get('agent')}"
+                if int(item.get("exit_code", 1)) == 0 and str(item.get("stdout", "")).strip():
+                    blocks.append(f"=== {label} ===\n{str(item['stdout']).strip()}")
+                else:
+                    blocks.append(f"=== {label} ===\n(exit {item.get('exit_code')})")
+        if blocks:
+            stdout = "\n\n".join(blocks) + "\n"
     if not stdout and isinstance(result.get("results"), list):
         # A background fan-out's result is a fan-out envelope, not an ask
         # envelope; render it the way a foreground fan-out prints.
@@ -3066,6 +3101,9 @@ def cmd_imagegen(args: argparse.Namespace) -> int:
             edit_path = resolve_cwd(args.cwd) / edit_path
         if not edit_path.is_file():
             raise YoyoError(f"Edit reference image not found: {edit_path}")
+
+    if getattr(args, "background", False) and not args.dry_run:
+        return start_background_run(args)
 
     before = image_fingerprint(out)
 
@@ -4140,6 +4178,10 @@ def cmd_review(args: argparse.Namespace) -> int:
     for name in {*names, synthesizer}:
         command_for_agent(agents[name], review_call_args(args, name, "review", "probe", "probe"))
 
+    if getattr(args, "background", False) and not args.dry_run:
+        # The detached child collects the diff itself, at its own start time.
+        return start_background_run(args)
+
     cwd = resolve_cwd(args.cwd)
     diff, scope, untracked = collect_review_diff(cwd, args.base)
     encoded = diff.encode("utf-8")
@@ -4416,6 +4458,9 @@ def cmd_research(args: argparse.Namespace) -> int:
         probe_targets.add(synthesizer)
     for name in probe_targets:
         command_for_agent(agents[name], research_call_args(args, name, "probe", "probe"))
+
+    if getattr(args, "background", False) and not args.dry_run:
+        return start_background_run(args)
 
     # Read caller context once, here, so parallel researchers never race on the
     # same input; it is embedded into each researcher's prompt text directly.
@@ -5019,7 +5064,8 @@ def build_parser() -> argparse.ArgumentParser:
     workflow.add_argument("--fail-fast", action="store_true", help="Stop after the first phase with a failed job")
     workflow.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     workflow.add_argument("--dry-run", action="store_true", help="Render planned agent calls without launching them")
-    workflow.set_defaults(func=run_workflow)
+    workflow.add_argument("--background", action="store_true", help="Detach the workflow run and record it in the run ledger (poll with `yoyo wait`)")
+    workflow.set_defaults(func=run_workflow, use_stdin_context=False)
 
     imagegen = sub.add_parser("imagegen", help="Generate an image via an agent's native image-generation skill")
     imagegen.add_argument("prompt_text", help="Image prompt (quote it)")
@@ -5038,7 +5084,8 @@ def build_parser() -> argparse.ArgumentParser:
     imagegen.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     imagegen.add_argument("--json", action="store_true", help="Emit a JSON result envelope")
     imagegen.add_argument("--dry-run", action="store_true", help="Print command and rendered prompt without running")
-    imagegen.set_defaults(func=cmd_imagegen)
+    imagegen.add_argument("--background", action="store_true", help="Detach the imagegen run and record it in the run ledger (poll with `yoyo wait`)")
+    imagegen.set_defaults(func=cmd_imagegen, use_stdin_context=False)
 
     loop = sub.add_parser("loop", help="Run a task as repeated fresh-context agent iterations with a shared state file")
     loop.add_argument(
@@ -5144,7 +5191,8 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     review.add_argument("--json", action="store_true", help="Emit a JSON result envelope with per-agent reviews and the synthesis")
     review.add_argument("--dry-run", action="store_true", help="Print the reviewer commands and prompts without running them")
-    review.set_defaults(func=cmd_review)
+    review.add_argument("--background", action="store_true", help="Detach the review run and record it in the run ledger (poll with `yoyo wait`)")
+    review.set_defaults(func=cmd_review, use_stdin_context=False)
 
     research = sub.add_parser("research", help="Deep research: fan a topic out to agents under distinct lenses, then synthesize a decision brief")
     research.add_argument("prompt", nargs="*", help="The research topic or question")
@@ -5192,7 +5240,8 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     research.add_argument("--json", action="store_true", help="Emit a JSON result envelope with per-lens perspectives and the synthesis")
     research.add_argument("--dry-run", action="store_true", help="Print the researcher commands and prompts without running them")
-    research.set_defaults(func=cmd_research, collect_unknown_prompt=True)
+    research.add_argument("--background", action="store_true", help="Detach the research run and record it in the run ledger (poll with `yoyo wait`)")
+    research.set_defaults(func=cmd_research, collect_unknown_prompt=True, use_stdin_context=False)
 
     runs = sub.add_parser("runs", help="List, show, and prune background run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")

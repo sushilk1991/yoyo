@@ -14,13 +14,14 @@ yoyo research --cwd "$PWD" "Should we move the core engine to Rust?"
 yoyo research --lenses proponent,skeptic,analyst --agents codex,claude,cursor "..."
 yoyo research --lens "Investigate only the licensing implications, citing actual license texts" "..."
 yoyo research --no-synthesis --json "..."     # raw perspectives; you synthesize
+run_id=$(yoyo research --background "...")    # detach; poll with `yoyo wait "$run_id"`
 ```
 
 - Phrase the question with its decision context: what is being decided, constraints, what evidence would settle it. A vague topic gets vague lenses.
 - Default lenses are `proponent,skeptic,analyst,explorer,pragmatist`; defaults agents are `codex,claude,pi`. Lenses are yours: unknown single words become ad-hoc angles (`--lenses regulatory,market`), repeatable `--lens` takes full free-text instructions, duplicates land on different vendors (best-of-n).
 - `--file FILE` gives every researcher shared context (a brief, a spec, the relevant doc) so they don't each re-derive it.
 - Prefer `--no-synthesis` when you hold the decision context yourself — read the raw perspectives and synthesize with everything else you know. `--synthesis-prompt "..."` replaces the brief format.
-- Long question? Detach: run the whole command with `--json` in a background shell and read the envelope file when it lands.
+- Long question? Detach with `--background`: it prints a run id immediately and records the run in the ledger — `yoyo wait <run_id>` blocks until the brief lands (exit 124 = still running, wait again), `yoyo runs show <run_id> --json` fetches the full envelope.
 
 ## Reading the result
 

@@ -139,10 +139,13 @@ The natural pairing is a scheduled loop: the state file carries progress between
 
 ## Background runs
 
-A real review or worker task can outlive the caller's tool budget. `--background` detaches the run into a durable ledger and returns immediately:
+A real review or worker task can outlive the caller's tool budget. `--background` detaches the run into a durable ledger and returns immediately. It works on every long-running command — `ask` (including fan-outs), `loop`, `research`, `review`, `workflow`, and `imagegen`:
 
 ```bash
 run_id=$(yoyo ask codex --role review --cwd "$PWD" --background "Audit the auth module.")
+run_id=$(yoyo research --background "Should we adopt X?")
+run_id=$(yoyo review --background)
+run_id=$(yoyo workflow ship-check --background)
 yoyo runs list
 yoyo wait "$run_id"            # blocks until done, exits with the run's exit code
 yoyo runs show "$run_id" --json

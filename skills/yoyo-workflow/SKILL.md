@@ -20,6 +20,7 @@ Reach for a workflow when:
 yoyo workflow --list                                     # bundled + saved templates
 yoyo workflow cross-review --input "$ARGUMENTS" --json
 yoyo workflow ./workflow.json --input "$ARGUMENTS" --dry-run --json   # inspect before spending tokens
+run_id=$(yoyo workflow cross-review --background)        # detach; poll with `yoyo wait "$run_id"`
 ```
 
 Bundled templates: `cross-review` (Codex + Claude independent reviews, then a synthesis judge), `adversarial-audit` (three single-lens audits, then a verifier that tries to refute every finding), `frontend-impl-review` (worker with the `frontend-design` skill, then an independent review).

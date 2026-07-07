@@ -48,8 +48,10 @@ yoyo loop codex,claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --ga
 # Schedule anything on cron; a scheduled loop continues from its state file
 yoyo cron add nightly --schedule "0 2 * * *" --cwd "$PWD" -- loop claude --max-iter 5 "Work through TODO.md"
 
-# Long call? Detach it and keep working
+# Long call? Detach it and keep working — --background works on ask, loop,
+# research, review, workflow, and imagegen alike
 run_id=$(yoyo ask claude --role review --cwd "$PWD" --background "...")
+run_id=$(yoyo research --background "...")
 yoyo wait "$run_id" --timeout 25    # 124 = still running, wait again; 0 = done
 ```
 

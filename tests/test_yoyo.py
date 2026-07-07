@@ -41,7 +41,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.16.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.17.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -1119,6 +1119,46 @@ class YoyoTests(unittest.TestCase):
         self.assertIn("Previous workflow outputs", review_stdout)
         self.assertIn("First pass", review_stdout)
         self.assertTrue(payload["phases"][1]["jobs"][0]["read_only"])
+
+    def test_workflow_background_detaches_and_wait_renders_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            config.write_text(
+                json.dumps({"agents": {"echo": {"command": ["python3", "-c", "import sys; sys.stdin.read(); print('job output')"], "read_only_args": ["--safe"]}}}),
+                encoding="utf-8",
+            )
+            spec = Path(tmp) / "workflow.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "name": "bg-smoke",
+                        "defaults": {"agent": "echo"},
+                        "phases": [{"name": "p1", "jobs": [{"id": "j1", "prompt": "Say hello"}]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+
+            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--background"], env=env)
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+
+            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "15", "--poll", "0.05"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("=== p1/j1 ===", stdout)
+            self.assertIn("job output", stdout)
+
+            meta = json.loads((Path(tmp) / "state" / "runs" / run_id / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["agent"], "workflow:bg-smoke")
+            self.assertTrue(meta["trace_id"])
+
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id, "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["workflow"], "bg-smoke")
+            self.assertEqual(payload["phases"][0]["jobs"][0]["job_id"], "j1")
 
     def test_workflow_for_each_expands_jobs_and_templates_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2437,6 +2477,26 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(payload["out"], str(out))
         self.assertGreater(payload["bytes"], 1024)
 
+    def test_imagegen_background_detaches_and_verifies_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._imagegen_agent_config(tmp, self.IMAGEGEN_WRITER)
+            out = Path(tmp) / "art.png"
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["imagegen", "a red yo-yo", "--agent", "fakegen", "--out", str(out), "--background"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+
+            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "15", "--poll", "0.05"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(out.is_file())
+            result = json.loads((Path(tmp) / "state" / "runs" / run_id / "result.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["out"], str(out))
+
     def test_imagegen_fails_loudly_when_no_image_is_created(self):
         script = "import sys; sys.stdin.read(); print('done, honest')"
         with tempfile.TemporaryDirectory() as tmp:
@@ -3507,6 +3567,30 @@ class YoyoTests(unittest.TestCase):
             self.assertIsNone(payload["synthesis"])
             self.assertEqual(payload["review"], "solo findings")
 
+    def test_review_background_detaches_and_wait_renders_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._review_repo(tmp)
+            config = self._review_config(tmp, {"r1": "solo findings"})
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["review", "--cwd", str(repo), "--agents", "r1", "--background"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+
+            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "15", "--poll", "0.05"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("solo findings", stdout)
+
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id, "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["review"], "solo findings")
+
     def test_review_falls_back_to_raw_reviews_when_synthesis_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._review_repo(tmp)
@@ -3717,6 +3801,30 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             payload = json.loads(stdout)
             self.assertIsNone(payload["synthesis"])
+            self.assertEqual(payload["report"], "finding from r1")
+
+    def test_research_background_detaches_and_wait_renders_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._research_config(tmp, ["r1"])
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+            code, stdout, stderr = self.run_cli(
+                ["research", "--cwd", tmp, "--agents", "r1", "--lenses", "proponent", "--background", "topic"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+
+            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "15", "--poll", "0.05"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("finding from r1", stdout)
+
+            code, stdout, stderr = self.run_cli(["runs", "show", run_id, "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["status"], "done")
+            self.assertEqual(payload["topic"], "topic")
             self.assertEqual(payload["report"], "finding from r1")
 
     def test_research_round_robins_agents_across_lenses(self):
