@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.18.0"
+VERSION = "0.18.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch stalls early on agents that stream output.
@@ -638,6 +638,29 @@ def read_file_context(paths: list[str], base: Path, limit: int) -> str:
     return "\n\n".join(blocks)
 
 
+def bundled_skill_roots() -> list[Path]:
+    """Skill dirs shipped with yoyo itself, searched after user skill roots.
+
+    Two candidates: the checkout the running script lives in, and the recorded
+    source checkout (the installed binary is a copy under ~/.local/bin, so its
+    own parent has no skills dir). Being last in the search order means a
+    user's personally installed skill of the same name always wins.
+    """
+    roots: list[Path] = []
+    script_root = Path(__file__).resolve().parents[1] / "skills"
+    if script_root.is_dir():
+        roots.append(script_root)
+    try:
+        record = source_record_path()
+        if record.is_file():
+            source = Path(record.read_text(encoding="utf-8").strip()).expanduser()
+            if (source / "skills").is_dir():
+                roots.append(source / "skills")
+    except OSError:
+        pass
+    return roots
+
+
 def skill_search_roots() -> list[Path]:
     roots: list[Path] = []
     raw = os.environ.get("YOYO_SKILL_PATH")
@@ -652,6 +675,7 @@ def skill_search_roots() -> list[Path]:
             Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
         ]
     )
+    roots.extend(bundled_skill_roots())
     ordered: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
@@ -722,13 +746,24 @@ def skill_prompt_block(names: list[str]) -> str:
     )
 
 
+# Injected into every non-raw call when YOYO_DEFAULT_SKILLS is not set at all.
+# fable-mode ships inbuilt with yoyo (see bundled_skill_roots), so a plain
+# install gets the reasoning-discipline harness on every delegation by default.
+DEFAULT_SKILLS_BUILTIN = "fable-mode"
+
+
 def default_skills_from_env() -> list[str]:
     """Skills injected into every non-raw call, from YOYO_DEFAULT_SKILLS (comma-separated).
 
-    Unresolvable names are skipped with a stderr warning rather than failing the
-    call: a broken default must not take down delegation itself.
+    An unset variable means the built-in default (fable-mode); an explicitly
+    empty one disables default injection. Unresolvable names are skipped with a
+    stderr warning rather than failing the call: a broken default must not take
+    down delegation itself.
     """
-    raw = os.environ.get("YOYO_DEFAULT_SKILLS", "").strip()
+    raw = os.environ.get("YOYO_DEFAULT_SKILLS")
+    if raw is None:
+        raw = DEFAULT_SKILLS_BUILTIN
+    raw = raw.strip()
     if not raw:
         return []
     names: list[str] = []
@@ -4980,6 +5015,11 @@ def install_skill(args: argparse.Namespace) -> int:
     skill_requirements = {"yoyo-imagegen": "codex"}
     kept: list[Path] = []
     for skill_source in skill_sources:
+        if skill_source.name == "fable-mode":
+            # Inbuilt: yoyo resolves it from its own bundle (bundled_skill_roots),
+            # and copying it out would clobber a user's personal fable-mode skill.
+            print(f"skipped skill: {skill_source.name} (inbuilt; resolved from the yoyo bundle)")
+            continue
         required = skill_requirements.get(skill_source.name)
         if required and not shutil.which(required):
             print(f"skipped skill: {skill_source.name} (requires {required} on PATH)")

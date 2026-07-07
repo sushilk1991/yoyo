@@ -88,7 +88,7 @@ Custom agents are a JSON entry away. Check everything works with `yoyo doctor --
 | `yoyo cron add/list/rm/run` | Schedule any yoyo command via crontab — no daemon |
 | `yoyo workflow <name>` | Rerun a saved multi-agent pipeline by name |
 | `yoyo chat` / `--session` / `--background` | Interactive, durable, and detached calls (`--background` on every long-running command) |
-| `YOYO_DEFAULT_SKILLS=farfield` | Bundled reasoning-discipline harness injected into every delegation |
+| inbuilt `fable-mode` skill | Reasoning-discipline harness injected into every delegation by default (`YOYO_DEFAULT_SKILLS=""` disables) |
 
 Full flags, the access model, custom agents, and design details: **[docs/REFERENCE.md](docs/REFERENCE.md)**.
 

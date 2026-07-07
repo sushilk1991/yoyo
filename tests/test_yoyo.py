@@ -29,8 +29,13 @@ class YoyoTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         merged_env = os.environ.copy()
+        # Deterministic default-skill behavior regardless of the host shell:
+        # tests opt into default injection explicitly. A value of None removes
+        # the variable entirely (exercising the built-in default).
+        merged_env["YOYO_DEFAULT_SKILLS"] = ""
         if env:
             merged_env.update(env)
+        merged_env = {key: value for key, value in merged_env.items() if value is not None}
         with mock.patch.dict(os.environ, merged_env, clear=True):
             with mock.patch("sys.stdin", io.StringIO(stdin)):
                 with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
@@ -41,7 +46,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.18.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.18.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -53,6 +58,57 @@ class YoyoTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("independent second-opinion agent", stdout)
         self.assertIn("Task:\nCheck this.", stdout)
+
+    def test_inbuilt_fable_mode_injected_by_default(self):
+        # With YOYO_DEFAULT_SKILLS unset entirely, the bundled fable-mode
+        # skill resolves from the repo's own skills dir and rides every call.
+        env = {
+            "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+            "YOYO_DEFAULT_SKILLS": None,
+        }
+        code, stdout, stderr = self.run_cli(["ask", "echo", "hello"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('<skill name="fable-mode">', stdout)
+        self.assertIn("Done Gate", stdout)
+        self.assertIn("Task:\nhello", stdout)
+
+    def test_default_skills_empty_string_disables_injection(self):
+        env = {
+            "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+            "YOYO_DEFAULT_SKILLS": "",
+        }
+        code, stdout, stderr = self.run_cli(["ask", "echo", "hello"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("<skill", stdout)
+
+    def test_user_installed_skill_overrides_bundled_fable_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "fable-mode"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("# My Own Harness\ncustom-override-marker\n", encoding="utf-8")
+            env = {
+                "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+                "YOYO_DEFAULT_SKILLS": None,
+                "YOYO_SKILL_PATH": tmp,
+            }
+            code, stdout, stderr = self.run_cli(["ask", "echo", "hello"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("custom-override-marker", stdout)
+        self.assertNotIn("Done Gate", stdout)
+
+    def test_raw_mode_skips_inbuilt_default_skill(self):
+        env = {
+            "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+            "YOYO_DEFAULT_SKILLS": None,
+        }
+        code, stdout, stderr = self.run_cli(["ask", "echo", "--raw", "/cmd verbatim"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("<skill", stdout)
+        self.assertTrue(stdout.startswith("/cmd verbatim"), stdout)
 
     def test_json_output_wraps_agent_result(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print('ok:' + sys.stdin.read().splitlines()[-1])\""}
@@ -4578,20 +4634,20 @@ class YoyoTests(unittest.TestCase):
                 "log": "/tmp/x.log",
                 "yoyo": "/usr/local/bin/yoyo",
                 "path_env": "/usr/bin",
-                "env": {"YOYO_DEFAULT_SKILLS": "farfield", "IGNORED_KEY": "nope"},
+                "env": {"YOYO_DEFAULT_SKILLS": "discipline", "IGNORED_KEY": "nope"},
             }
         )
-        self.assertIn("YOYO_DEFAULT_SKILLS=farfield", line)
+        self.assertIn("YOYO_DEFAULT_SKILLS=discipline", line)
         self.assertNotIn("IGNORED_KEY", line)
         self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
 
     def test_cron_add_captures_default_skills_env_into_crontab_line(self):
         with tempfile.TemporaryDirectory() as tmp:
-            skill_dir = Path(tmp) / "skills" / "farfield"
+            skill_dir = Path(tmp) / "skills" / "discipline"
             skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text("# Farfield\nBe rigorous.\n", encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text("# Discipline\nBe rigorous.\n", encoding="utf-8")
             env, store = self._cron_env(tmp)
-            env["YOYO_DEFAULT_SKILLS"] = "farfield"
+            env["YOYO_DEFAULT_SKILLS"] = "discipline"
             env["YOYO_SKILL_PATH"] = str(Path(tmp) / "skills")
             code, _, stderr = self.run_cli(
                 ["cron", "add", "envy", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "hi"],
@@ -4599,7 +4655,7 @@ class YoyoTests(unittest.TestCase):
             )
             self.assertEqual(code, 0, stderr)
             line = store.read_text().strip()
-            self.assertIn("YOYO_DEFAULT_SKILLS=farfield", line)
+            self.assertIn("YOYO_DEFAULT_SKILLS=discipline", line)
             self.assertIn("YOYO_SKILL_PATH=", line)
             self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
 

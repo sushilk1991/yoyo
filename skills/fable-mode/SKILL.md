@@ -1,9 +1,9 @@
 ---
-name: farfield
-description: Reasoning-discipline harness for delegated work — contract before acting, evidence for every claim, and a done gate before any completion claim. Vendor-neutral; designed to ride along on every yoyo delegation via YOYO_DEFAULT_SKILLS=farfield.
+name: fable-mode
+description: Reasoning-discipline harness for delegated work — contract before acting, evidence for every claim, and a done gate before any completion claim. Ships inbuilt with yoyo and is injected into every non-raw delegation by default; set YOYO_DEFAULT_SKILLS to override it or to the empty string to disable.
 ---
 
-# Farfield Discipline
+# Fable Mode
 
 You are doing delegated work. The caller will act on your answer, so a skipped check here becomes their shipped bug. These are hard gates, not advice. They constrain *how* you work — never *what* the task is.
 

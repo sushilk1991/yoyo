@@ -57,7 +57,7 @@ run_id=$(yoyo research --background "...")
 yoyo wait "$run_id" --timeout 25    # 124 = still running, wait again; 0 = done
 ```
 
-Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*) — a path (`--skill ./rules/ponytail.md`) injects any rules file as an opt-in overlay, e.g. a minimal-code "senior engineer" ladder for workers; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim. `YOYO_DEFAULT_SKILLS=farfield` (bundled; installed by `yoyo install-skill`) rides a lean reasoning-discipline harness — contract, evidence, done gate — on every delegation without per-call flags.
+Everything composes: `--skill <name>` injects a SKILL.md as guidance (the skill says *how*, the prompt says *what*) — a path (`--skill ./rules/ponytail.md`) injects any rules file as an opt-in overlay, e.g. a minimal-code "senior engineer" ladder for workers; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives you a machine-readable envelope; `--raw` passes a leading `/command` through verbatim. The inbuilt `fable-mode` skill — a lean reasoning-discipline harness (contract, evidence, done gate) — is injected into every non-raw delegation by default; `YOYO_DEFAULT_SKILLS` swaps the default set, and the empty string disables it.
 
 ## Orchestrate step by step
 
