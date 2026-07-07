@@ -46,7 +46,7 @@ class YoyoTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.18.2")
+        self.assertEqual(stdout.strip(), "yoyo 0.20.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -3432,6 +3432,129 @@ class YoyoTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertIn("Unknown checker agent", stderr)
+
+    def _critic_env(self, tmp, critic_body, worker_command):
+        config = self._checker_config(tmp, critic_body, name="criticbot")
+        return {
+            "YOYO_STATE_DIR": str(Path(tmp) / "state"),
+            "YOYO_AGENT_WORKER": worker_command,
+            "YOYO_CONFIG": str(config),
+        }
+
+    def test_loop_critic_appends_findings_and_next_iteration_sees_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            # Worker records each iteration's prompt so we can assert the
+            # critic block reached the fresh context.
+            prompts_dir = Path(tmp) / "prompts"
+            prompts_dir.mkdir()
+            worker_body = (
+                "import os, sys\n"
+                f"d = {str(prompts_dir)!r}\n"
+                "n = len(os.listdir(d)) + 1\n"
+                "open(os.path.join(d, str(n)), 'w').write(sys.stdin.read())\n"
+                "print('iteration output line')\n"
+            )
+            worker = self._loop_stub_command(tmp, worker_body, name="worker.py")
+            critic_body = (
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "print('bin/app.py:42 the retry path swallows the timeout error')\n"
+            )
+            env = self._critic_env(tmp, critic_body, worker)
+            code, stdout, stderr = self.run_cli(
+                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            # The critic reviews iteration 1 only: iteration 2 is the last, so
+            # no next iteration exists to consume findings.
+            self.assertEqual(summary["critic"], "criticbot")
+            self.assertEqual(summary["critic_reviews"], 1)
+            self.assertEqual(summary["critic_findings"], 1)
+            self.assertEqual(summary["iterations"], 2)
+            final_state = state.read_text(encoding="utf-8")
+            self.assertIn("## CRITIC FINDINGS (iteration 1, independent review by criticbot)", final_state)
+            self.assertIn("retry path swallows the timeout error", final_state)
+            # Both iteration prompts carry the critic protocol block; findings
+            # themselves travel via the state file, not the prompt.
+            for prompt_file in ("1", "2"):
+                prompt = (prompts_dir / prompt_file).read_text(encoding="utf-8")
+                self.assertIn("=== INDEPENDENT CRITIC ===", prompt)
+                self.assertIn("criticbot", prompt)
+            # Per-iteration rows record the critic outcome.
+            self.assertEqual(summary["runs"][0]["critic"], {"exit_code": 0, "findings": True, "cost_usd": None})
+            self.assertNotIn("critic", summary["runs"][1])
+
+    def test_loop_critic_no_findings_marker_appends_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            worker, _ = self._counting_stub(tmp)
+            critic_body = "import sys\nsys.stdin.read()\nprint('reviewed carefully')\nprint('NO FINDINGS')\n"
+            env = self._critic_env(tmp, critic_body, worker)
+            code, stdout, stderr = self.run_cli(
+                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["critic_reviews"], 1)
+            self.assertEqual(summary["critic_findings"], 0)
+            self.assertNotIn("CRITIC FINDINGS", state.read_text(encoding="utf-8"))
+
+    def test_loop_critic_failure_leaves_iteration_unreviewed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            worker, _ = self._counting_stub(tmp)
+            critic_body = "import sys\nsys.stdin.read()\nprint('half a review')\nsys.exit(1)\n"
+            env = self._critic_env(tmp, critic_body, worker)
+            code, stdout, stderr = self.run_cli(
+                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            # A failed critic call must not invent findings — and must not
+            # fail the loop.
+            self.assertEqual(summary["critic_reviews"], 1)
+            self.assertEqual(summary["critic_findings"], 0)
+            self.assertIn("critic call failed", stderr)
+            self.assertNotIn("CRITIC FINDINGS", state.read_text(encoding="utf-8"))
+
+    def test_loop_critic_never_gates_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".yoyo" / "loop-state.md"
+            worker = self._done_each_call_stub(tmp, state)
+            critic_body = "import sys\nsys.stdin.read()\nprint('this would be a finding')\n"
+            env = self._critic_env(tmp, critic_body, worker)
+            code, stdout, stderr = self.run_cli(
+                ["loop", "worker", "--cwd", tmp, "--max-iter", "5", "--critic", "criticbot", "--json", "finish now"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            # DONE on iteration 1 ends the loop before any critic review: the
+            # critic is advisory iteration fuel, never a completion gate.
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(summary["iterations"], 1)
+            self.assertEqual(summary["critic_reviews"], 0)
+            self.assertFalse(summary["verified"])
+
+    def test_loop_critic_unknown_agent_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command, _ = self._counting_stub(tmp)
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            code, _, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--critic", "nope", "do it"],
+                env=env,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("Unknown critic agent", stderr)
 
     def test_loop_dry_run_shows_spec_block_and_completion_check(self):
         with tempfile.TemporaryDirectory() as tmp:

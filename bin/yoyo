@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch stalls early on agents that stream output.
@@ -176,6 +176,47 @@ What changed (git diff HEAD; may be empty if the work was already committed):
 List anything missing, broken, or unverified. Then end your reply with exactly
 one line — either "VERDICT: PASS" if the goal is fully and correctly met, or
 "VERDICT: FAIL" if anything is incomplete or unproven."""
+
+
+# The per-iteration critic is the checker's sibling with the opposite job:
+# instead of gating a DONE claim at the end, it reviews each iteration's diff
+# while the loop is still running and appends findings to the state file,
+# where the next fresh context treats them as work. Findings are untrusted
+# text — they never gate control flow. The only thing yoyo parses is the
+# explicitly-demanded NO FINDINGS marker, so a clean review appends nothing.
+LOOP_CRITIC_PROMPT = """You are an INDEPENDENT critic reviewing one iteration of a fresh-context
+loop. A different agent just finished an increment of work toward the goal
+below. You did not write this code and must not assume it is correct. Review
+ONLY this iteration's changes for concrete problems: correctness bugs, broken
+or missing edge cases, spec violations, incomplete work presented as complete,
+and drift from the goal. Read the repository at {cwd} when the diff alone is
+ambiguous.
+
+GOAL:
+{task}
+{spec_block}
+What changed this iteration (committed or not):
+<diff>
+{diff}
+</diff>
+
+Report each finding as a short paragraph with file/line references, ordered by
+severity, concrete enough to act on. No style nits, no praise, no summary of
+what the diff does. If nothing substantive is wrong, reply with exactly one
+line: NO FINDINGS"""
+
+
+# Injected into the worker prompt's stable prefix when --critic is active, so
+# every fresh context knows where CRITIC FINDINGS blocks come from and what to
+# do with them. The critic name is constant for the whole loop, so this block
+# stays byte-identical across iterations and can prefix-cache.
+LOOP_CRITIC_BLOCK = """=== INDEPENDENT CRITIC ===
+After each iteration, an independent agent ({critic}) reviews that iteration's
+diff and appends findings to the state file under "## CRITIC FINDINGS".
+Findings are evidence, not truth: address each one — or record in the state
+file why it is wrong — before starting new work, and drop resolved findings
+when you rewrite the state file.
+=== END INDEPENDENT CRITIC ==="""
 
 
 @dataclass(frozen=True)
@@ -3466,6 +3507,98 @@ def run_loop_checker(
     return {"pass": passed, "verdict": verdict, "exit_code": exit_code, "cost_usd": cost, "tail": text.strip()[-800:]}
 
 
+def loop_git_head(cwd: Path) -> str | None:
+    code, out = git_capture(["git", "rev-parse", "HEAD"], cwd)
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def loop_iteration_git_diff(cwd: Path, pre_head: str | None) -> str:
+    """This iteration's changes: the diff against the pre-iteration HEAD.
+
+    Diffing against the commit recorded before the iteration keeps work the
+    iteration committed visible to the critic; with no recorded HEAD (no git,
+    unborn branch) fall back to the uncommitted diff.
+    """
+    if pre_head is None:
+        return loop_git_diff(cwd)
+    code, diff = git_capture(["git", "diff", pre_head], cwd)
+    return diff if code == 0 else loop_git_diff(cwd)
+
+
+def critic_no_findings(text: str) -> bool:
+    """True when the critic's reply ends with the explicitly-demanded NO FINDINGS marker.
+
+    Only the last non-empty line is inspected — the same one-blessed-marker
+    rule as parse_checker_verdict; surrounding prose is never graded.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return bool(lines) and lines[-1].upper().rstrip(".") == "NO FINDINGS"
+
+
+# The findings block must stay bounded: it lands in the agent-maintained state
+# file, and an unbounded review would dominate every later iteration's reading.
+CRITIC_FINDINGS_MAX_CHARS = 8000
+
+
+def format_critic_findings(iteration: int, critic_name: str, findings: str) -> str:
+    body = findings.strip()
+    if len(body) > CRITIC_FINDINGS_MAX_CHARS:
+        body = body[:CRITIC_FINDINGS_MAX_CHARS] + "\n[findings truncated by yoyo loop]"
+    return (
+        f"## CRITIC FINDINGS (iteration {iteration}, independent review by {critic_name})\n"
+        f"{body}\n"
+        "(Address each finding — or record here why it is wrong — before new work.)"
+    )
+
+
+def append_loop_state(state_path: Path, block: str) -> None:
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    state_path.write_text(text.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
+
+
+def run_loop_critic(
+    args: argparse.Namespace,
+    critic_name: str,
+    critic_model: str | None,
+    agents: dict[str, AgentSpec],
+    task: str,
+    spec_text: str | None,
+    pre_head: str | None,
+    trace_suffix: str,
+) -> dict[str, Any]:
+    """Independent, read-only review of one iteration's diff, blind to the worker's prose.
+
+    Advisory by design: the result carries findings text (or None), and the
+    caller only ever appends it to the state file — it never gates control flow.
+    """
+    cwd = resolve_cwd(args.cwd)
+    diff = loop_iteration_git_diff(cwd, pre_head)
+    if not diff.strip():
+        diff = "(no diff detected for this iteration; inspect the repository directly)"
+    encoded = diff.encode("utf-8")
+    if len(encoded) > args.max_input_bytes:
+        diff = encoded[: args.max_input_bytes].decode("utf-8", errors="replace") + "\n[diff truncated by yoyo loop]"
+    spec_block = ("\n" + LOOP_SPEC_BLOCK.format(spec=spec_text) + "\n") if spec_text else ""
+    prompt_text = LOOP_CRITIC_PROMPT.format(cwd=cwd, task=task, spec_block=spec_block, diff=diff)
+    critic_spec = agents[critic_name]
+    call_args = checker_call_args(args, critic_name, critic_model, critic_spec, prompt_text, trace_suffix)
+    result = execute_agent_call(critic_name, call_args, build_prompt(call_args), agents)
+    text = str(result.get("stdout", ""))
+    cost: float | None = None
+    extracted = extract_loop_usage(critic_spec, text)
+    if extracted is not None:
+        text, cost, _ = extracted
+    exit_code = int(result.get("exit_code", 1))
+    ok = exit_code == 0
+    # A failed critic call yields no findings — the iteration simply goes
+    # unreviewed (reported on stderr); it must never invent work.
+    findings = None if (not ok or critic_no_findings(text)) else text.strip()
+    return {"ok": ok, "exit_code": exit_code, "cost_usd": cost, "findings": findings}
+
+
 def loop_gate_records(gate_cmds: list[str], cwd: Path, timeout: float) -> tuple[list[dict[str, Any]], int]:
     results: list[dict[str, Any]] = []
     for index, run in enumerate(gate_cmds):
@@ -3571,6 +3704,7 @@ def loop_iteration_args(
     queue_path: Path | None = None,
     queue_text: str | None = None,
     brief_text: str | None = None,
+    critic_name: str | None = None,
 ) -> argparse.Namespace:
     # Stable blocks first, per-iteration content last: everything before the
     # queue block is byte-identical across iterations, so it can prefix-cache.
@@ -3580,6 +3714,8 @@ def loop_iteration_args(
     if brief_text:
         parts.append(LOOP_BRIEF_BLOCK.format(brief=brief_text))
     parts.append(LOOP_PROTOCOL.format(state_path=state_path, task=task))
+    if critic_name:
+        parts.append(LOOP_CRITIC_BLOCK.format(critic=critic_name))
     if verifiers:
         parts.append(LOOP_COMPLETION_CHECK.format(verifiers=verifiers))
     if queue_path is not None and queue_text:
@@ -3657,6 +3793,11 @@ def loop_summary_line(summary: dict[str, Any]) -> str:
     reject_note = ""
     if gate_failures or checker_rejections:
         reject_note = f", rejected done: {gate_failures} gate / {checker_rejections} checker"
+    if summary.get("critic"):
+        reject_note += (
+            f", critic findings on {summary.get('critic_findings') or 0}"
+            f"/{summary.get('critic_reviews') or 0} reviewed iterations"
+        )
     return (
         f"loop {summary.get('loop_id')}: {summary.get('end_reason')}{verify_note} after "
         f"{summary.get('iterations')} iterations{cost_note}{reject_note}, state {summary.get('state')}"
@@ -3754,7 +3895,9 @@ def cmd_loop(args: argparse.Namespace) -> int:
         rotation_spec = agents[name]
         command_for_agent(
             rotation_spec,
-            loop_iteration_args(args, 1, rotation_spec, task, state_path, spec_text, verifiers, agent_name=name),
+            loop_iteration_args(
+                args, 1, rotation_spec, task, state_path, spec_text, verifiers, agent_name=name, critic_name=args.critic
+            ),
         )
     if args.checker:
         if args.checker not in agents:
@@ -3765,6 +3908,20 @@ def cmd_loop(args: argparse.Namespace) -> int:
             agents[args.checker],
             checker_call_args(args, args.checker, args.checker_model, agents[args.checker], "probe", "probe"),
         )
+    if args.critic:
+        if args.critic not in agents:
+            known = ", ".join(sorted(agents))
+            raise YoyoError(f"Unknown critic agent {args.critic!r}. Known agents: {known}")
+        # The critic always runs read-only; fail loudly now if that can't be enforced.
+        command_for_agent(
+            agents[args.critic],
+            checker_call_args(args, args.critic, args.critic_model, agents[args.critic], "probe", "probe"),
+        )
+        if set(loop_agents) == {args.critic}:
+            eprint(
+                "warning: --critic is the same agent as the worker; "
+                "a different vendor catches failure modes the author's model shares"
+            )
     guard_loop_state_task(state_path, task)
 
     if args.dry_run:
@@ -3772,7 +3929,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
         iter_args = loop_iteration_args(
             args, 1, agents[first_agent], task, state_path, spec_text, verifiers, agent_name=first_agent,
             queue_path=queue_path, queue_text=read_loop_queue(queue_path, args.max_input_bytes),
-            brief_text=read_loop_brief(brief_path, args.max_input_bytes),
+            brief_text=read_loop_brief(brief_path, args.max_input_bytes), critic_name=args.critic,
         )
         prompt = build_prompt(iter_args)
         result = execute_agent_call(first_agent, iter_args, prompt, agents)
@@ -3818,6 +3975,8 @@ def cmd_loop(args: argparse.Namespace) -> int:
         gate_failures = 0
         checker_rejections = 0
         queue_rejections = 0
+        critic_reviews = 0
+        critic_findings_count = 0
         iterations_run = 0
         end_reason = "max-iter"
         rows: list[dict[str, Any]] = []
@@ -3886,8 +4045,11 @@ def cmd_loop(args: argparse.Namespace) -> int:
             iter_args = loop_iteration_args(
                 args, iteration, iter_spec, task, state_path, current_spec_text, verifiers, agent_name=iter_agent,
                 queue_path=queue_path, queue_text=read_loop_queue(queue_path, args.max_input_bytes),
-                brief_text=read_loop_brief(brief_path, args.max_input_bytes),
+                brief_text=read_loop_brief(brief_path, args.max_input_bytes), critic_name=args.critic,
             )
+            # Recorded before the worker runs so the critic can see exactly this
+            # iteration's changes, including any commits the worker makes.
+            pre_head = loop_git_head(resolve_cwd(args.cwd)) if args.critic else None
             prompt = build_prompt(iter_args)
             started = utc_now()
             result = execute_agent_call(iter_agent, iter_args, prompt, agents)
@@ -3945,6 +4107,38 @@ def cmd_loop(args: argparse.Namespace) -> int:
             if consecutive_failures >= args.max_fail:
                 end_reason = "max-fail"
                 break
+            # The critic reviews an iteration only when a next iteration exists
+            # to consume its findings — it feeds the loop, it never ends it.
+            # (Terminal quality belongs to --gate/--checker.) Failed iterations
+            # go unreviewed: there is no coherent increment to critique.
+            if args.critic and ok and iteration < args.max_iter:
+                critic_result = run_loop_critic(
+                    args, args.critic, args.critic_model, agents, task, current_spec_text, pre_head,
+                    f"{iteration}:critic",
+                )
+                critic_reviews += 1
+                critic_cost = critic_result.get("cost_usd")
+                if isinstance(critic_cost, (int, float)) and not isinstance(critic_cost, bool):
+                    total_cost += float(critic_cost)
+                    cost_known = True
+                findings = critic_result.get("findings")
+                if findings:
+                    critic_findings_count += 1
+                    append_loop_state(state_path, format_critic_findings(iteration, args.critic, findings))
+                    eprint(f"loop {args.trace_id}: critic ({args.critic}) filed findings on iteration {iteration}")
+                elif not critic_result.get("ok"):
+                    eprint(
+                        f"loop {args.trace_id}: critic call failed (exit {critic_result.get('exit_code')}); "
+                        f"iteration {iteration} goes unreviewed"
+                    )
+                rows[-1]["critic"] = {
+                    "exit_code": critic_result.get("exit_code"),
+                    "findings": bool(findings),
+                    "cost_usd": critic_cost,
+                }
+                if args.budget_usd is not None and cost_known and total_cost >= args.budget_usd:
+                    end_reason = "budget"
+                    break
             if args.interval and iteration < args.max_iter:
                 time.sleep(args.interval)
     finally:
@@ -3964,6 +4158,9 @@ def cmd_loop(args: argparse.Namespace) -> int:
         "gate_failures": gate_failures,
         "checker_rejections": checker_rejections,
         "queue_rejections": queue_rejections,
+        "critic": args.critic,
+        "critic_reviews": critic_reviews,
+        "critic_findings": critic_findings_count,
         "queue": str(queue_path) if queue_path is not None else None,
         "total_cost_usd": round(total_cost, 4) if cost_known else None,
         "exit_code": exit_code,
@@ -5119,6 +5316,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent that independently verifies completion, blind to the worker's state-file prose (judges goal + git diff + repo, read-only). Implies a checker done-policy.",
     )
     loop.add_argument("--checker-model", help="Model for the --checker agent (recommend a cheaper tier than the worker, e.g. sonnet; not Haiku for completion judgment)")
+    loop.add_argument(
+        "--critic",
+        help="Agent that independently reviews EACH iteration's diff (read-only, blind to the worker's prose) and appends concrete findings to the state file, where the next fresh iteration picks them up as work. Advisory only — findings never gate DONE; pair with --gate/--checker for verified completion. Prefer a different vendor than the worker.",
+    )
+    loop.add_argument("--critic-model", help="Model for the --critic agent (a cheaper tier than the worker is usually fine)")
     loop.add_argument(
         "--spec",
         help="Immutable standing-spec file re-read every iteration and never rewritten (fights goal drift); distinct from the mutable --state file",

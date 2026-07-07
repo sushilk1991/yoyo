@@ -91,6 +91,8 @@ For itemizable work, `--queue tasks.md` (a `- [ ] item` checklist) makes each it
 
 For unattended loops, make DONE earn it: `--gate "pytest -q"` (repeatable; closed-form evidence only) and/or `--checker codex` (independent read-only verdict, blind to the worker's prose). `--spec FILE` pins immutable constraints that the lossy state rewrite would otherwise drop. Cost levers for claude workers: `--model sonnet` or `--agent-arg=--effort=low`, plus `--agent-arg=--setting-sources=project`.
 
+`--critic codex` adds a cross-vendor write → review → revise cycle: after each iteration, an independent read-only critic (prefer a different vendor than the worker) reviews that iteration's diff and appends concrete findings to the state file, which the next fresh iteration is instructed to address before new work. Advisory only — findings never gate DONE; keep `--gate`/`--checker` for verified completion. This is the default reach when the goal is maximum code quality rather than just completion.
+
 `yoyo cron` makes any yoyo command recurring via the user's crontab — no daemon. The natural pairing is a scheduled loop: state file carries progress between runs, the flock prevents overlap, and a verified DONE makes later runs no-ops. `yoyo cron list` / `rm <name>` / `run <name>` manage entries; output lands in the entry's log file. Only schedule work the human asked to keep running, and give it a gate or checker — unattended self-grading drifts.
 
 ## Verify, then trust

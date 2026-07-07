@@ -53,6 +53,11 @@ yoyo loop codex,claude --cwd "$PWD" --max-iter 30 --gate "pytest -q" "Fix the fa
 # repo knowledge so fresh contexts stop re-deriving it.
 yoyo loop claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --gate "pytest -q" "Work the queue."
 
+# Write → review → revise, cross-vendor: after each iteration an independent
+# critic reviews that iteration's diff and its findings become the next
+# iteration's work list. Advisory only — the gate still decides DONE.
+yoyo loop claude --cwd "$PWD" --critic codex --gate "pytest -q" "Implement the parser per SPEC.md."
+
 # Schedule it. The loop picks up where it left off, every night, until it's verifiably done.
 yoyo cron add nightly --schedule "0 2 * * *" --cwd "$PWD" -- loop claude --max-iter 5 --gate "pytest -q" "Work through TODO.md"
 
@@ -84,7 +89,7 @@ Custom agents are a JSON entry away. Check everything works with `yoyo doctor --
 | `yoyo ask <agent(s)> "..."` | One call — or a parallel best-of-n fan-out with `--judge` |
 | `yoyo review` | Cross-vendor consensus review of the current git diff (`--stance unanimous\|any` precision/recall dial) |
 | `yoyo research "..."` | Parallel perspectives (lenses fully yours to define) → decision brief |
-| `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with opt-in gates/checkers |
+| `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with opt-in gates/checkers and a per-iteration cross-vendor `--critic` |
 | `yoyo cron add/list/rm/run` | Schedule any yoyo command via crontab — no daemon |
 | `yoyo workflow <name>` | Rerun a saved multi-agent pipeline by name |
 | `yoyo chat` / `--session` / `--background` | Interactive, durable, and detached calls (`--background` on every long-running command) |

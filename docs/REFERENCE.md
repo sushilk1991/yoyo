@@ -121,6 +121,18 @@ By default the agent grades its own `STATUS: DONE`, which drifts toward "done en
 - **`--done-policy`** (`worker`/`gate`/`checker`/`gate+checker`) is auto-derived from the flags.
 - **`--spec PATH`**: a standing spec re-read every iteration and never rewritten — holds constraints the lossy state rewrite would otherwise drop.
 
+### Per-iteration critic (`--critic AGENT`)
+
+Gates and the checker only judge the *end*; nothing pushes back while the work is happening. `--critic` closes that gap with a write → review → revise cycle across vendors:
+
+```bash
+yoyo loop claude --cwd "$PWD" --critic codex --gate "pytest -q" "Implement the parser per SPEC.md."
+```
+
+After each successful iteration (when a next iteration exists to consume the result), the critic — independent, **read-only**, blind to the worker's state-file prose — reviews *that iteration's diff* (taken against the pre-iteration HEAD, so mid-iteration commits stay visible) against the goal and `--spec`, and its concrete findings are appended to the state file under `## CRITIC FINDINGS`. The next fresh context is instructed to address each finding — or record why it's wrong — before new work. A clean review replies with the one blessed `NO FINDINGS` marker and appends nothing; that marker is the only thing yoyo parses.
+
+The critic is **advisory by design**: findings never gate `STATUS: DONE` — completion verification stays with `--gate`/`--checker` (pair them for a verified end state). A failed critic call leaves the iteration unreviewed (stderr notes it) and never fails the loop. Critic cost counts toward `--budget-usd`; the summary reports `critic_reviews`/`critic_findings` and each run row records the critic outcome. `--critic-model` picks the tier. Prefer a different vendor than the worker — same-vendor criticism shares the author's blind spots (yoyo warns if they match).
+
 State-file guards: a `.task` sidecar makes reusing a state file recorded for a different task fail loudly; a leftover `STOP` file is cleared at startup; a `.lock` (flock) rejects a second concurrent loop. For claude, iterations run with `--output-format json` so cost is real.
 
 **Cost levers:** for mechanical work pass `--model sonnet` (or keep Opus with `--agent-arg=--effort=low`), and add `--agent-arg=--setting-sources=project` to drop user-level config (one measured setup: $0.94 → $0.15 per iteration).
