@@ -19,6 +19,8 @@ Core trio (battle-tested, support `--session` follow-ups):
 
 On demand, one-shot only (`--session` rejected): `cursor` (cross-vendor model picker, needs Cursor auth), `agy` (Google Antigravity — **full-access only**, can't be a reviewer/checker or take `--read-only`), `grok` (xAI — a fourth vendor for adversarial tiebreaks). Reach for these when vendor diversity is the point: a third vendor breaks a tie better than a second call to the same model family, and an adversarial review is more credible from a vendor that didn't write the code.
 
+Each agent runs whatever model its own CLI is configured to use (codex reads `~/.codex/config.toml`, claude reads `~/.claude/settings.json`); yoyo adds no model flag unless you pass `--model`, which forwards to any agent.
+
 Probe health with `yoyo doctor --live --agent <name>`.
 
 ## The primitives
@@ -70,6 +72,49 @@ The powerful pattern is not one big command — it's you in the loop between sma
 5. Repeat. Each step's shape comes from the previous step's result, not from a plan fixed up front.
 
 Prefer being the judge yourself when you hold the decision context; use `--judge` when you want an independent one. For research, `--no-synthesis` returns the raw perspectives so you synthesize them with everything else you know.
+
+### Hard problems: multi-round search discipline
+
+When the task is a genuine search — a bug nobody can find, a design with no obvious route, "make X work at all" — one wave of fan-out is not enough. Run rounds, and as the root orchestrator:
+
+- **Track approach families, not agents.** Classify each delegate's attempt by the underlying idea, not its wording. When several converge on one family, redirect the next calls toward underexplored formulations instead of sampling the same basin again.
+- **Don't let the elegant route dominate.** An approach that reduces the problem to a sub-problem of equal difficulty has made no progress; say so in the state you carry between rounds.
+- **Mark blocked routes and keep them blocked.** Once a route stalls on a hard missing piece, assign no more agents to it unless someone proposes a materially new mechanism — not a rewording of the old one.
+- **Keep incompatible routes alive across rounds.** Cross-pollinate only after independent development has exposed each route's real strengths and gaps; merging too early collapses the diversity that made the fan-out worth paying for.
+- **Don't stop after the first wave fails.** Synthesize, challenge, redirect, launch the next round. Failed waves narrow the space — that's the product.
+
+### Prompting a codex (or any) delegate hard
+
+The per-call prompt patterns that make the above work:
+
+- **Demand concrete artifacts, ban status reports.** "Return the failing input, the patch, or the counterexample — not progress notes." Reject "this part is routine", vague optimism, and unproved claims stated as done.
+- **State the return contract explicitly.** "Return only when X is achieved and survives your own adversarial check; otherwise return the strongest verified partial result and its exact remaining gap" — never a best-effort summary. Without this, delegates return early with plausible prose.
+- **Give an explicit persistence budget.** Codex especially calibrates effort to the prompt: "keep working until the gate passes; do not return because the first approaches failed" produces materially longer, deeper runs than an unadorned ask. Pair generous budgets with `--background` and an `--idle-timeout` guard rather than shortening the ask.
+- **Enumerate the known failure modes as an adversarial checklist.** Generic "check your work" is weak; "check for A, B, C" (the specific ways this class of answer goes wrong — off-by-one at boundaries, warm-vs-cold path, both themes) is what makes an adversarial pass bite.
+- **Scope external search.** Allow lookup of background/standard material, forbid searching for the answer itself when you want independent reasoning you can compare across vendors.
+
+### Prompting a claude delegate
+
+`claude -p` runs a full agentic session per call — it explores, edits, runs commands, and stops when the work *looks* done. Prompt it like a work order, not a chat message:
+
+- **Scope precisely.** Name the files/dirs, the scenario, and the exclusions: "write a test for foo.py covering the logged-out edge case; avoid mocks" beats "add tests for foo.py". Point to an exemplar in the repo ("follow the pattern in HotDogWidget.php") instead of describing conventions.
+- **Give it a check it can run, and ask it to iterate until the check passes.** "Looks done" is claude's only stop signal unless you hand it one: a test command, a build, a script that diffs output against a fixture. This is what `--gate` mechanizes in loops; inline it in the prompt for one-shot asks.
+- **For bugs: symptom, likely location, and what "fixed" looks like** — and ask for a failing test that reproduces the issue before the fix.
+- **Demand evidence, not assertions**: the exact commands run and their output, file/line pointers, the test results. Reviewing evidence beats re-verifying, and it's how you catch a delegate that stopped at "plausible".
+- **Big asks: split explore/plan from implement.** Ask for the plan and file list first, read it, then send "implement your plan" as the follow-up (`--session` keeps the context). One-sentence-diff tasks skip the plan.
+- **Cost/latency**: every `claude -p` call re-reads the user's full harness context (~40k tokens here). For mechanical work, `--agent-arg=--setting-sources=project` and/or `--model sonnet` cut most of it.
+
+### Callers with short tool budgets
+
+If you are an agent calling yoyo through an exec tool with its own timeout (codex's shell tool yields in tens of seconds; a claude delegate legitimately runs many minutes), a foreground `yoyo ask` will outlive your budget and look hung. Two facts: `claude -p` **buffers all stdout until completion** — zero bytes mid-run is normal, not a hang — and yoyo's 20s heartbeat goes to stderr, which your harness may not surface. Never conclude "timed out, no output" from a killed foreground call. Instead:
+
+```bash
+run_id=$(yoyo ask claude --cwd "$PWD" --background "...")
+yoyo wait "$run_id" --timeout 25   # exit 124 = still running: call wait again
+                                   # exit 0 = done, output printed; other = real failure
+```
+
+Repeat the short `wait` as many times as needed; don't raise your own tool timeout, don't kill the run, and report a cut-off review as *unavailable*, never as passed.
 
 **Agent-to-agent communication is you.** Agents don't need a direct channel to each other — the orchestrator is the message bus, and that's a feature: you filter, verify, and decide what crosses. The plumbing: `--session <name>` holds a durable bilateral conversation with one agent; a state/brief file is the shared memory two agents both read (`--file` it into the next call); piping one call's output into the next (`yoyo ask a ... | yoyo ask b --read-only "critique this"`) is a handoff with you able to inspect the seam. Wire agents directly to each other and you've built an unsupervised loop — exactly where delegation drifts.
 
