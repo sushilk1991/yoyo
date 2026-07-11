@@ -24,11 +24,18 @@ sys.modules[spec.name] = yoyo
 spec.loader.exec_module(yoyo)
 
 
-class YoyoTests(unittest.TestCase):
+class CliTestCase(unittest.TestCase):
+    def setUp(self):
+        # Isolate the runs ledger: agent-calling tests journal every call,
+        # and must never write into the developer's real state dir.
+        self._state_guard = tempfile.TemporaryDirectory(prefix="yoyo-test-state-")
+        self.addCleanup(self._state_guard.cleanup)
+
     def run_cli(self, argv, *, stdin="", env=None):
         stdout = io.StringIO()
         stderr = io.StringIO()
         merged_env = os.environ.copy()
+        merged_env.setdefault("YOYO_STATE_DIR", self._state_guard.name)
         # Deterministic default-skill behavior regardless of the host shell:
         # tests opt into default injection explicitly. A value of None removes
         # the variable entirely (exercising the built-in default).
@@ -42,11 +49,13 @@ class YoyoTests(unittest.TestCase):
                     code = yoyo.main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
+
+class YoyoTests(CliTestCase):
     def test_version_outputs_current_release(self):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.20.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.21.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -4776,6 +4785,202 @@ class YoyoTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             payload = json.loads(stdout)
             self.assertIn("through the lens of developer experience", payload["prompt"])
+
+
+class SkillGuardTests(CliTestCase):
+    """The SKILL.md files are yoyo's interface to calling agents.
+
+    A load-bearing section silently dropped in a rewrite broke codex's
+    calling pattern for a month (v0.9.1 removed the caller-budget guidance).
+    These anchors pin the *contracts*, not the phrasing: a rewrite may
+    restructure freely but must keep teaching each of these.
+    """
+
+    SKILL_PATH = ROOT / "skills" / "yoyo" / "SKILL.md"
+    LOAD_BEARING_ANCHORS = {
+        "short-budget callers must be taught background+wait": "Callers with short tool budgets",
+        "the poll recipe agents copy verbatim": "yoyo wait",
+        "exit 124 means still-running, keep waiting": "124",
+        "claude silence is buffering, not a hang": "buffers all stdout until completion",
+        "reviews and untrusted input run read-only": "--read-only",
+        "a cut-off review is unavailable, never passed": "never as passed",
+    }
+
+    def test_skill_keeps_load_bearing_sections(self):
+        text = self.SKILL_PATH.read_text(encoding="utf-8")
+        missing = [why for why, anchor in self.LOAD_BEARING_ANCHORS.items() if anchor not in text]
+        self.assertEqual(missing, [], f"SKILL.md lost load-bearing content: {missing}")
+
+    def test_doctor_flags_out_of_sync_skill_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            stale = home / ".codex" / "skills" / "yoyo"
+            stale.mkdir(parents=True)
+            (stale / "SKILL.md").write_text("# stale copy\n", encoding="utf-8")
+            fresh = home / ".claude" / "skills" / "yoyo"
+            fresh.mkdir(parents=True)
+            (fresh / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skill yoyo: OUT OF SYNC", stdout)
+            self.assertIn(str(stale / "SKILL.md"), stdout)
+
+            code, stdout, _ = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 1, "drifted skill copies must fail doctor --strict")
+
+    def test_doctor_reports_in_sync_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            target = home / ".claude" / "skills" / "yoyo"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 0, stderr + stdout)
+            self.assertIn("skill yoyo: in sync (1 homes)", stdout)
+
+
+class CallJournalTests(CliTestCase):
+    """Every foreground agent call must be reconstructable after the fact."""
+
+    ECHO_AGENT = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdin.read(); print('hi')\""}
+
+    def _runs(self, state_dir):
+        root = Path(state_dir) / "runs"
+        return sorted([p for p in root.iterdir() if p.is_dir()]) if root.is_dir() else []
+
+    def test_foreground_call_is_journaled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(self.ECHO_AGENT, YOYO_STATE_DIR=tmp)
+            code, stdout, stderr = self.run_cli(["ask", "echo", "ping"], env=env)
+            self.assertEqual(code, 0, stderr)
+
+            runs = self._runs(tmp)
+            self.assertEqual(len(runs), 1)
+            meta = json.loads((runs[0] / "meta.json").read_text())
+            self.assertEqual(meta["mode"], "call")
+            self.assertEqual(meta["agent"], "echo")
+            result = json.loads((runs[0] / "result.json").read_text())
+            self.assertEqual(result["exit_code"], 0)
+            self.assertGreater(result["stdout_bytes"], 0)
+            self.assertTrue((runs[0] / "stdout.txt").exists())
+
+    def test_journal_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(self.ECHO_AGENT, YOYO_STATE_DIR=tmp, YOYO_NO_CALL_JOURNAL="1")
+            code, _, stderr = self.run_cli(["ask", "echo", "ping"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(self._runs(tmp), [])
+
+    def test_dry_run_is_not_journaled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(self.ECHO_AGENT, YOYO_STATE_DIR=tmp)
+            code, _, stderr = self.run_cli(["ask", "echo", "--dry-run", "ping"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(self._runs(tmp), [])
+
+
+class AutopsyTests(CliTestCase):
+    def _make_run(self, state_dir, run_id, meta, result=None, files=None):
+        run_dir = Path(state_dir) / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        if result is not None:
+            (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        for name, content in (files or {}).items():
+            (run_dir / name).write_text(content, encoding="utf-8")
+        return run_dir
+
+    def test_autopsy_completed_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdin.read(); print('hi')\"", "YOYO_STATE_DIR": tmp}
+            code, _, stderr = self.run_cli(["ask", "echo", "ping"], env=env)
+            self.assertEqual(code, 0, stderr)
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("completed successfully", stdout)
+
+    def test_autopsy_explains_hard_killed_claude_call(self):
+        # The exact scenario that caused repeated misdiagnosis: a caller's
+        # exec-tool timeout SIGKILLs yoyo mid-claude-call; claude had written
+        # nothing to stdout (it buffers); the caller concludes "timed out,
+        # no output". The autopsy must say what actually happened.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp,
+                "20260711T120000-deadbeef",
+                {
+                    "run_id": "20260711T120000-deadbeef",
+                    "mode": "call",
+                    "agent": "claude",
+                    "pid": 99999999,
+                    "started_at": "2026-07-11T12:00:00Z",
+                },
+                files={"stdout.txt": "", "stderr.txt": "yoyo: still running, 20s elapsed\n"},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("died without recording a result", payload["verdict"])
+            self.assertTrue(any("buffers all stdout" in note for note in payload["notes"]))
+            self.assertTrue(any("--background" in line for line in payload["advice"]))
+
+    def test_autopsy_reports_signal_kill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp,
+                "20260711T120100-cafecafe",
+                {"run_id": "20260711T120100-cafecafe", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-11T12:01:00Z"},
+                result={"exit_code": None, "killed_by_signal": 15, "duration_s": 43.2},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("killed by SIGTERM after 43.2s", stdout)
+
+    def test_autopsy_picks_latest_run_and_accepts_explicit_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260711T110000-00000001",
+                {"run_id": "20260711T110000-00000001", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-11T11:00:00Z"},
+                result={"exit_code": 3, "duration_s": 1.0, "stdout_bytes": 5, "stderr_bytes": 0},
+            )
+            self._make_run(
+                tmp, "20260711T115900-00000002",
+                {"run_id": "20260711T115900-00000002", "mode": "call", "agent": "pi", "pid": 99999999, "started_at": "2026-07-11T11:59:00Z"},
+                result={"exit_code": 0, "duration_s": 2.0, "stdout_bytes": 9, "stderr_bytes": 0},
+            )
+
+            code, stdout, _ = self.run_cli(["runs", "autopsy"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0)
+            self.assertIn("agent:   pi", stdout)
+
+            code, stdout, _ = self.run_cli(["runs", "autopsy", "20260711T110000-00000001", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0)
+            self.assertIn("exit code 3", json.loads(stdout)["verdict"])
 
 
 if __name__ == "__main__":

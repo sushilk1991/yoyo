@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.20.1"
+VERSION = "0.21.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch stalls early on agents that stream output.
@@ -309,6 +309,7 @@ def _install_signal_handlers() -> None:
         return
 
     def handler(signum: int, _frame: Any) -> None:
+        _flush_active_journals(signum)
         _kill_active_children(signal.SIGKILL)
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
@@ -1353,6 +1354,89 @@ def run_summary(run_dir: Path) -> dict[str, Any]:
     }
 
 
+_ACTIVE_JOURNALS_LOCK = threading.Lock()
+_ACTIVE_JOURNALS: dict[str, dict[str, Any]] = {}
+
+
+def call_journal_enabled() -> bool:
+    return os.environ.get("YOYO_NO_CALL_JOURNAL", "") != "1"
+
+
+def journal_call_start(
+    agent_name: str,
+    cmd: list[str],
+    args: argparse.Namespace,
+    cwd: Path,
+) -> Path | None:
+    """Record a foreground agent call in the runs ledger as it executes.
+
+    Foreground calls used to leave no trace: when a caller's harness killed
+    yoyo (a short exec-tool budget hitting a multi-minute delegate), the
+    evidence died with the process and the caller was left guessing. The
+    journal makes every call reconstructable via `yoyo runs autopsy`.
+    Best-effort: a journal failure must never fail the call itself.
+    """
+    if not call_journal_enabled():
+        return None
+    try:
+        root = runs_root()
+        root.mkdir(parents=True, exist_ok=True)
+        run_dir = root / generate_run_id()
+        run_dir.mkdir(mode=0o700)
+        meta = {
+            "run_id": run_dir.name,
+            "mode": "call",
+            "agent": agent_name,
+            "role": getattr(args, "role", None),
+            "cwd": str(cwd),
+            "trace_id": getattr(args, "trace_id", None),
+            "caller": getattr(args, "caller", None),
+            "command": cmd,
+            "pid": os.getpid(),
+            "started_at": iso_utc(utc_now()),
+        }
+        (run_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return None
+    with _ACTIVE_JOURNALS_LOCK:
+        _ACTIVE_JOURNALS[str(run_dir)] = {"run_dir": run_dir, "started": time.monotonic()}
+    return run_dir
+
+
+def journal_call_finish(run_dir: Path | None, payload: dict[str, Any]) -> None:
+    if run_dir is None:
+        return
+    with _ACTIVE_JOURNALS_LOCK:
+        _ACTIVE_JOURNALS.pop(str(run_dir), None)
+    try:
+        (run_dir / "result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _flush_active_journals(signum: int) -> None:
+    """On a fatal signal, stamp every in-flight call journal with the cause.
+
+    This is what lets `yoyo runs autopsy` say "killed by SIGTERM at 43s"
+    instead of leaving a dead record the caller has to interpret.
+    """
+    with _ACTIVE_JOURNALS_LOCK:
+        entries = list(_ACTIVE_JOURNALS.values())
+        _ACTIVE_JOURNALS.clear()
+    for entry in entries:
+        payload = {
+            "exit_code": None,
+            "killed_by_signal": signum,
+            "duration_s": round(time.monotonic() - entry["started"], 3),
+        }
+        try:
+            (entry["run_dir"] / "result.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+
 def background_child_argv(args: argparse.Namespace) -> list[str]:
     raw = list(getattr(args, "_raw_argv", sys.argv[1:]))
     filtered: list[str] = []
@@ -1745,11 +1829,26 @@ def execute_agent_call(
             return result
 
         started = time.monotonic()
-        stdout_path = tmpdir / "stdout.txt"
-        stderr_path = tmpdir / "stderr.txt"
+        journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(agent_name, cmd, args, cwd)
+        # Captures live in the journal dir when one exists, so the evidence
+        # (bytes written so far) survives even if the caller kills yoyo.
+        capture_dir = journal_dir if journal_dir is not None else tmpdir
+        stdout_path = capture_dir / "stdout.txt"
+        stderr_path = capture_dir / "stderr.txt"
         heartbeat = resolve_heartbeat(args)
         idle_timeout = resolve_idle_timeout(args)
         label = f"{agent_name} {args.trace_id}".strip()
+
+        def finish_journal(exit_code: int | None, **extra: Any) -> None:
+            payload: dict[str, Any] = {
+                "exit_code": exit_code,
+                "duration_s": round(time.monotonic() - started, 3),
+                "stdout_bytes": _safe_size(stdout_path),
+                "stderr_bytes": _safe_size(stderr_path),
+            }
+            payload.update(extra)
+            journal_call_finish(journal_dir, payload)
+
         try:
             proc = run_to_files(
                 cmd,
@@ -1763,8 +1862,10 @@ def execute_agent_call(
                 label=label,
             )
         except FileNotFoundError as exc:
+            finish_journal(127, error="agent command not found")
             raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
         except subprocess.TimeoutExpired:
+            finish_journal(124, timed_out=True, timeout_s=args.timeout)
             result = _timeout_result(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Timed out after {args.timeout}s",
@@ -1772,6 +1873,7 @@ def execute_agent_call(
             attach_session_result(args, agents[agent_name], result)
             return result
         except AgentIdleTimeout as exc:
+            finish_journal(124, idle_timed_out=True, idle_seconds=exc.idle_seconds)
             result = _timeout_result(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Idle timeout after {exc.idle_seconds}s with no output "
@@ -1779,6 +1881,7 @@ def execute_agent_call(
             )
             attach_session_result(args, agents[agent_name], result)
             return result
+        finish_journal(proc.returncode)
 
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
@@ -2640,12 +2743,134 @@ def show_run(run_id: str, as_json: bool, *, exit_with_result: bool = False) -> i
     return 3 if status == "running" else 4
 
 
+def latest_run_id() -> str | None:
+    root = runs_root()
+    if not root.is_dir():
+        return None
+    dirs = sorted([path.name for path in root.iterdir() if path.is_dir()], reverse=True)
+    return dirs[0] if dirs else None
+
+
+def signal_name(signum: Any) -> str:
+    try:
+        return signal.Signals(int(signum)).name
+    except (ValueError, TypeError):
+        return f"signal {signum}"
+
+
+def autopsy_run(run_id: str | None, as_json: bool) -> int:
+    """Explain how a run ended, from the recorded evidence.
+
+    Exists for the caller who just saw their tool call die and is about to
+    conclude "the agent timed out with no output": one cheap command that
+    reports what actually happened (finished / killed / still running) with
+    byte counts, instead of leaving the caller to guess from silence.
+    """
+    resolved = run_id or latest_run_id()
+    if resolved is None:
+        raise YoyoError("No runs recorded yet.")
+    run_dir = run_dir_for(resolved)
+    meta = run_meta(run_dir) or {}
+    result = run_result(run_dir)
+    status = run_status(run_dir)
+    agent = meta.get("agent")
+    mode = meta.get("mode") or ("call" if meta.get("command") else "background")
+    started = run_started_at(meta, run_dir)
+
+    def captured_bytes() -> tuple[int, int]:
+        if result is not None and "stdout_bytes" in result:
+            return int(result.get("stdout_bytes") or 0), int(result.get("stderr_bytes") or 0)
+        stdout_size = _safe_size(run_dir / "stdout.txt") or _safe_size(run_dir / "result.json")
+        stderr_size = _safe_size(run_dir / "stderr.txt") or _safe_size(run_dir / "log.txt")
+        return stdout_size, stderr_size
+
+    def last_activity_elapsed() -> float | None:
+        if started is None:
+            return None
+        newest = 0.0
+        for name in ("stdout.txt", "stderr.txt", "result.json", "log.txt", "meta.json"):
+            try:
+                newest = max(newest, (run_dir / name).stat().st_mtime)
+            except OSError:
+                continue
+        return max(0.0, newest - started.timestamp()) if newest else None
+
+    stdout_bytes, stderr_bytes = captured_bytes()
+    verdict: str
+    advice: list[str] = []
+    if result is not None and result.get("killed_by_signal") is not None:
+        sig = signal_name(result.get("killed_by_signal"))
+        duration = result.get("duration_s")
+        verdict = (
+            f"killed by {sig} after {duration}s — yoyo did not fail; something sent it that signal "
+            "(most often the caller's own exec-tool timeout)"
+        )
+        advice.append("If your tool budget is short, rerun with --background and poll: yoyo wait <id> --timeout 25 (repeat while exit 124).")
+    elif status == "done" and result is not None:
+        exit_code = result.get("exit_code")
+        duration = result.get("duration_s")
+        if result.get("timed_out"):
+            verdict = f"hit yoyo's own --timeout ({result.get('timeout_s')}s); exit 124"
+        elif result.get("idle_timed_out"):
+            verdict = f"idle-timeout: no new output for {result.get('idle_seconds')}s; exit 124"
+        elif exit_code == 0:
+            verdict = f"completed successfully in {duration}s"
+        else:
+            verdict = f"finished with exit code {exit_code} in {duration}s — a real agent failure, read the stderr"
+    elif status == "running":
+        elapsed = round(time.time() - started.timestamp(), 1) if started is not None else None
+        verdict = f"still running ({elapsed}s elapsed)" if elapsed is not None else "still running"
+        advice.append("Do not kill it. Poll with: yoyo wait " + resolved + " --timeout 25 (repeat while exit 124).")
+    else:
+        elapsed = last_activity_elapsed()
+        at_note = f" last activity ~{round(elapsed, 1)}s after start;" if elapsed is not None else ""
+        verdict = (
+            f"died without recording a result —{at_note} the yoyo process was killed hard "
+            "(SIGKILL, or the machine/caller took it down) before it could finish"
+        )
+        advice.append("Rerun with --background so the run survives your tool's timeout: yoyo wait <id> --timeout 25 (repeat while exit 124).")
+
+    notes: list[str] = []
+    if agent == "claude" and stdout_bytes == 0 and (result is None or result.get("exit_code") != 0):
+        notes.append("claude -p buffers all stdout until completion: 0 bytes captured mid-run is normal, not a hang.")
+
+    if as_json:
+        print(json.dumps({
+            "run_id": resolved,
+            "agent": agent,
+            "mode": mode,
+            "status": status,
+            "started_at": iso_utc(started) if started is not None else None,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
+            "verdict": verdict,
+            "notes": notes,
+            "advice": advice,
+            "run_dir": str(run_dir),
+        }, ensure_ascii=False))
+        return 0
+
+    print(f"run:     {resolved}")
+    print(f"agent:   {agent or '?'}  (mode: {mode})")
+    if started is not None:
+        print(f"started: {iso_utc(started)}")
+    print(f"output:  {stdout_bytes} bytes stdout, {stderr_bytes} bytes stderr (captured in {run_dir})")
+    print(f"verdict: {verdict}")
+    for note in notes:
+        print(f"note:    {note}")
+    for line in advice:
+        print(f"advice:  {line}")
+    return 0
+
+
 def cmd_runs(args: argparse.Namespace) -> int:
     action = args.runs_action
     if action == "show":
         if not args.run_id:
             raise YoyoError("runs show requires a run_id")
         return show_run(args.run_id, args.json)
+    if action == "autopsy":
+        return autopsy_run(args.run_id, args.json)
     if action == "prune":
         if args.run_id:
             raise YoyoError("runs prune does not accept a run_id")
@@ -4879,6 +5104,7 @@ def doctor(args: argparse.Namespace) -> int:
             print(f"{name}: missing ({spec.command[0]})")
             continue
         print(f"{name}: ok ({found})")
+    failed += doctor_check_skill_sync()
     path = config_path()
     print(f"config: {path} ({'present' if path.exists() else 'not present'})")
     source_path = source_record_path()
@@ -4933,6 +5159,7 @@ def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) ->
         trace_id=f"doctor-{agent}-{mode}",
         quiet=True,
         idle_timeout=None,
+        _no_journal=True,
     )
 
 
@@ -5057,6 +5284,78 @@ def doctor_live(args: argparse.Namespace) -> int:
     return 1 if failed and args.strict else 0
 
 
+def skill_target_roots() -> list[Path]:
+    return [
+        Path("~/.codex/skills").expanduser(),
+        Path("~/.claude/skills").expanduser(),
+        Path("~/.agents/skills").expanduser(),
+        Path("~/.config/opencode/skills").expanduser(),
+        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
+    ]
+
+
+def bundled_skills_source() -> Path | None:
+    """Locate the bundled skills directory, if reachable.
+
+    Mirrors install_skill's resolution, with a fallback to the recorded
+    source repo for the installed binary (which has no skills sibling).
+    """
+    source_env = os.environ.get("YOYO_SKILL_SOURCE")
+    if source_env:
+        path = Path(source_env).expanduser()
+        return path if path.exists() else None
+    sibling = Path(__file__).resolve().parents[1] / "skills"
+    if sibling.exists():
+        return sibling
+    try:
+        recorded = read_recorded_source() / "skills"
+    except YoyoError:
+        return None
+    return recorded if recorded.exists() else None
+
+
+def doctor_check_skill_sync() -> int:
+    """Report installed skill copies that drifted from the bundled source.
+
+    The SKILL.md files ARE yoyo's interface to calling agents; a stale copy
+    in one agent home silently degrades that agent's behavior (this happened:
+    a dropped section broke codex's calling pattern for a month).
+    Returns the number of out-of-sync copies found.
+    """
+    source = bundled_skills_source()
+    if source is None:
+        print("skills: bundled source not found; sync check skipped")
+        return 0
+    skill_dirs = [child for child in sorted(source.iterdir()) if child.is_dir() and (child / "SKILL.md").exists()]
+    drifted = 0
+    for skill_dir in skill_dirs:
+        if skill_dir.name == "fable-mode":
+            continue  # inbuilt: resolved from the bundle, never copied out
+        try:
+            source_text = (skill_dir / "SKILL.md").read_bytes()
+        except OSError:
+            continue
+        stale: list[Path] = []
+        installed = 0
+        for root in skill_target_roots():
+            target = root / skill_dir.name / "SKILL.md"
+            if not target.exists():
+                continue
+            installed += 1
+            try:
+                if target.read_bytes() != source_text:
+                    stale.append(target)
+            except OSError:
+                stale.append(target)
+        if stale:
+            drifted += len(stale)
+            for target in stale:
+                print(f"skill {skill_dir.name}: OUT OF SYNC at {target} (run: yoyo install-skill)")
+        elif installed:
+            print(f"skill {skill_dir.name}: in sync ({installed} homes)")
+    return drifted
+
+
 def install_skill(args: argparse.Namespace) -> int:
     source_env = os.environ.get("YOYO_SKILL_SOURCE")
     if source_env:
@@ -5090,13 +5389,7 @@ def install_skill(args: argparse.Namespace) -> int:
         kept.append(skill_source)
     skill_sources = kept
 
-    target_roots = [
-        Path("~/.codex/skills").expanduser(),
-        Path("~/.claude/skills").expanduser(),
-        Path("~/.agents/skills").expanduser(),
-        Path("~/.config/opencode/skills").expanduser(),
-        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
-    ]
+    target_roots = skill_target_roots()
     for skill_source in skill_sources:
         for target_root in target_roots:
             target = target_root / skill_source.name
@@ -5429,8 +5722,8 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--background", action="store_true", help="Detach the research run and record it in the run ledger (poll with `yoyo wait`)")
     research.set_defaults(func=cmd_research, collect_unknown_prompt=True, use_stdin_context=False)
 
-    runs = sub.add_parser("runs", help="List, show, and prune background run records")
-    runs.add_argument("runs_action", nargs="?", choices=["list", "show", "prune"], default="list")
+    runs = sub.add_parser("runs", help="List, show, autopsy, and prune run records")
+    runs.add_argument("runs_action", nargs="?", choices=["list", "show", "autopsy", "prune"], default="list")
     runs.add_argument("run_id", nargs="?")
     runs.add_argument("--json", action="store_true")
     runs.add_argument("--limit", type=int, default=20)

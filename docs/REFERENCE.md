@@ -169,6 +169,19 @@ yoyo runs prune --days 7
 
 `yoyo wait` exit codes: 124 = still running (wait again); 0 = success (result on stdout); anything else = failed or died. Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`). Argument validation still happens in the foreground, so a bad agent name fails loudly before detaching.
 
+## The call journal and autopsy
+
+Foreground agent calls are journaled into the same ledger as they execute (`meta.json` at start, `result.json` at exit, live stdout/stderr captures in the run dir), so a call killed by its caller leaves evidence instead of vanishing. If yoyo receives SIGINT/SIGTERM/SIGHUP mid-call, the journal records which signal and when.
+
+```bash
+yoyo runs autopsy              # explain how the most recent run ended
+yoyo runs autopsy "$run_id"    # or a specific one; --json for structure
+```
+
+The autopsy states, from recorded evidence, whether the run completed, failed, hit a timeout, was signal-killed (naming the signal and elapsed time), or died hard — plus captured byte counts. Use it before concluding an agent "timed out with no output": most such reports are the caller's own exec-tool budget killing a healthy run (note: `claude -p` writes stdout only at completion, so zero bytes mid-run is normal). Set `YOYO_NO_CALL_JOURNAL=1` to disable journaling; `yoyo runs prune --days N` trims the ledger.
+
+`yoyo doctor` also verifies that the skill copies installed into agent homes (`~/.claude/skills`, `~/.codex/skills`, …) match the bundled source, and flags any drifted copy (`doctor --strict` fails on drift) — the SKILL.md files are yoyo's interface to calling agents, so a stale copy silently degrades that agent's calling patterns.
+
 ## Sessions
 
 `--session <name>` gives a named durable conversation: the first call creates it, later calls continue it with full context.

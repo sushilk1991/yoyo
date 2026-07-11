@@ -116,6 +116,8 @@ yoyo wait "$run_id" --timeout 25   # exit 124 = still running: call wait again
 
 Repeat the short `wait` as many times as needed; don't raise your own tool timeout, don't kill the run, and report a cut-off review as *unavailable*, never as passed.
 
+If a call already died on you (or you're unsure what happened), don't guess: `yoyo runs autopsy` reconstructs the most recent run from recorded evidence — completed, failed, signal-killed (with the signal and elapsed time), or still running — with captured byte counts and the fix.
+
 **Agent-to-agent communication is you.** Agents don't need a direct channel to each other — the orchestrator is the message bus, and that's a feature: you filter, verify, and decide what crosses. The plumbing: `--session <name>` holds a durable bilateral conversation with one agent; a state/brief file is the shared memory two agents both read (`--file` it into the next call); piping one call's output into the next (`yoyo ask a ... | yoyo ask b --read-only "critique this"`) is a handoff with you able to inspect the seam. Wire agents directly to each other and you've built an unsupervised loop — exactly where delegation drifts.
 
 ## Making each call good
