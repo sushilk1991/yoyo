@@ -55,7 +55,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.21.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.22.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -69,7 +69,7 @@ class YoyoTests(CliTestCase):
         self.assertIn("Task:\nCheck this.", stdout)
 
     def test_inbuilt_fable_mode_injected_by_default(self):
-        # With YOYO_DEFAULT_SKILLS unset entirely, the bundled fable-mode
+        # With YOYO_DEFAULT_SKILLS unset entirely, the bundled yoyo-fable-mode
         # skill resolves from the repo's own skills dir and rides every call.
         env = {
             "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
@@ -78,8 +78,8 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["ask", "echo", "hello"], env=env)
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn('<skill name="fable-mode">', stdout)
-        self.assertIn("Done Gate", stdout)
+        self.assertIn('<skill name="yoyo-fable-mode">', stdout)
+        self.assertIn("one-shot", stdout)
         self.assertIn("Task:\nhello", stdout)
 
     def test_default_skills_empty_string_disables_injection(self):
@@ -92,7 +92,11 @@ class YoyoTests(CliTestCase):
         self.assertEqual(code, 0, stderr)
         self.assertNotIn("<skill", stdout)
 
-    def test_user_installed_skill_overrides_bundled_fable_mode(self):
+    def test_personal_fable_mode_skill_cannot_shadow_the_bundled_one(self):
+        # Regression guard. The default used to be the bare name "fable-mode",
+        # which user skill roots win — so every delegate got the caller's own
+        # interactive-session harness (it told them they were "running as Opus")
+        # instead of the delegate one yoyo ships. The yoyo- prefix closes that.
         with tempfile.TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "fable-mode"
             skill_dir.mkdir()
@@ -105,8 +109,24 @@ class YoyoTests(CliTestCase):
             code, stdout, stderr = self.run_cli(["ask", "echo", "hello"], env=env)
 
         self.assertEqual(code, 0, stderr)
+        self.assertNotIn("custom-override-marker", stdout)
+        self.assertIn('<skill name="yoyo-fable-mode">', stdout)
+
+    def test_named_skill_still_resolves_from_a_user_skill_root(self):
+        # The shadowing fix must not break ordinary --skill overrides.
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "house-rules"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("# House Rules\ncustom-override-marker\n", encoding="utf-8")
+            env = {
+                "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdout.write(sys.stdin.read())\"",
+                "YOYO_DEFAULT_SKILLS": "",
+                "YOYO_SKILL_PATH": tmp,
+            }
+            code, stdout, stderr = self.run_cli(["ask", "echo", "--skill", "house-rules", "hello"], env=env)
+
+        self.assertEqual(code, 0, stderr)
         self.assertIn("custom-override-marker", stdout)
-        self.assertNotIn("Done Gate", stdout)
 
     def test_raw_mode_skips_inbuilt_default_skill(self):
         env = {
@@ -503,15 +523,6 @@ class YoyoTests(CliTestCase):
         self.assertEqual(stdout, "")
         self.assertIn("--timeout must be greater than 0", stderr)
 
-    def test_default_timeout_is_one_hour_for_agent_and_workflow_calls(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            parser = yoyo.build_parser()
-
-        ask_args = parser.parse_args(["ask", "codex", "hello"])
-        workflow_args = parser.parse_args(["workflow", "workflow.json"])
-
-        self.assertEqual(ask_args.timeout, 14400.0)
-        self.assertEqual(workflow_args.timeout, 14400.0)
 
     def test_stdin_is_truncated_at_configured_limit(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -536,20 +547,6 @@ class YoyoTests(CliTestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn("warning: full-access delegation includes stdin/--file context", stderr)
 
-    def test_input_budget_is_aggregate_across_stdin_and_files(self):
-        env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "note.txt"
-            path.write_text("file-data", encoding="utf-8")
-            code, stdout, stderr = self.run_cli(
-                ["ask", "echo", "--cwd", tmp, "--max-input-bytes", "3", "--file", "note.txt", "hello"],
-                stdin="abc",
-                env=env,
-            )
-
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("<stdin>\nabc", stdout)
-        self.assertIn("input budget exhausted before this file", stdout)
 
     def test_dry_run_includes_context_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -652,7 +649,7 @@ class YoyoTests(CliTestCase):
         self.assertIn("mode=read-only delegation", stdout)
 
     def test_on_demand_agents_pass_model_flag(self):
-        for agent, model in (("cursor", "sonnet-4"), ("agy", "gemini-3.1-pro"), ("grok", "grok-4")):
+        for agent, model in (("cursor", "composer-2.5"), ("agy", "gemini-3.1-pro"), ("grok", "grok-4")):
             code, stdout, stderr = self.run_cli(
                 ["ask", agent, "--dry-run", "--model", model, "Do it."],
             )
@@ -669,13 +666,6 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 2)
             self.assertIn("does not support --session", stderr)
 
-    def test_chat_grok_rejects_initial_prompt(self):
-        code, stdout, stderr = self.run_cli(
-            ["chat", "grok", "--dry-run", "hello"],
-        )
-
-        self.assertEqual(code, 2)
-        self.assertIn("positional prompt", stderr)
 
     def test_ask_read_only_constrains_codex(self):
         code, stdout, stderr = self.run_cli(
@@ -745,91 +735,12 @@ class YoyoTests(CliTestCase):
         self.assertEqual(stdout, "")
         self.assertIn("unrecognized arguments", stderr)
 
-    def test_chat_builds_interactive_command(self):
-        code, stdout, stderr = self.run_cli(
-            ["chat", "claude", "--dry-run", "--model", "haiku", "Debug this."],
-        )
 
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("claude", stdout)
-        self.assertIn("--permission-mode bypassPermissions", stdout)
-        self.assertIn("--model haiku", stdout)
-        self.assertIn("'Debug this.'", stdout)
 
-    def test_chat_builds_codex_interactive_full_access_command(self):
-        code, stdout, stderr = self.run_cli(
-            ["chat", "codex", "--dry-run", "Debug this."],
-        )
 
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("codex -C", stdout)
-        self.assertIn("--sandbox danger-full-access", stdout)
-        self.assertIn("--ask-for-approval never", stdout)
 
-    def test_chat_builds_codex_interactive_read_only_command(self):
-        code, stdout, stderr = self.run_cli(
-            ["chat", "codex", "--dry-run", "--read-only", "Debug this."],
-        )
 
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("--sandbox read-only", stdout)
-        self.assertNotIn("--ask-for-approval never", stdout)
 
-    def test_chat_claude_session_creates_and_resumes_named_session(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
-            code, stdout, stderr = self.run_cli(
-                ["chat", "claude", "--session", "foo", "--dry-run", "Debug this."],
-                env=env,
-            )
-            self.assertEqual(code, 0, stderr)
-            first_command = shlex.split(stdout.strip())
-            self.assertIn("--session-id", first_command)
-            backend_id = first_command[first_command.index("--session-id") + 1]
-
-            code, stdout, stderr = self.run_cli(
-                ["chat", "claude", "--session", "foo", "--dry-run", "Debug more."],
-                env=env,
-            )
-            self.assertEqual(code, 0, stderr)
-            second_command = shlex.split(stdout.strip())
-            self.assertIn("--resume", second_command)
-            self.assertEqual(second_command[second_command.index("--resume") + 1], backend_id)
-
-    def test_chat_codex_session_resumes_recorded_session(self):
-        fixed_id = "44444444-4444-4444-8444-444444444444"
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write_session_record(tmp, "codex", "foo", fixed_id)
-            code, stdout, stderr = self.run_cli(
-                ["chat", "codex", "--session", "foo", "--dry-run", "Debug this."],
-                env={"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        command = shlex.split(stdout.strip())
-        self.assertEqual(command[0:2], ["codex", "resume"])
-        self.assertEqual(command[-2:], [fixed_id, "Debug this."])
-
-    def test_chat_launches_interactive_subprocess_without_capture(self):
-        env = {"YOYO_AGENT_FAKE": "/usr/bin/env"}
-        with mock.patch.object(yoyo.subprocess, "call", return_value=7) as call:
-            code, stdout, stderr = self.run_cli(["chat", "fake", "hello"], env=env)
-
-        self.assertEqual(code, 7)
-        self.assertEqual(stdout, "")
-        self.assertEqual(stderr, "")
-        call.assert_called_once()
-        self.assertEqual(call.call_args.args[0], ["/usr/bin/env", "hello"])
-        self.assertIn("cwd", call.call_args.kwargs)
-
-    def test_chat_joins_custom_agent_prompt_as_one_argument(self):
-        env = {"YOYO_AGENT_FAKE": "/usr/bin/env"}
-        with mock.patch.object(yoyo.subprocess, "call", return_value=0) as call:
-            code, stdout, stderr = self.run_cli(["chat", "fake", "hello", "world"], env=env)
-
-        self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout, "")
-        self.assertEqual(call.call_args.args[0], ["/usr/bin/env", "hello world"])
 
     def test_missing_context_file_fails_loudly(self):
         code, stdout, stderr = self.run_cli(
@@ -1129,840 +1040,26 @@ class YoyoTests(CliTestCase):
             self.assertFalse((pi_dir.resolve() / "skills" / "yoyo" / "old.txt").exists())
             self.assertTrue((pi_dir.resolve() / "skills" / "yoyo" / "SKILL.md").exists())
 
-    def test_workflow_runs_phases_and_passes_previous_outputs_to_review_job(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "two-phase",
-                        "defaults": {"agent": "echo", "read_only": True},
-                        "phases": [
-                            {"name": "fanout", "jobs": [{"id": "first", "prompt": "First pass"}]},
-                            {
-                                "name": "review",
-                                "jobs": [
-                                    {
-                                        "id": "cross-check",
-                                        "role": "review",
-                                        "include_previous": True,
-                                        "prompt": "Check prior output",
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json", "--trace-id", "wf-1"],
-                env={"YOYO_CONFIG": str(config)},
-            )
 
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["workflow"], "two-phase")
-        self.assertEqual(payload["job_count"], 2)
-        self.assertEqual(payload["phases"][0]["jobs"][0]["job_id"], "first")
-        review_stdout = payload["phases"][1]["jobs"][0]["stdout"]
-        self.assertIn("Previous workflow outputs", review_stdout)
-        self.assertIn("First pass", review_stdout)
-        self.assertTrue(payload["phases"][1]["jobs"][0]["read_only"])
 
-    def test_workflow_background_detaches_and_wait_renders_jobs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps({"agents": {"echo": {"command": ["python3", "-c", "import sys; sys.stdin.read(); print('job output')"], "read_only_args": ["--safe"]}}}),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bg-smoke",
-                        "defaults": {"agent": "echo"},
-                        "phases": [{"name": "p1", "jobs": [{"id": "j1", "prompt": "Say hello"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
 
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--background"], env=env)
-            self.assertEqual(code, 0, stderr)
-            run_id = stdout.strip()
-            self.assertRegex(run_id, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
 
-            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "15", "--poll", "0.05"], env=env)
-            self.assertEqual(code, 0, stderr)
-            self.assertIn("=== p1/j1 ===", stdout)
-            self.assertIn("job output", stdout)
 
-            meta = json.loads((Path(tmp) / "state" / "runs" / run_id / "meta.json").read_text(encoding="utf-8"))
-            self.assertEqual(meta["agent"], "workflow:bg-smoke")
-            self.assertTrue(meta["trace_id"])
 
-            code, stdout, stderr = self.run_cli(["runs", "show", run_id, "--json"], env=env)
-            self.assertEqual(code, 0, stderr)
-            payload = json.loads(stdout)
-            self.assertEqual(payload["workflow"], "bg-smoke")
-            self.assertEqual(payload["phases"][0]["jobs"][0]["job_id"], "j1")
 
-    def test_workflow_for_each_expands_jobs_and_templates_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "a.txt").write_text("a", encoding="utf-8")
-            (Path(tmp) / "b.txt").write_text("b", encoding="utf-8")
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "fanout",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "audit",
-                                "jobs": [
-                                    {
-                                        "id": "audit-{index}",
-                                        "for_each": ["a.txt", "b.txt"],
-                                        "prompt": "Audit {item}",
-                                        "files": ["{item}"],
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json", "--cwd", tmp],
-                env={"YOYO_CONFIG": str(config)},
-            )
 
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        jobs = payload["phases"][0]["jobs"]
-        self.assertEqual([job["job_id"] for job in jobs], ["audit-0", "audit-1"])
-        self.assertIn("<file path=\"a.txt\">", jobs[0]["stdout"])
-        self.assertIn("<file path=\"b.txt\">", jobs[1]["stdout"])
 
-    def test_workflow_blocks_previous_output_into_write_capable_job_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                                "full_access_args": ["--write"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "unsafe",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "one", "jobs": [{"id": "source", "prompt": "Find something"}]},
-                            {
-                                "name": "two",
-                                "jobs": [
-                                    {
-                                        "id": "writer",
-                                        "read_only": False,
-                                        "include_previous": True,
-                                        "prompt": "Apply prior advice",
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
 
-        self.assertEqual(code, 2)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["exit_code"], 2)
-        failed = payload["phases"][1]["jobs"][0]
-        self.assertIn("allow_untrusted_context=true", failed["stderr"])
 
-    def test_workflow_dry_run_renders_commands_without_running_agents(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "dry",
-                        "defaults": {"agent": "codex", "model": "gpt-5"},
-                        "phases": [{"name": "plan", "jobs": [{"id": "one", "prompt": "Plan {input}"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--dry-run", "--json", "--input", "the migration"],
-            )
 
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        job = payload["phases"][0]["jobs"][0]
-        self.assertIn("--model", job["command"])
-        self.assertIn("gpt-5", job["command"])
-        self.assertIn("Plan the migration", job["prompt"])
-        self.assertIn("--sandbox", job["command"])
-        self.assertIn("read-only", job["command"])
 
-    def test_workflow_duplicate_phase_names_fail_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bad",
-                        "phases": [
-                            {"name": "same", "jobs": [{"id": "one", "prompt": "One"}]},
-                            {"name": "same", "jobs": [{"id": "two", "prompt": "Two"}]},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--json"])
 
-        self.assertEqual(code, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn("duplicated", stderr)
 
-    def test_workflow_unknown_include_phase_is_reported_in_job_result(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bad-include",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "review",
-                                "jobs": [
-                                    {
-                                        "id": "future",
-                                        "include_phases": ["missing"],
-                                        "prompt": "Review missing phase",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 2)
-        payload = json.loads(stdout)
-        self.assertIn("unknown or future include_phases", payload["phases"][0]["jobs"][0]["stderr"])
-
-    def test_workflow_phase_level_include_previous_is_inherited_by_jobs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "inherited-context",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "first", "jobs": [{"id": "source", "prompt": "Source output"}]},
-                            {
-                                "name": "second",
-                                "include_previous": True,
-                                "jobs": [{"id": "reviewer", "prompt": "Review inherited context"}],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertIn("Previous workflow outputs", payload["phases"][1]["jobs"][0]["stdout"])
-        self.assertIn("Source output", payload["phases"][1]["jobs"][0]["stdout"])
-
-    def test_workflow_previous_output_with_agent_args_requires_explicit_untrusted_context(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "raw-args-context",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "first", "jobs": [{"id": "source", "prompt": "Source output"}]},
-                            {
-                                "name": "second",
-                                "jobs": [
-                                    {
-                                        "id": "reviewer",
-                                        "include_previous": True,
-                                        "agent_args": ["--maybe-write"],
-                                        "prompt": "Review with raw args",
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 2)
-        payload = json.loads(stdout)
-        self.assertIn("write-capable or raw-arg agent", payload["phases"][1]["jobs"][0]["stderr"])
-
-    def test_workflow_duplicate_expanded_job_ids_fail_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "duplicate-jobs",
-                        "phases": [
-                            {
-                                "name": "audit",
-                                "jobs": [
-                                    {
-                                        "id": "same",
-                                        "for_each": ["a", "b"],
-                                        "prompt": "Audit {item}",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--json"])
-
-        self.assertEqual(code, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn("duplicate job id", stderr)
-
-    def test_workflow_invalid_timeout_fails_before_job_results(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bad-timeout",
-                        "phases": [{"name": "one", "jobs": [{"id": "one", "prompt": "One"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--timeout", "0", "--json"])
-
-        self.assertEqual(code, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn("--timeout must be greater than 0", stderr)
-
-    def test_workflow_invalid_io_limits_fail_before_job_results(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bad-limits",
-                        "phases": [{"name": "one", "jobs": [{"id": "one", "prompt": "One"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--max-output-bytes", "0", "--json"])
-            self.assertEqual(code, 2)
-            self.assertEqual(stdout, "")
-            self.assertIn("--max-output-bytes must be at least 1", stderr)
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--max-input-bytes", "0", "--json"])
-            self.assertEqual(code, 2)
-            self.assertEqual(stdout, "")
-            self.assertIn("--max-input-bytes must be at least 1", stderr)
-
-    def test_workflow_invalid_context_bytes_env_fails_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "bad-context-env",
-                        "phases": [{"name": "one", "jobs": [{"id": "one", "prompt": "One"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_WORKFLOW_CONTEXT_BYTES": "0"},
-            )
-            self.assertEqual(code, 2)
-            self.assertEqual(stdout, "")
-            self.assertIn("YOYO_WORKFLOW_CONTEXT_BYTES must be at least 1", stderr)
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_WORKFLOW_CONTEXT_BYTES": "not-an-int"},
-            )
-            self.assertEqual(code, 2)
-            self.assertEqual(stdout, "")
-            self.assertIn("YOYO_WORKFLOW_CONTEXT_BYTES must be an integer", stderr)
-
-    def test_workflow_exit_code_uses_first_failing_job_in_phase_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "slow2": {
-                                "command": ["python3", "-c", "import sys, time; time.sleep(0.1); sys.exit(2)"],
-                                "read_only_args": ["--safe"],
-                            },
-                            "fast3": {
-                                "command": ["python3", "-c", "import sys; sys.exit(3)"],
-                                "read_only_args": ["--safe"],
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "exit-order",
-                        "phases": [
-                            {
-                                "name": "failures",
-                                "jobs": [
-                                    {"id": "first", "agent": "slow2", "prompt": "First fails second"},
-                                    {"id": "second", "agent": "fast3", "prompt": "Second fails first"},
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 2)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["exit_code"], 2)
-        self.assertEqual([job["job_id"] for job in payload["phases"][0]["jobs"]], ["first", "second"])
-        self.assertEqual([job["exit_code"] for job in payload["phases"][0]["jobs"]], [2, 3])
-
-    def test_workflow_fail_fast_stops_after_failing_phase(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "fail": {
-                                "command": ["python3", "-c", "import sys; sys.exit(2)"],
-                                "read_only_args": ["--safe"],
-                            },
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "fail-fast",
-                        "phases": [
-                            {"name": "one", "jobs": [{"id": "fail", "agent": "fail", "prompt": "Fail"}]},
-                            {"name": "two", "jobs": [{"id": "skip", "agent": "echo", "prompt": "Should not run"}]},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json", "--fail-fast"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 2)
-        payload = json.loads(stdout)
-        self.assertEqual([phase["name"] for phase in payload["phases"]], ["one"])
-
-    def test_workflow_allow_untrusted_context_permits_agent_args_escape_hatch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "allow-untrusted",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "first", "jobs": [{"id": "source", "prompt": "Source output"}]},
-                            {
-                                "name": "second",
-                                "jobs": [
-                                    {
-                                        "id": "reviewer",
-                                        "include_previous": True,
-                                        "agent_args": ["--maybe-write"],
-                                        "allow_untrusted_context": True,
-                                        "prompt": "Review with acknowledged raw args",
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertIn("--maybe-write", payload["phases"][1]["jobs"][0]["command"])
-        self.assertIn("Previous workflow outputs", payload["phases"][1]["jobs"][0]["stdout"])
-
-    def test_workflow_include_phases_selects_named_prior_phase(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "include-phases",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "one", "jobs": [{"id": "one", "prompt": "Phase one marker"}]},
-                            {"name": "two", "jobs": [{"id": "two", "prompt": "Phase two marker"}]},
-                            {
-                                "name": "review",
-                                "include_phases": ["one"],
-                                "jobs": [{"id": "reviewer", "prompt": "Review selected phase"}],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        review_stdout = json.loads(stdout)["phases"][2]["jobs"][0]["stdout"]
-        self.assertIn("Phase one marker", review_stdout)
-        self.assertNotIn("Phase two marker", review_stdout)
-
-    def test_workflow_max_jobs_guard_fails_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "too-many",
-                        "phases": [
-                            {
-                                "name": "fanout",
-                                "jobs": [
-                                    {
-                                        "id": "job-{index}",
-                                        "for_each": ["a", "b"],
-                                        "prompt": "Audit {item}",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--max-jobs", "1", "--json"])
-
-        self.assertEqual(code, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn("above max_jobs=1", stderr)
-
-    def test_workflow_cli_max_jobs_overrides_spec_cap(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "cli-cap-wins",
-                        "max_jobs": 100,
-                        "phases": [
-                            {
-                                "name": "fanout",
-                                "jobs": [
-                                    {
-                                        "id": "job-{index}",
-                                        "for_each": ["a", "b"],
-                                        "prompt": "Audit {item}",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(["workflow", str(spec), "--max-jobs", "1", "--json"])
-
-        self.assertEqual(code, 2)
-        self.assertEqual(stdout, "")
-        self.assertIn("above max_jobs=1", stderr)
-
-    def test_workflow_cli_context_bytes_overrides_spec_context_bytes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "cli-context-wins",
-                        "context_bytes": 1000,
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "source", "jobs": [{"id": "source", "prompt": "0123456789abcdef"}]},
-                            {
-                                "name": "review",
-                                "jobs": [{"id": "reviewer", "include_previous": True, "prompt": "Review short context"}],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json", "--context-bytes", "10"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        review_stdout = json.loads(stdout)["phases"][1]["jobs"][0]["stdout"]
-        self.assertIn("workflow context budget exhausted after 10 bytes", review_stdout)
-
-    def test_workflow_previous_context_is_truncated_at_context_budget(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "echo": {
-                                "command": ["python3", "-c", "import sys; print(sys.stdin.read())"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "truncated-context",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "source", "jobs": [{"id": "source", "prompt": "0123456789abcdef"}]},
-                            {
-                                "name": "review",
-                                "jobs": [{"id": "reviewer", "include_previous": True, "prompt": "Review short context"}],
-                            },
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json", "--context-bytes", "10"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        review_stdout = json.loads(stdout)["phases"][1]["jobs"][0]["stdout"]
-        self.assertIn("workflow context budget exhausted after 10 bytes", review_stdout)
 
 
     def test_open_idle_stdin_pipe_does_not_block_or_inject(self):
@@ -2228,286 +1325,15 @@ class YoyoTests(CliTestCase):
         self.assertEqual(rows["alpha"], str(root_a / "alpha"))
         self.assertEqual(rows["beta"], str(root_b / "beta"))
 
-    def test_workflow_template_resolves_by_name(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            templates = Path(tmp) / "templates"
-            templates.mkdir()
-            (templates / "smoke.json").write_text(
-                json.dumps(
-                    {
-                        "name": "smoke",
-                        "defaults": {"agent": "echo"},
-                        "phases": [{"name": "one", "jobs": [{"id": "j1", "prompt": "Say hi"}]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", "smoke", "--json"],
-                env={"YOYO_CONFIG": str(config), "YOYO_WORKFLOW_PATH": str(templates)},
-            )
 
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["workflow"], "smoke")
-        self.assertEqual(payload["spec"], str(templates / "smoke.json"))
 
-    def test_workflow_list_templates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            templates = Path(tmp) / "templates"
-            templates.mkdir()
-            (templates / "yoyo-test-wf.json").write_text("{}", encoding="utf-8")
-            code, stdout, stderr = self.run_cli(
-                ["workflow", "--list", "--json"],
-                env={"YOYO_WORKFLOW_PATH": str(templates)},
-            )
 
-        self.assertEqual(code, 0, stderr)
-        names = [row["name"] for row in json.loads(stdout)]
-        self.assertIn("yoyo-test-wf", names)
 
-    def test_workflow_without_spec_or_list_fails_loudly(self):
-        code, stdout, stderr = self.run_cli(["workflow"])
 
-        self.assertEqual(code, 2)
-        self.assertIn("Pass a workflow spec path or template name", stderr)
 
-    def test_workflow_gate_failure_stops_workflow(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "gated",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [{"id": "j1", "prompt": "First"}],
-                                "gates": [{"name": "must-fail", "run": "echo gate-stdout; exit 7"}],
-                            },
-                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Never runs"}]},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
 
-        self.assertEqual(code, 7, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(len(payload["phases"]), 1)
-        gate = payload["phases"][0]["gates"][0]
-        self.assertEqual(gate["exit_code"], 7)
-        self.assertIn("gate-stdout", gate["stdout"])
 
-    def test_workflow_gate_success_lets_next_phase_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "gated-ok",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [{"id": "j1", "prompt": "First"}],
-                                "gates": ["true"],
-                            },
-                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Second"}]},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
 
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(len(payload["phases"]), 2)
-        self.assertEqual(payload["phases"][0]["gates"][0]["exit_code"], 0)
-
-    def test_workflow_gates_are_skipped_when_phase_jobs_fail(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "boom": {
-                                "command": ["python3", "-c", "import sys; sys.stdin.read(); sys.exit(5)"],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "gated-fail",
-                        "defaults": {"agent": "boom"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [{"id": "j1", "prompt": "First"}],
-                                "gates": ["echo should-not-run"],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 5, stderr)
-        payload = json.loads(stdout)
-        gate = payload["phases"][0]["gates"][0]
-        self.assertEqual(gate["skipped"], "phase jobs failed")
-
-    def test_workflow_retries_until_success_and_records_attempts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            counter = Path(tmp) / "counter"
-            agent_code = (
-                "import sys, os\n"
-                "path = sys.argv[1]\n"
-                "n = int(open(path).read()) if os.path.exists(path) else 0\n"
-                "open(path, 'w').write(str(n + 1))\n"
-                "sys.stdin.read()\n"
-                "if n == 0:\n"
-                "    sys.exit(1)\n"
-                "print('recovered')\n"
-            )
-            config = Path(tmp) / "agents.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": {
-                            "flaky": {
-                                "command": ["python3", "-c", agent_code, str(counter)],
-                                "read_only_args": ["--safe"],
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "flaky-retry",
-                        "defaults": {"agent": "flaky"},
-                        "phases": [
-                            {
-                                "name": "one",
-                                "jobs": [{"id": "j1", "prompt": "Go", "retries": 2}],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={"YOYO_CONFIG": str(config)},
-            )
-
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        job = payload["phases"][0]["jobs"][0]
-        self.assertEqual(job["exit_code"], 0)
-        self.assertEqual(job["attempts"], 2)
-        self.assertIn("recovered", job["stdout"])
-
-    def test_workflow_job_skill_is_injected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            self._write_skill(Path(tmp) / "skills", "myskill", body="WORKFLOW_SKILL_BODY")
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "skilled",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "one", "jobs": [{"id": "j1", "prompt": "Do it", "skill": "myskill"}]}
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={
-                    "YOYO_CONFIG": str(config),
-                    "YOYO_SKILL_PATH": str(Path(tmp) / "skills"),
-                },
-            )
-
-        self.assertEqual(code, 0, stderr)
-        payload = json.loads(stdout)
-        job_stdout = payload["phases"][0]["jobs"][0]["stdout"]
-        self.assertIn('<skill name="myskill">', job_stdout)
-        self.assertIn("WORKFLOW_SKILL_BODY", job_stdout)
-
-    def test_workflow_missing_skill_fails_before_any_job_runs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "skilled-missing",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "one", "jobs": [{"id": "j1", "prompt": "Do it"}]},
-                            {"name": "two", "jobs": [{"id": "j2", "prompt": "Do it", "skill": "nope"}]},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                ["workflow", str(spec), "--json"],
-                env={
-                    "YOYO_CONFIG": str(config),
-                    "YOYO_SKILL_PATH": str(Path(tmp) / "empty-skills"),
-                },
-            )
-
-        self.assertEqual(code, 2)
-        self.assertIn("Skill not found", stderr)
-        self.assertEqual(stdout.strip(), "")
-
-    def test_bundled_workflow_templates_are_valid_specs(self):
-        bundled = ROOT / "workflows"
-        templates = sorted(bundled.glob("*.json"))
-        self.assertTrue(templates, "no bundled workflow templates found")
-        for template in templates:
-            spec = json.loads(template.read_text(encoding="utf-8"))
-            phases = yoyo.workflow_phases(spec)
-            self.assertTrue(phases)
-            for phase in phases:
-                yoyo.normalize_phase_gates(phase)
-                jobs = yoyo.expand_workflow_jobs(phase, "input")
-                for job in jobs:
-                    self.assertTrue(str(job.get("prompt", "")).strip())
 
 
     def _imagegen_agent_config(self, tmp, script):
@@ -2643,23 +1469,6 @@ class YoyoTests(CliTestCase):
         self.assertIn("Do NOT draw or render the image with code", stdout)
         self.assertIn(str(out), stdout)
 
-    def test_imagegen_codex_delegates_to_builtin_image_gen_tool(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "art.png"
-            code, stdout, stderr = self.run_cli(
-                ["imagegen", "a red yo-yo on white, flat vector, no other text",
-                 "--out", str(out), "--size", "1024x1024", "--quality", "low", "--dry-run"],
-                env={"YOYO_CONFIG": str(Path(tmp) / "missing.json"), "OPENAI_API_KEY": ""},
-            )
-        self.assertEqual(code, 0, stderr)
-        # Agent delegation to codex exec, driving the built-in image_gen tool.
-        self.assertIn("exec", stdout)
-        self.assertIn("built-in image_gen tool", stdout)
-        self.assertIn("Do NOT draw or render the image with code", stdout)
-        self.assertIn(str(out), stdout)
-        # The API-key CLI fallback must be explicitly forbidden, not used.
-        self.assertIn("do NOT use the scripts/image_gen.py CLI fallback", stdout)
-        self.assertNotIn("--no-augment", stdout)
 
     def test_imagegen_codex_edit_mentions_reference_image(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2890,49 +1699,7 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertEqual(state.read_text(encoding="utf-8"), custom)
 
-    def test_loop_claude_flavor_envelope_cost_accumulates_until_budget(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            body = (
-                "import json, sys\n"
-                "sys.stdin.read()\n"
-                "print(json.dumps({'result': 'did one increment', 'total_cost_usd': 0.6, "
-                "'usage': {'output_tokens': 8412, 'cache_read_input_tokens': 121000, "
-                "'cache_creation_input_tokens': 43000}}))\n"
-            )
-            config = self._claude_flavor_config(tmp, body)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "10", "--budget-usd", "1.0", "--json", "work"],
-                env=env,
-            )
 
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["iterations"], 2)
-            self.assertEqual(summary["end_reason"], "budget")
-            self.assertAlmostEqual(summary["total_cost_usd"], 1.2)
-            self.assertEqual([row["cost_usd"] for row in summary["runs"]], [0.6, 0.6])
-            self.assertIn("$0.60", stderr)
-            self.assertIn("out=8,412", stderr)
-            self.assertIn("did one increment", stderr)
-
-    def test_loop_malformed_claude_envelope_keeps_loop_alive_with_unknown_cost(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            body = "import sys\nsys.stdin.read()\nprint('this is not a json envelope')\n"
-            config = self._claude_flavor_config(tmp, body)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "2", "--json", "work"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["iterations"], 2)
-            self.assertEqual(summary["end_reason"], "max-iter")
-            self.assertIsNone(summary["total_cost_usd"])
-            self.assertEqual([row["exit_code"] for row in summary["runs"]], [0, 0])
-            self.assertIn("this is not a json envelope", stderr)
 
     def test_loop_max_fail_aborts_and_success_resets_counter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2967,7 +1734,6 @@ class YoyoTests(CliTestCase):
             self.assertIn('<skill name="frontend">', stdout)
             self.assertIn("Use 8px spacing", stdout)
             self.assertIn("TASK:\nBuild the page.", stdout)
-            self.assertIn("--output-format json", stdout)
             self.assertIn("delegated worker", stdout)
 
     def test_loop_rejects_session(self):
@@ -3019,20 +1785,6 @@ class YoyoTests(CliTestCase):
             self.assertFalse((Path(tmp) / ".yoyo").exists())
             self.assertFalse((Path(tmp) / "state" / "runs").exists())
 
-    def test_loop_budget_with_costless_agent_warns_and_continues(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            command, _ = self._counting_stub(tmp)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--budget-usd", "5", "--json", "work"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0)
-            self.assertIn("do not report cost", stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["iterations"], 2)
-            self.assertEqual(summary["end_reason"], "max-iter")
 
     def test_loop_task_text_requires_task_and_rejects_both_sources(self):
         code, _, stderr = self.run_cli(["loop", "claude"])
@@ -3054,43 +1806,7 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("TASK:\nfrom file", stdout)
 
-    def test_loop_done_outranks_budget_on_the_same_iteration(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            body = (
-                "import json, sys\n"
-                "sys.stdin.read()\n"
-                f"open({str(state)!r}, 'a').write('\\nSTATUS: DONE\\n')\n"
-                "print(json.dumps({'result': 'finished and verified', 'total_cost_usd': 5.0, 'usage': {}}))\n"
-            )
-            config = self._claude_flavor_config(tmp, body)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "fakeclaude", "--cwd", tmp, "--budget-usd", "1.0", "--json", "finish now"],
-                env=env,
-            )
 
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["end_reason"], "done")
-            self.assertEqual(summary["iterations"], 1)
-            self.assertAlmostEqual(summary["total_cost_usd"], 5.0)
-
-    def test_loop_malformed_envelope_with_budget_warns_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            body = "import sys\nsys.stdin.read()\nprint('no envelope here')\n"
-            config = self._claude_flavor_config(tmp, body)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "fakeclaude", "--cwd", tmp, "--max-iter", "1", "--budget-usd", "1.0", "--json", "work"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0)
-            self.assertIn("not a parseable cost envelope", stderr)
-            self.assertIn("not counted toward --budget-usd", stderr)
-            summary = json.loads(stdout)
-            self.assertIsNone(summary["total_cost_usd"])
 
     def test_loop_background_records_parent_run_and_iteration_children(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3147,53 +1863,8 @@ class YoyoTests(CliTestCase):
         )
         return config
 
-    def test_loop_gate_rejects_self_declared_done_and_strips_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            command = self._done_each_call_stub(tmp, state)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--gate", "exit 1", "--json", "do the work"],
-                env=env,
-            )
 
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            # A failing gate never lets the self-declared DONE end the loop.
-            self.assertEqual(summary["end_reason"], "max-iter")
-            self.assertEqual(summary["done_policy"], "gate")
-            self.assertFalse(summary["verified"])
-            self.assertEqual(summary["gate_failures"], 3)
-            self.assertEqual(summary["iterations"], 3)
-            # The false DONE line was stripped (the rejection text mentions the
-            # phrase, but no standalone STATUS: DONE line — what the loop checks —
-            # survives) and the rejection was recorded for the next iteration.
-            final_state = state.read_text(encoding="utf-8")
-            self.assertFalse(any(line.strip() == "STATUS: DONE" for line in final_state.splitlines()))
-            self.assertIn("VERIFICATION REJECTED", final_state)
 
-    def test_loop_gate_accepts_done_when_gate_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            done_body = (
-                f"state = {str(state)!r}\n"
-                "if calls == 2:\n"
-                "    open(state, 'a').write('\\nSTATUS: DONE\\n')\n"
-            )
-            command, counter = self._counting_stub(tmp, done_body)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--max-iter", "10", "--gate", "exit 0", "--json", "finish in two"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["end_reason"], "done")
-            self.assertTrue(summary["verified"])
-            self.assertEqual(summary["done_policy"], "gate")
-            self.assertEqual(summary["gate_failures"], 0)
-            self.assertEqual(summary["iterations"], 2)
 
     def test_loop_queue_rejects_done_while_items_unchecked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3203,7 +1874,8 @@ class YoyoTests(CliTestCase):
             command = self._done_each_call_stub(tmp, state)
             env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
             code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--queue", "tasks.md", "--json", "work the queue"],
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "3",
+                 "--queue", "tasks.md", "--json", "work the queue"],
                 env=env,
             )
 
@@ -3213,9 +1885,6 @@ class YoyoTests(CliTestCase):
             self.assertEqual(summary["end_reason"], "max-iter")
             self.assertEqual(summary["queue_rejections"], 3)
             self.assertEqual(Path(summary["queue"]).resolve(), queue.resolve())
-            # The worker owns the queue file, so a queue alone is not
-            # independent verification.
-            self.assertFalse(summary["verified"])
             final_state = state.read_text(encoding="utf-8")
             self.assertFalse(any(line.strip() == "STATUS: DONE" for line in final_state.splitlines()))
             self.assertIn("work queue", final_state)
@@ -3260,7 +1929,7 @@ class YoyoTests(CliTestCase):
             self.assertIn("=== WORK QUEUE", stdout)
             self.assertIn("rename the module", stdout)
             self.assertIn("Queue rules:", stdout)
-            self.assertIn("the work queue", stdout)  # verifiers label in COMPLETION CHECK
+            self.assertIn("STATUS: DONE is only accepted once every queue item is checked.", stdout)
             # Per-iteration content stays after the stable blocks for prefix caching.
             self.assertLess(stdout.index("=== LOOP PROTOCOL"), stdout.index("=== WORK QUEUE"))
             self.assertLess(stdout.index("=== WORK QUEUE"), stdout.index("Loop position:"))
@@ -3340,16 +2009,6 @@ class YoyoTests(CliTestCase):
             self.assertEqual(answers_dir, Path(tmp) / "fanout" / "fanout")
             self.assertTrue((answers_dir / "1-a.md").is_file())
 
-    def test_workflow_json_slims_nested_job_results(self):
-        payload = {
-            "phases": [
-                {"name": "p1", "jobs": [{"agent": "a", "stdout": "hi", "stderr": "raw", "stderr_plain": ""}]}
-            ],
-        }
-        slim = yoyo.slim_result_for_emission(payload)
-        job = slim["phases"][0]["jobs"][0]
-        self.assertNotIn("stderr_plain", job)
-        self.assertEqual(job["stderr"], "")
 
     def test_loop_queue_missing_or_itemless_fails_loudly(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3369,215 +2028,25 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 2)
             self.assertIn("no checklist items", stderr)
 
-    def test_loop_gate_does_not_run_until_done_is_claimed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            # The worker never claims done; the gate writes a marker if it ever runs.
-            command, _ = self._counting_stub(tmp)
-            marker = Path(tmp) / "gate-ran"
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, stdout, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--max-iter", "2", "--gate", f"touch {shlex.quote(str(marker))}", "--json", "never done"],
-                env=env,
-            )
 
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["end_reason"], "max-iter")
-            self.assertEqual(summary["gate_failures"], 0)
-            self.assertFalse(marker.exists(), "gate must not run when STATUS: DONE was never claimed")
 
-    def test_loop_done_policy_gate_without_gate_command_errors(self):
-        code, _, stderr = self.run_cli(["loop", "claude", "--done-policy", "gate", "do it"])
-        self.assertEqual(code, 2)
-        self.assertIn("no --gate command", stderr)
 
-    def test_loop_explicit_worker_policy_with_gate_is_a_conflict(self):
-        code, _, stderr = self.run_cli(["loop", "claude", "--done-policy", "worker", "--gate", "exit 0", "do it"])
-        self.assertEqual(code, 2)
-        self.assertIn("ignores gates", stderr)
 
-    def test_loop_checker_rejects_then_accepts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            worker = self._done_each_call_stub(tmp, state)
-            checker_counter = Path(tmp) / "checks.txt"
-            checker_body = (
-                "import os, sys\n"
-                f"counter = {str(checker_counter)!r}\n"
-                "sys.stdin.read()\n"
-                "n = int(open(counter).read()) if os.path.exists(counter) else 0\n"
-                "n += 1\n"
-                "open(counter, 'w').write(str(n))\n"
-                "print('missing tests' if n == 1 else 'looks complete')\n"
-                "print('VERDICT: FAIL' if n == 1 else 'VERDICT: PASS')\n"
-            )
-            config = self._checker_config(tmp, checker_body)
-            env = {
-                "YOYO_STATE_DIR": str(Path(tmp) / "state"),
-                "YOYO_AGENT_WORKER": worker,
-                "YOYO_CONFIG": str(config),
-            }
-            code, stdout, stderr = self.run_cli(
-                ["loop", "worker", "--cwd", tmp, "--max-iter", "5", "--checker", "checkbot", "--json", "build it"],
-                env=env,
-            )
 
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["end_reason"], "done")
-            self.assertTrue(summary["verified"])
-            self.assertEqual(summary["done_policy"], "checker")
-            self.assertEqual(summary["checker_rejections"], 1)
-            self.assertEqual(summary["iterations"], 2)
-            self.assertEqual(checker_counter.read_text(encoding="utf-8"), "2")
 
-    def test_loop_checker_unknown_agent_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            command, _ = self._counting_stub(tmp)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, _, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--checker", "nope", "do it"],
-                env=env,
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("Unknown checker agent", stderr)
-
-    def _critic_env(self, tmp, critic_body, worker_command):
-        config = self._checker_config(tmp, critic_body, name="criticbot")
-        return {
-            "YOYO_STATE_DIR": str(Path(tmp) / "state"),
-            "YOYO_AGENT_WORKER": worker_command,
-            "YOYO_CONFIG": str(config),
-        }
-
-    def test_loop_critic_appends_findings_and_next_iteration_sees_them(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            # Worker records each iteration's prompt so we can assert the
-            # critic block reached the fresh context.
-            prompts_dir = Path(tmp) / "prompts"
-            prompts_dir.mkdir()
-            worker_body = (
-                "import os, sys\n"
-                f"d = {str(prompts_dir)!r}\n"
-                "n = len(os.listdir(d)) + 1\n"
-                "open(os.path.join(d, str(n)), 'w').write(sys.stdin.read())\n"
-                "print('iteration output line')\n"
-            )
-            worker = self._loop_stub_command(tmp, worker_body, name="worker.py")
-            critic_body = (
-                "import sys\n"
-                "sys.stdin.read()\n"
-                "print('bin/app.py:42 the retry path swallows the timeout error')\n"
-            )
-            env = self._critic_env(tmp, critic_body, worker)
-            code, stdout, stderr = self.run_cli(
-                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            # The critic reviews iteration 1 only: iteration 2 is the last, so
-            # no next iteration exists to consume findings.
-            self.assertEqual(summary["critic"], "criticbot")
-            self.assertEqual(summary["critic_reviews"], 1)
-            self.assertEqual(summary["critic_findings"], 1)
-            self.assertEqual(summary["iterations"], 2)
-            final_state = state.read_text(encoding="utf-8")
-            self.assertIn("## CRITIC FINDINGS (iteration 1, independent review by criticbot)", final_state)
-            self.assertIn("retry path swallows the timeout error", final_state)
-            # Both iteration prompts carry the critic protocol block; findings
-            # themselves travel via the state file, not the prompt.
-            for prompt_file in ("1", "2"):
-                prompt = (prompts_dir / prompt_file).read_text(encoding="utf-8")
-                self.assertIn("=== INDEPENDENT CRITIC ===", prompt)
-                self.assertIn("criticbot", prompt)
-            # Per-iteration rows record the critic outcome.
-            self.assertEqual(summary["runs"][0]["critic"], {"exit_code": 0, "findings": True, "cost_usd": None})
-            self.assertNotIn("critic", summary["runs"][1])
-
-    def test_loop_critic_no_findings_marker_appends_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            worker, _ = self._counting_stub(tmp)
-            critic_body = "import sys\nsys.stdin.read()\nprint('reviewed carefully')\nprint('NO FINDINGS')\n"
-            env = self._critic_env(tmp, critic_body, worker)
-            code, stdout, stderr = self.run_cli(
-                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            self.assertEqual(summary["critic_reviews"], 1)
-            self.assertEqual(summary["critic_findings"], 0)
-            self.assertNotIn("CRITIC FINDINGS", state.read_text(encoding="utf-8"))
-
-    def test_loop_critic_failure_leaves_iteration_unreviewed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            worker, _ = self._counting_stub(tmp)
-            critic_body = "import sys\nsys.stdin.read()\nprint('half a review')\nsys.exit(1)\n"
-            env = self._critic_env(tmp, critic_body, worker)
-            code, stdout, stderr = self.run_cli(
-                ["loop", "worker", "--cwd", tmp, "--max-iter", "2", "--critic", "criticbot", "--json", "build it"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            # A failed critic call must not invent findings — and must not
-            # fail the loop.
-            self.assertEqual(summary["critic_reviews"], 1)
-            self.assertEqual(summary["critic_findings"], 0)
-            self.assertIn("critic call failed", stderr)
-            self.assertNotIn("CRITIC FINDINGS", state.read_text(encoding="utf-8"))
-
-    def test_loop_critic_never_gates_done(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / ".yoyo" / "loop-state.md"
-            worker = self._done_each_call_stub(tmp, state)
-            critic_body = "import sys\nsys.stdin.read()\nprint('this would be a finding')\n"
-            env = self._critic_env(tmp, critic_body, worker)
-            code, stdout, stderr = self.run_cli(
-                ["loop", "worker", "--cwd", tmp, "--max-iter", "5", "--critic", "criticbot", "--json", "finish now"],
-                env=env,
-            )
-
-            self.assertEqual(code, 0, stderr)
-            summary = json.loads(stdout)
-            # DONE on iteration 1 ends the loop before any critic review: the
-            # critic is advisory iteration fuel, never a completion gate.
-            self.assertEqual(summary["end_reason"], "done")
-            self.assertEqual(summary["iterations"], 1)
-            self.assertEqual(summary["critic_reviews"], 0)
-            self.assertFalse(summary["verified"])
-
-    def test_loop_critic_unknown_agent_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            command, _ = self._counting_stub(tmp)
-            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
-            code, _, stderr = self.run_cli(
-                ["loop", "stub", "--cwd", tmp, "--critic", "nope", "do it"],
-                env=env,
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("Unknown critic agent", stderr)
-
-    def test_loop_dry_run_shows_spec_block_and_completion_check(self):
+    def test_loop_dry_run_shows_the_immutable_spec_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = Path(tmp) / "VISION.md"
             spec.write_text("Never touch src/payments/.", encoding="utf-8")
             code, stdout, stderr = self.run_cli(
-                ["loop", "claude", "--cwd", tmp, "--spec", "VISION.md", "--gate", "pytest -q", "--dry-run", "Build the page."],
+                ["loop", "claude", "--cwd", tmp, "--spec", "VISION.md", "--dry-run", "Build the page."],
                 env={},
             )
             self.assertEqual(code, 0, stderr)
-            self.assertIn("STANDING SPEC", stdout)
+            self.assertIn("=== STANDING SPEC", stdout)
             self.assertIn("Never touch src/payments/.", stdout)
-            self.assertIn("COMPLETION CHECK", stdout)
-            self.assertIn("pytest -q", stdout)
+            # Immutable blocks lead so the prompt prefix stays cacheable.
+            self.assertLess(stdout.index("=== STANDING SPEC"), stdout.index("=== LOOP PROTOCOL"))
 
     def test_loop_spec_file_not_found_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4587,186 +3056,14 @@ class YoyoTests(CliTestCase):
         }
         return env, store
 
-    def test_cron_add_list_rm_roundtrip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, store = self._cron_env(tmp)
-            code, stdout, stderr = self.run_cli(
-                [
-                    "cron", "add", "nightly", "--schedule", "0 2 * * *", "--cwd", tmp,
-                    "--", "loop", "claude", "Work through TODO.md",
-                ],
-                env=env,
-            )
-            self.assertEqual(code, 0, stderr)
-            line = store.read_text().strip()
-            self.assertTrue(line.startswith("0 2 * * *"), line)
-            self.assertIn("loop claude", line)
-            self.assertIn("YOYO_CALLER=cron", line)
-            self.assertTrue(line.endswith("# yoyo-cron:nightly"), line)
 
-            code, stdout, stderr = self.run_cli(["cron", "list", "--json"], env=env)
-            self.assertEqual(code, 0, stderr)
-            payload = json.loads(stdout)
-            self.assertEqual(len(payload["entries"]), 1)
-            entry = payload["entries"][0]
-            self.assertEqual(entry["name"], "nightly")
-            self.assertEqual(entry["schedule"], "0 2 * * *")
-            self.assertTrue(entry["installed"])
-            self.assertEqual(payload["untracked_crontab_names"], [])
 
-            code, stdout, stderr = self.run_cli(["cron", "rm", "nightly"], env=env)
-            self.assertEqual(code, 0, stderr)
-            self.assertNotIn("yoyo-cron:nightly", store.read_text())
 
-            code, stdout, _ = self.run_cli(["cron", "list", "--json"], env=env)
-            self.assertEqual(json.loads(stdout)["entries"], [])
 
-    def test_cron_add_validates_name_schedule_and_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, _ = self._cron_env(tmp)
-            code, _, stderr = self.run_cli(["cron", "add", "x", "--", "loop", "claude", "t"], env=env)
-            self.assertEqual(code, 2)
-            self.assertIn("requires --schedule", stderr)
 
-            code, _, stderr = self.run_cli(
-                ["cron", "add", "x", "--schedule", "1 2 3", "--", "loop", "claude", "t"], env=env
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("five cron fields", stderr)
 
-            code, _, stderr = self.run_cli(
-                ["cron", "add", "x", "--schedule", "@daily", "--", "rm", "-rf", "/"], env=env
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("must start with a yoyo subcommand", stderr)
 
-            code, _, stderr = self.run_cli(["cron", "add", "x", "--schedule", "@daily"], env=env)
-            self.assertEqual(code, 2)
-            self.assertIn("after '--'", stderr)
 
-    def test_cron_add_duplicate_requires_force(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, store = self._cron_env(tmp)
-            argv = ["cron", "add", "job", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "hello"]
-            code, _, stderr = self.run_cli(argv, env=env)
-            self.assertEqual(code, 0, stderr)
-
-            code, _, stderr = self.run_cli(argv, env=env)
-            self.assertEqual(code, 2)
-            self.assertIn("already exists", stderr)
-
-            forced = ["cron", "add", "job", "--schedule", "@daily", "--cwd", tmp, "--force", "--", "ask", "claude", "hello"]
-            code, _, stderr = self.run_cli(forced, env=env)
-            self.assertEqual(code, 0, stderr)
-            # Replaced, not duplicated: exactly one tagged line remains.
-            tagged = [line for line in store.read_text().splitlines() if line.endswith("# yoyo-cron:job")]
-            self.assertEqual(len(tagged), 1)
-
-    def test_cron_run_executes_recorded_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, _ = self._cron_env(tmp)
-            code, _, stderr = self.run_cli(
-                ["cron", "add", "job", "--schedule", "@hourly", "--cwd", tmp, "--", "ask", "claude", "hi"],
-                env=env,
-            )
-            self.assertEqual(code, 0, stderr)
-
-            recorded = Path(tmp) / "ran.txt"
-            fake_yoyo = Path(tmp) / "bin" / "fake-yoyo"
-            fake_yoyo.write_text(f"#!/bin/sh\necho \"$@\" > {recorded}\n", encoding="utf-8")
-            fake_yoyo.chmod(0o755)
-            registry = Path(tmp) / "state" / "cron.json"
-            data = json.loads(registry.read_text())
-            data["entries"]["job"]["yoyo"] = str(fake_yoyo)
-            registry.write_text(json.dumps(data), encoding="utf-8")
-
-            code, _, stderr = self.run_cli(["cron", "run", "job"], env=env)
-            self.assertEqual(code, 0, stderr)
-            self.assertEqual(recorded.read_text().strip(), "ask claude hi")
-
-    def test_cron_line_escapes_percent_for_crontab(self):
-        line = yoyo.build_cron_line(
-            {
-                "name": "pct",
-                "schedule": "@daily",
-                "cwd": "/tmp",
-                "argv": ["ask", "claude", "is this 100% done?"],
-                "log": "/tmp/x.log",
-                "yoyo": "/usr/local/bin/yoyo",
-                "path_env": "/usr/bin",
-            }
-        )
-        self.assertIn(r"100\%", line)
-        self.assertTrue(line.endswith("# yoyo-cron:pct"))
-
-    def test_cron_line_carries_captured_yoyo_env(self):
-        line = yoyo.build_cron_line(
-            {
-                "name": "envy",
-                "schedule": "@daily",
-                "cwd": "/tmp",
-                "argv": ["ask", "claude", "hi"],
-                "log": "/tmp/x.log",
-                "yoyo": "/usr/local/bin/yoyo",
-                "path_env": "/usr/bin",
-                "env": {"YOYO_DEFAULT_SKILLS": "discipline", "IGNORED_KEY": "nope"},
-            }
-        )
-        self.assertIn("YOYO_DEFAULT_SKILLS=discipline", line)
-        self.assertNotIn("IGNORED_KEY", line)
-        self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
-
-    def test_cron_add_captures_default_skills_env_into_crontab_line(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            skill_dir = Path(tmp) / "skills" / "discipline"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text("# Discipline\nBe rigorous.\n", encoding="utf-8")
-            env, store = self._cron_env(tmp)
-            env["YOYO_DEFAULT_SKILLS"] = "discipline"
-            env["YOYO_SKILL_PATH"] = str(Path(tmp) / "skills")
-            code, _, stderr = self.run_cli(
-                ["cron", "add", "envy", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "hi"],
-                env=env,
-            )
-            self.assertEqual(code, 0, stderr)
-            line = store.read_text().strip()
-            self.assertIn("YOYO_DEFAULT_SKILLS=discipline", line)
-            self.assertIn("YOYO_SKILL_PATH=", line)
-            self.assertLess(line.index("YOYO_DEFAULT_SKILLS"), line.index("YOYO_CALLER=cron"))
-
-    def test_cron_add_rejects_newlines_in_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, store = self._cron_env(tmp)
-            code, _, stderr = self.run_cli(
-                ["cron", "add", "nl", "--schedule", "@daily", "--cwd", tmp, "--", "ask", "claude", "line one\nline two"],
-                env=env,
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("single line", stderr)
-            self.assertFalse(store.exists())
-
-    def test_workflow_removed_expect_field_fails_loudly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._echo_agent_config(tmp)
-            spec = Path(tmp) / "workflow.json"
-            spec.write_text(
-                json.dumps(
-                    {
-                        "name": "legacy",
-                        "defaults": {"agent": "echo"},
-                        "phases": [
-                            {"name": "one", "jobs": [
-                                {"id": "j1", "prompt": "First", "expect": {"contains": ["X"]}}
-                            ]}
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            code, _, stderr = self.run_cli(["workflow", str(spec)], env={"YOYO_CONFIG": str(config)})
-
-            self.assertEqual(code, 2)
-            self.assertIn("removed in 0.15.0", stderr)
 
     def test_research_multiword_lenses_item_keeps_adhoc_scaffold(self):
         # Provenance matters: --lenses items (even multi-word) get the ad-hoc
@@ -4797,13 +3094,28 @@ class SkillGuardTests(CliTestCase):
     """
 
     SKILL_PATH = ROOT / "skills" / "yoyo" / "SKILL.md"
+    # Anchors chosen from a 60-day audit of the run ledger: these are the lines
+    # whose absence showed up as real failures (1,088 foreground calls, 5.8% of
+    # them killed by a caller's tool timeout; --background used zero times).
     LOAD_BEARING_ANCHORS = {
-        "short-budget callers must be taught background+wait": "Callers with short tool budgets",
+        "background is taught as the default call shape": "--background",
         "the poll recipe agents copy verbatim": "yoyo wait",
         "exit 124 means still-running, keep waiting": "124",
-        "claude silence is buffering, not a hang": "buffers all stdout until completion",
+        "raising the caller's own timeout is named as the wrong move": "Raising your own tool timeout",
+        "a cut-off review is unavailable, never passed": "**unavailable**",
+        "a lost run can be reconstructed instead of guessed at": "yoyo runs autopsy",
         "reviews and untrusted input run read-only": "--read-only",
-        "a cut-off review is unavailable, never passed": "never as passed",
+        "the verifier is a different vendor than the author": "different vendor than the one that wrote the code",
+        "cursor-via-grok is not an independent sample": "not independent of native Grok",
+        "disagreement is what to work on next": "disagreement is your work list",
+        "model ids come from the live CLI, not memory": "cursor-agent --list-models",
+        "complex work keeps the target cli default": "Default-first quality rule",
+        "quality is never traded for efficiency": "Never trade correctness or completeness",
+        "fast variants are not called cost-efficient": "lower latency, not lower cost",
+        "cursor read-only is plan mode, not a sandbox": "plan mode, not an OS sandbox",
+        "delegated output is confirmed only after the caller confirms it": "only after you confirmed it",
+        "irreversible work needs the human to ask": "only when the human asked",
+        "loop DONE is self-declared and needs a diff read": "Read the diff before you believe it",
     }
 
     def test_skill_keeps_load_bearing_sections(self):

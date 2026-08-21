@@ -33,12 +33,15 @@ For the full protocol (preflight, first-run setup, long-video strategy), read `~
 A 10-minute video is ~80 frames ≈ 16k image tokens plus transcript. When you only need conclusions — or you're mid-task and shouldn't burn context on frames — have a yoyo agent watch it and report:
 
 ```bash
-yoyo ask claude --skill watch --timeout 420 "Watch this video and <your actual question>. Video: VIDEO_URL_OR_PATH"
+run_id=$(yoyo ask claude --skill watch --background "Watch this video and <your actual question>. Video: VIDEO_URL_OR_PATH")
+yoyo wait "$run_id" --timeout 30    # 124 = still running, wait again
 ```
+
+Watching is slow — downloading, extracting, and reading frames runs for minutes — so detach it rather than raising your own tool timeout.
 
 - `--skill watch` injects the watch skill so the delegate knows the pipeline; claude and codex both have vision and can Read the frames.
 - Write the question the way you'd brief a person: what to look for, what to report back, at what depth. The delegate controls its own detail mode; name one only if you have a reason (e.g. "use --detail transcript" for a pure what-was-said question).
-- Fan out for independent readings of ambiguous footage: `yoyo ask codex,claude --skill watch --judge claude "..."`.
+- Fan out for independent readings of ambiguous footage: `yoyo ask codex,claude --skill watch --judge claude --background "..."`.
 - Spot-check: if the answer is load-bearing, verify one claim yourself (Mode 1 with `--start/--end` around the claimed moment is cheap).
 
 ## Notes
