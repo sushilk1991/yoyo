@@ -5,8 +5,10 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.22.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.23.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -80,6 +82,7 @@ class YoyoTests(CliTestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn('<skill name="yoyo-fable-mode">', stdout)
         self.assertIn("one-shot", stdout)
+        self.assertIn("failure trajectory", stdout)
         self.assertIn("Task:\nhello", stdout)
 
     def test_default_skills_empty_string_disables_injection(self):
@@ -195,14 +198,36 @@ class YoyoTests(CliTestCase):
             self.assertEqual(payload["exit_code"], 0)
             self.assertIn("hello", payload["stdout"])
 
-    def test_background_run_writes_meta_and_result_files(self):
+    def test_foreground_call_journals_the_prompt(self):
+        # The journal recorded the delegate command but not what was asked, so
+        # a killed foreground call left no way to see the actual prompt.
         with tempfile.TemporaryDirectory() as tmp:
             env = {
                 "YOYO_STATE_DIR": tmp,
                 "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
             }
             code, stdout, stderr = self.run_cli(
-                ["ask", "echo", "--background", "--trace-id", "trace-bg", "hello"],
+                ["ask", "echo", "--json", "review the substring delivery proof"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            runs = sorted((Path(tmp) / "runs").iterdir())
+            self.assertEqual(len(runs), 1)
+            prompt = (runs[0] / "prompt.txt").read_text(encoding="utf-8")
+            self.assertIn("review the substring delivery proof", prompt)
+            meta = json.loads((runs[0] / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["prompt_bytes"], len(prompt.encode("utf-8")))
+
+    def test_background_run_writes_meta_and_result_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = "héllo"
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "--trace-id", "trace-bg", prompt],
                 env=env,
             )
             self.assertEqual(code, 0, stderr)
@@ -216,9 +241,72 @@ class YoyoTests(CliTestCase):
             self.assertEqual(meta["agent"], "echo")
             self.assertIsInstance(meta["pid"], int)
             self.assertEqual(meta["trace_id"], "trace-bg")
+            self.assertEqual(meta["prompt_bytes"], len(prompt.encode("utf-8")))
             self.assertEqual(result["agent"], "echo")
             self.assertEqual(result["exit_code"], 0)
             self.assertIn("duration_s", result)
+
+    def test_background_prompt_journal_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_NO_CALL_JOURNAL": "1",
+                "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "private background prompt"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            code, _, stderr = self.run_cli(["wait", run_id, "--timeout", "3", "--poll", "0.01"], env=env)
+            self.assertEqual(code, 0, stderr)
+
+            run_dir = Path(tmp) / "runs" / run_id
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertFalse((run_dir / "prompt.txt").exists())
+            self.assertNotIn("prompt_bytes", meta)
+
+    def test_journalled_prompt_is_capped_but_reports_its_true_size(self):
+        # A review prompt carries the whole diff and runs tens of KB, while the
+        # captures beside it average a few. Keep a bounded head on disk; the
+        # real size stays in meta.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"import sys; sys.stdin.read(); print('ok')\"",
+            }
+            code, _, stderr = self.run_cli(["ask", "echo", "--json", "x" * 200_000], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            run_dir = next((Path(tmp) / "runs").iterdir())
+            written = (run_dir / "prompt.txt").read_bytes()
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertLess(len(written), 70_000)
+            self.assertIn(b"prompt truncated by yoyo", written)
+            self.assertGreater(meta["prompt_bytes"], 200_000)
+
+    def test_background_autopsy_shows_the_prompt_not_the_trace_id(self):
+        # The child argv ends with --trace-id <id>, so reading the question off
+        # the tail of argv reported the trace id as what was asked.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_ECHO": "python3 -c \"print('ok')\"",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "--trace-id", "trace-bg", "why is the cache cold"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+            code, _, stderr = self.run_cli(["wait", run_id, "--timeout", "3", "--poll", "0.01"], env=env)
+            self.assertEqual(code, 0, stderr)
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", run_id], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("asked:   why is the cache cold", stdout)
+            self.assertNotIn("asked:   trace-bg", stdout)
 
     def test_background_ask_passes_piped_stdin_to_child(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,7 +389,8 @@ class YoyoTests(CliTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"YOYO_STATE_DIR": tmp}
             run_id = "20000101T000000-00000001"
-            self._write_run_meta(tmp, run_id, pid=os.getpid())
+            run_dir = self._write_run_meta(tmp, run_id, pid=os.getpid())
+            (run_dir / "stdout.txt").write_text("partial", encoding="utf-8")
 
             code, stdout, stderr = self.run_cli(
                 ["wait", run_id, "--timeout", "0.05", "--poll", "0.01"],
@@ -309,7 +398,55 @@ class YoyoTests(CliTestCase):
             )
             self.assertEqual(code, 124)
             self.assertEqual(stdout, "")
-            self.assertIn("timed out waiting", stderr)
+            self.assertIn("poll expired", stderr)
+            self.assertIn(run_id, stderr)
+            self.assertIn("7 bytes stdout", stderr)
+
+    def test_wait_timeout_reports_proof_of_life(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-00000002"
+            run_dir = self._write_run_meta(tmp, run_id, pid=os.getpid())
+            (run_dir / "log.txt").write_text(
+                "yoyo: still running, 20s elapsed, 1024 bytes captured\n"
+                "yoyo: still running, 60s elapsed, 255886 bytes captured\n",
+                encoding="utf-8",
+            )
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "0.05", "--poll", "0.01"],
+                env=env,
+            )
+            self.assertEqual(code, 124)
+            self.assertEqual(stdout, "")
+            self.assertIn("poll expired", stderr)
+            self.assertNotIn("timed out waiting", stderr)
+            self.assertIn("still running, 60s elapsed, 255886 bytes captured", stderr)
+            self.assertNotIn("20s elapsed", stderr)
+            self.assertRegex(stderr, r"\d+(\.\d+)?s elapsed")
+
+    def test_wait_timeout_json_adds_progress_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-00000003"
+            run_dir = self._write_run_meta(tmp, run_id, pid=os.getpid())
+            (run_dir / "log.txt").write_text(
+                "yoyo: still running, 60s elapsed, 255886 bytes captured\n", encoding="utf-8"
+            )
+
+            code, stdout, _ = self.run_cli(
+                ["wait", run_id, "--timeout", "0.05", "--poll", "0.01", "--json"],
+                env=env,
+            )
+            self.assertEqual(code, 124)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["run_id"], run_id)
+            self.assertEqual(payload["status"], "timeout")
+            self.assertEqual(payload["run_status"], "running")
+            self.assertGreater(payload["elapsed_s"], 0)
+            self.assertIn("255886 bytes captured", payload["last_progress"])
+            self.assertEqual(payload["stdout_bytes"], 0)
+            self.assertGreater(payload["stderr_bytes"], 0)
 
     def test_runs_prune_dry_run_lists_old_run_and_prune_deletes_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -810,6 +947,65 @@ class YoyoTests(CliTestCase):
         self.assertEqual(payload["stderr"], "")
         self.assertNotIn("stderr_plain", payload)
 
+    def test_timeout_salvages_codex_final_message(self):
+        # codex writes its answer to --output-last-message, not stdout. A run
+        # killed one second before it would have returned still has the
+        # finished answer on disk; reporting empty stdout discards it.
+        def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout, **kwargs):
+            output_index = cmd.index("--output-last-message") + 1
+            Path(cmd[output_index]).write_text("salvaged answer", encoding="utf-8")
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("codex transcript", encoding="utf-8")
+            raise yoyo.subprocess.TimeoutExpired(cmd, timeout)
+
+        with mock.patch.object(yoyo, "run_to_files", side_effect=fake_run):
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--json", "--timeout", "0.1", "hello"],
+            )
+
+        self.assertEqual(code, 124)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["exit_code"], 124)
+        self.assertEqual(payload["stdout"], "salvaged answer")
+        self.assertIn("Timed out after 0.1s", payload["stderr"])
+
+    def test_idle_timeout_salvages_codex_final_message(self):
+        def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout, **kwargs):
+            output_index = cmd.index("--output-last-message") + 1
+            Path(cmd[output_index]).write_text("salvaged answer", encoding="utf-8")
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+            raise yoyo.AgentIdleTimeout(idle_seconds=0.3, captured_bytes=0)
+
+        with mock.patch.object(yoyo, "run_to_files", side_effect=fake_run):
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--json", "--idle-timeout", "0.3", "hello"],
+            )
+
+        self.assertEqual(code, 124)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["stdout"], "salvaged answer")
+        self.assertIn("Idle timeout after 0.3s", payload["stderr"])
+
+    def test_timeout_keeps_stdout_when_final_message_empty(self):
+        # An untouched or blank final-message file must not blank out the
+        # bytes the agent did write before the kill.
+        def fake_run(cmd, prompt, cwd, stdout_path, stderr_path, timeout, **kwargs):
+            output_index = cmd.index("--output-last-message") + 1
+            Path(cmd[output_index]).write_text("   \n", encoding="utf-8")
+            stdout_path.write_text("partial transcript", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+            raise yoyo.subprocess.TimeoutExpired(cmd, timeout)
+
+        with mock.patch.object(yoyo, "run_to_files", side_effect=fake_run):
+            code, stdout, stderr = self.run_cli(
+                ["ask", "codex", "--json", "--timeout", "0.1", "hello"],
+            )
+
+        self.assertEqual(code, 124)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["stdout"], "partial transcript")
+
     def test_plain_output_uses_stderr_plain(self):
         result = {
             "stdout": "ok\n",
@@ -1070,6 +1266,9 @@ class YoyoTests(CliTestCase):
         reader = os.fdopen(read_fd, "r")
         merged_env = os.environ.copy()
         merged_env.update(env)
+        # This test drives main() directly, so it repeats run_cli's guard: the
+        # call it makes is journaled, and must not land in the real ledger.
+        merged_env.setdefault("YOYO_STATE_DIR", self._state_guard.name)
         stdout = io.StringIO()
         stderr = io.StringIO()
         try:
@@ -1105,7 +1304,8 @@ class YoyoTests(CliTestCase):
         self.assertNotIn("<stdin>", payload["stdout"])
 
     def test_idle_timeout_returns_124_with_idle_message(self):
-        env = {"YOYO_AGENT_SLEEP": "python3 -c \"import time; time.sleep(5)\""}
+        # Speaks once, then stalls: a real hang the idle guard must catch.
+        env = {"YOYO_AGENT_SLEEP": "python3 -c \"import time; print('working', flush=True); time.sleep(5)\""}
         code, stdout, stderr = self.run_cli(
             ["ask", "sleep", "--json", "--idle-timeout", "0.3", "hello"],
             env=env,
@@ -1116,6 +1316,20 @@ class YoyoTests(CliTestCase):
         self.assertEqual(payload["exit_code"], 124)
         self.assertIn("Idle timeout", payload["stderr"])
         self.assertNotIn("stderr_plain", payload)
+
+    def test_idle_timeout_ignores_silence_before_first_output(self):
+        # Agents that buffer everything until exit (claude, cursor, pi) emit
+        # nothing while they think. Arming the idle clock at process start
+        # turns --idle-timeout N into a hard kill at N seconds.
+        env = {"YOYO_AGENT_LATE": "python3 -c \"import time; time.sleep(1.2); print('late answer')\""}
+        code, stdout, stderr = self.run_cli(
+            ["ask", "late", "--json", "--idle-timeout", "0.4", "hello"],
+            env=env,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertIn("late answer", payload["stdout"])
 
     def test_invalid_idle_timeout_fails_loudly(self):
         code, stdout, stderr = self.run_cli(
@@ -1718,6 +1932,50 @@ class YoyoTests(CliTestCase):
             self.assertEqual(summary["end_reason"], "max-fail")
             self.assertEqual(summary["exit_code"], 1)
             self.assertEqual(counter.read_text(encoding="utf-8"), "5")
+
+    def test_loop_iteration_tail_reports_failure_reason(self):
+        long_failure = "p" * 130
+        results = [
+            {
+                "exit_code": 0,
+                "duration_s": 1,
+                "stdout": "success first\nsuccess tail\n",
+                "stderr": "success raw noise",
+                "stderr_plain": "success plain noise",
+            },
+            {
+                "exit_code": 1,
+                "duration_s": 2,
+                "stdout": "misleading failure stdout",
+                "stderr": "raw failure noise",
+                "stderr_plain": long_failure,
+            },
+            {
+                "exit_code": 1,
+                "duration_s": 3,
+                "stdout": "another misleading stdout",
+                "stderr": "raw failure reason",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            command = self._loop_stub_command(tmp, "import sys\nsys.stdin.read()\n")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+            with mock.patch.object(yoyo, "execute_agent_call", side_effect=results):
+                code, stdout, stderr = self.run_cli(
+                    ["loop", "stub", "--cwd", tmp, "--max-iter", "3", "--max-fail", "2", "--json", "report failures"],
+                    env=env,
+                )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout)["end_reason"], "max-fail")
+        iteration_lines = [line for line in stderr.splitlines() if " iter " in line]
+        self.assertEqual(len(iteration_lines), 3)
+        self.assertTrue(iteration_lines[0].endswith("success tail"))
+        self.assertTrue(iteration_lines[1].endswith(long_failure[:120]))
+        self.assertNotIn(long_failure, iteration_lines[1])
+        self.assertTrue(iteration_lines[2].endswith("raw failure reason"))
+        self.assertNotIn("misleading failure stdout", stderr)
+        self.assertNotIn("another misleading stdout", stderr)
 
     def test_loop_dry_run_prompt_contains_protocol_state_path_and_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2723,6 +2981,145 @@ class YoyoTests(CliTestCase):
         self.assertIn("=== b ===", stdout)
         self.assertIn("beta-answer", stdout)
 
+    def test_ask_fanout_marks_sites_cited_by_more_than_one_agent(self):
+        # Fan-out concatenated the answers and left the caller to spot overlap
+        # by eye. Co-citation is the one cheap signal only the caller can see.
+        env = self._fanout_env(
+            YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('bug at src/auth.ts:112 and src/solo.ts:5')\"",
+            YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('also src/auth.ts:112, plus lib/other.py:9')\"",
+        )
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "compare this"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        section = stdout.split("=== cited by more than one agent")[1]
+        self.assertIn("src/auth.ts:112", section)
+        self.assertIn("a, b", section)
+        self.assertNotIn("src/solo.ts:5", section)
+        self.assertNotIn("lib/other.py:9", section)
+
+    def test_ask_fanout_co_cites_an_extensionless_path(self):
+        # Real answers cite bin/yoyo, which carries no extension, and one agent
+        # spells it absolute where the other spells it relative. A port and a
+        # ratio appear in both answers and must not read as a shared site.
+        env = self._fanout_env(
+            YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('bin/yoyo:34 sets it, see http://host:8080, a 2:1 ratio')\"",
+            YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('[bin/yoyo](/Users/me/code/bin/yoyo:34), http://host:8080, 2:1')\"",
+        )
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "--json", "compare this"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["co_cited"],
+            [{"site": "/Users/me/code/bin/yoyo:34", "agents": ["a", "b"]}],
+        )
+
+    def test_co_citation_keeps_two_directories_apart(self):
+        # Grouping on the basename alone merged src/auth.py:42 with
+        # tests/auth.py:42 and printed one path neither agent cited. A third
+        # agent naming the bare file cannot decide which of the two it meant.
+        results = [
+            {"agent": "a", "stdout": "leak at src/auth.py:42"},
+            {"agent": "b", "stdout": "leak at tests/auth.py:42"},
+            {"agent": "c", "stdout": "leak at auth.py:42"},
+        ]
+
+        self.assertEqual(yoyo.co_cited_sites(results), [])
+
+    def test_co_citation_ignores_a_slash_only_path(self):
+        # "/:5" satisfies the citation shape (it has a separator) but names no
+        # file. Grouping by its last segment must not fall over on it.
+        results = [
+            {"agent": "a", "stdout": "look at /:5 and src/auth.py:42"},
+            {"agent": "b", "stdout": "look at /:5 and src/auth.py:42"},
+        ]
+
+        self.assertEqual(
+            yoyo.co_cited_sites(results),
+            [{"site": "src/auth.py:42", "agents": ["a", "b"]}],
+        )
+
+    def test_co_citation_merges_spellings_of_one_file(self):
+        # One file gets cited three ways in the same fan-out. All three name
+        # the same site, and the fullest spelling is the useful one to print.
+        results = [
+            {"agent": "a", "stdout": "./bin/yoyo:34 and lib/auth.py:9"},
+            {"agent": "b", "stdout": "bin/yoyo:34 and src/lib/auth.py:9"},
+            {"agent": "c", "stdout": "/Users/me/code/bin/yoyo:34"},
+        ]
+
+        self.assertEqual(
+            yoyo.co_cited_sites(results),
+            [
+                {"site": "/Users/me/code/bin/yoyo:34", "agents": ["a", "b", "c"]},
+                {"site": "src/lib/auth.py:9", "agents": ["a", "b"]},
+            ],
+        )
+
+    def test_co_citation_scan_stays_linear_on_a_long_token(self):
+        # Agents paste base64 and minified bundles. Restarting either regex on
+        # every "+" in one token could stall a fan-out for minutes.
+        blob = "aB3+" * 8000
+        results = [
+            {"agent": "a", "stdout": f"{blob} {blob}:112 src/auth.ts:112"},
+            {"agent": "b", "stdout": f"{blob} {blob}:112 src/auth.ts:112"},
+        ]
+
+        started = time.perf_counter()
+        shared = yoyo.co_cited_sites(results)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual([entry["site"] for entry in shared], ["src/auth.ts:112"])
+        self.assertLess(elapsed, 1.0, f"citation scan took {elapsed:.1f}s on one long token")
+
+    def test_co_citation_grouping_stays_linear_on_many_sites(self):
+        # A pasted grep dump is thousands of distinct sites. Matching each one
+        # against every site seen so far would take minutes on a 2 MB answer.
+        dump = "\n".join(f"src/mod{index}/file{index}.py:{index % 900 + 1}: hit" for index in range(20000))
+        results = [{"agent": "a", "stdout": dump}, {"agent": "b", "stdout": dump}]
+
+        started = time.perf_counter()
+        shared = yoyo.co_cited_sites(results)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(shared), 20000)
+        self.assertLess(elapsed, 1.0, f"citation grouping took {elapsed:.1f}s on 20k sites")
+
+    def test_co_citation_grouping_stays_linear_on_one_filename(self):
+        # A monorepo greps into thousands of same-named files, so the whole
+        # dump lands in one filename+line bucket. Scanning that bucket per
+        # candidate is quadratic even though the site count is unchanged.
+        dump = "\n".join(f"src/mod{index}/index.ts:42: hit" for index in range(20000))
+        results = [{"agent": "a", "stdout": dump}, {"agent": "b", "stdout": dump}]
+
+        started = time.perf_counter()
+        shared = yoyo.co_cited_sites(results)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(shared), 20000)
+        self.assertLess(elapsed, 1.0, f"citation grouping took {elapsed:.1f}s on one filename")
+
+    def test_ask_fanout_reports_when_no_site_is_shared(self):
+        # Silence would read as "not computed"; say the overlap was empty.
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "compare this"], env=self._fanout_env())
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("no file:line site was cited by more than one agent", stdout)
+
+    def test_ask_fanout_json_carries_the_co_citations(self):
+        env = self._fanout_env(
+            YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('src/auth.ts:112 leaks')\"",
+            YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('confirm src/auth.ts:112')\"",
+        )
+        code, stdout, stderr = self.run_cli(["ask", "a,b", "--json", "compare this"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["co_cited"],
+            [{"site": "src/auth.ts:112", "agents": ["a", "b"]}],
+        )
+
     def test_ask_fanout_judge_sees_all_candidates_and_the_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = self._fanout_env(YOYO_CONFIG=str(self._judge_config(tmp)))
@@ -2904,6 +3301,61 @@ class YoyoTests(CliTestCase):
             self.assertIn("=== a ===", stdout)
             self.assertIn("alpha-answer", stdout)
             self.assertIn("beta-answer", stdout)
+            self.assertIn("no file:line site was cited by more than one agent", stdout)
+
+    def test_ask_fanout_background_wait_prints_co_citations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(
+                YOYO_STATE_DIR=tmp,
+                YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('alpha src/auth.ts:112')\"",
+                YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('beta src/auth.ts:112')\"",
+            )
+            code, stdout, stderr = self.run_cli(["ask", "a,b", "--background", "task"], env=env)
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "5", "--poll", "0.01"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn(yoyo.CO_CITED_HEADER, stdout)
+            self.assertIn("src/auth.ts:112 — a, b", stdout)
+
+    def test_ask_fanout_background_one_answer_omits_co_citations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._fanout_env(
+                YOYO_STATE_DIR=tmp,
+                YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); sys.exit(3)\"",
+            )
+            code, stdout, stderr = self.run_cli(["ask", "a,b", "--background", "task"], env=env)
+            self.assertEqual(code, 0, stderr)
+            run_id = stdout.strip()
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--timeout", "5", "--poll", "0.01"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("alpha-answer", stdout)
+            self.assertNotIn(yoyo.CO_CITED_HEADER, stdout)
+
+    def test_stored_fanout_without_co_citations_omits_block(self):
+        result = {
+            "results": [
+                {"agent": "a", "exit_code": 0, "stdout": "alpha-answer"},
+                {"agent": "b", "exit_code": 0, "stdout": "beta-answer"},
+            ],
+            "judge": None,
+        }
+        stdout = io.StringIO()
+
+        with mock.patch("sys.stdout", stdout):
+            yoyo.emit_result(result, as_json=False)
+
+        self.assertNotIn(yoyo.CO_CITED_HEADER, stdout.getvalue())
 
     def test_ask_fanout_rejects_session(self):
         code, _, stderr = self.run_cli(
@@ -3084,6 +3536,56 @@ class YoyoTests(CliTestCase):
             self.assertIn("through the lens of developer experience", payload["prompt"])
 
 
+class TimeoutHelpGuardTests(CliTestCase):
+    """`--help` is the surface a calling agent actually reads.
+
+    145 of the 186 killed runs in the local ledger died on a hard --timeout the
+    caller had typed, and none on the default. An agent that sees a bare
+    "Per-agent timeout in seconds" supplies a number; one that is told the flag
+    kills the task does not. These anchors pin that warning to each subcommand
+    where a wrong value ends the run, and pin `wait --timeout` as the safe one.
+    """
+
+    def flag_help(self, subcommand: str, flag: str) -> str:
+        parser = yoyo.build_parser()
+        subparsers = parser._subparsers._group_actions[0]
+        for action in subparsers.choices[subcommand]._actions:
+            if flag in action.option_strings:
+                return action.help or ""
+        raise AssertionError(f"{subcommand} has no {flag}")
+
+    def test_task_timeouts_warn_that_they_kill_the_run(self):
+        for subcommand in ("ask", "review", "research", "loop"):
+            with self.subTest(subcommand=subcommand):
+                self.assertIn("kill", self.flag_help(subcommand, "--timeout").lower())
+
+    def test_task_timeout_help_quotes_env_default(self):
+        # The quoted number must be the one argparse will apply. A caller who
+        # exports YOYO_TIMEOUT and then reads "default 14400s" is being told a
+        # budget that is not theirs, on the flag that kills the most runs.
+        with mock.patch.dict(os.environ, {"YOYO_TIMEOUT": "300"}):
+            for subcommand in ("ask", "review", "research", "loop"):
+                with self.subTest(subcommand=subcommand):
+                    help_text = self.flag_help(subcommand, "--timeout")
+                    self.assertIn("default 300s", help_text)
+                    self.assertNotIn(str(yoyo.DEFAULT_TIMEOUT_SECONDS), help_text)
+
+    def test_task_timeout_help_quotes_builtin_default(self):
+        # With no override the help still names the built-in budget.
+        without_override = {key: value for key, value in os.environ.items() if key != "YOYO_TIMEOUT"}
+        with mock.patch.dict(os.environ, without_override, clear=True):
+            for subcommand in ("ask", "review", "research", "loop"):
+                with self.subTest(subcommand=subcommand):
+                    help_text = self.flag_help(subcommand, "--timeout")
+                    self.assertIn(f"default {yoyo.DEFAULT_TIMEOUT_SECONDS}s", help_text)
+
+    def test_wait_timeout_is_marked_safe_to_repeat(self):
+        self.assertIn("poll", self.flag_help("wait", "--timeout").lower())
+
+    def test_idle_timeout_does_not_recommend_a_task_budget(self):
+        self.assertNotIn("use --timeout", self.flag_help("ask", "--idle-timeout").lower())
+
+
 class SkillGuardTests(CliTestCase):
     """The SKILL.md files are yoyo's interface to calling agents.
 
@@ -3116,12 +3618,38 @@ class SkillGuardTests(CliTestCase):
         "delegated output is confirmed only after the caller confirms it": "only after you confirmed it",
         "irreversible work needs the human to ask": "only when the human asked",
         "loop DONE is self-declared and needs a diff read": "Read the diff before you believe it",
+        "a caller-typed timeout is the dominant kill, not the default": "not one died on the default",
+        "a timeout is a kill rather than a persistence budget": "a kill, not a budget",
+        "--background does not exempt the child from that timeout": "inherits the `--timeout`",
+        "a loop bound covers one iteration, set far above a normal one": "bounds a single iteration",
     }
 
     def test_skill_keeps_load_bearing_sections(self):
         text = self.SKILL_PATH.read_text(encoding="utf-8")
         missing = [why for why, anchor in self.LOAD_BEARING_ANCHORS.items() if anchor not in text]
         self.assertEqual(missing, [], f"SKILL.md lost load-bearing content: {missing}")
+
+    def test_doctor_reports_resolved_default_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            personal_root = Path(tmp) / "personal-skills"
+            foreign = personal_root / "fable-mode" / "SKILL.md"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("# Personal harness\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_DEFAULT_SKILLS": "yoyo-fable-mode,fable-mode",
+                "YOYO_SKILL_PATH": str(personal_root),
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+
+        bundled = ROOT / "skills" / "yoyo-fable-mode" / "SKILL.md"
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(f"default skill yoyo-fable-mode: bundled ({bundled})", stdout)
+        self.assertIn(f"default skill fable-mode: OUTSIDE YOYO BUNDLE ({foreign})", stdout)
 
     def test_doctor_flags_out_of_sync_skill_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3171,6 +3699,63 @@ class SkillGuardTests(CliTestCase):
             code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
             self.assertEqual(code, 0, stderr + stdout)
             self.assertIn("skill yoyo: in sync (1 homes)", stdout)
+
+    def test_doctor_reports_an_orphaned_skill_copy(self):
+        # Renaming a bundled skill leaves the old directory behind in every
+        # agent home, where it keeps being resolved: that is exactly how the
+        # pre-rename fable-mode kept shadowing yoyo-fable-mode.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            target = home / ".claude" / "skills" / "yoyo"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            orphan = home / ".claude" / "skills" / "yoyo-gone"
+            orphan.mkdir(parents=True)
+            (orphan / "SKILL.md").write_text("# left behind\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skill yoyo-gone: ORPHANED", stdout)
+            self.assertIn(str(orphan), stdout)
+
+            code, _, _ = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 1, "an orphaned skill copy must fail doctor --strict")
+
+    def test_doctor_ignores_a_foreign_skill_directory(self):
+        # Only yoyo's own skills are yoyo's to report on; a personal skill
+        # sharing an agent home is none of its business.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            target = home / ".claude" / "skills" / "yoyo"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            foreign = home / ".claude" / "skills" / "no-ai-slop"
+            foreign.mkdir(parents=True)
+            (foreign / "SKILL.md").write_text("# mine\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 0, stderr + stdout)
+            self.assertNotIn("no-ai-slop", stdout)
 
 
 class CallJournalTests(CliTestCase):
@@ -3273,6 +3858,103 @@ class AutopsyTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("killed by SIGTERM after 43.2s", stdout)
 
+    def test_autopsy_names_hard_timeout_clock(self):
+        # A background parent stores the child's raw payload, which carries no
+        # timed_out flag, so the autopsy called yoyo's own --timeout kill "a
+        # real agent failure". The clock and its value are in the stderr suffix.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260711T130000-00000003",
+                {"run_id": "20260711T130000-00000003", "agent": "claude", "pid": 99999999, "started_at": "2026-07-11T13:00:00Z"},
+                result={
+                    "agent": "claude",
+                    "exit_code": 124,
+                    "duration_s": 600.029,
+                    "stdout": "",
+                    "stderr": "warming up\n\nTimed out after 600.0s",
+                },
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130000-00000003"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("--timeout (600.0s)", stdout)
+            self.assertNotIn("a real agent failure", stdout)
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130000-00000003", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--timeout")
+            self.assertEqual(payload["timeout_clock_s"], 600.0)
+
+    def test_autopsy_names_idle_timeout_clock(self):
+        # Same record shape, opposite diagnosis: the stream stalled, so a bigger
+        # --timeout would not have helped.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260711T130100-00000004",
+                {"run_id": "20260711T130100-00000004", "agent": "claude", "pid": 99999999, "started_at": "2026-07-11T13:01:00Z"},
+                result={
+                    "agent": "claude",
+                    "exit_code": 124,
+                    "duration_s": 181.039,
+                    "stdout": "",
+                    "stderr": "warming up\n\nIdle timeout after 180.0s with no output (192 bytes captured before the stall)",
+                },
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130100-00000004"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("no new output for 180.0s", stdout)
+            self.assertNotIn("a real agent failure", stdout)
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130100-00000004", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--idle-timeout")
+            self.assertEqual(payload["timeout_clock_s"], 180.0)
+
+    def test_autopsy_reports_journal_clock_fields(self):
+        # A foreground call records the clock as flags rather than a suffix; the
+        # json form must name it there too.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260711T130200-00000005",
+                {"run_id": "20260711T130200-00000005", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-11T13:02:00Z"},
+                result={"exit_code": 124, "duration_s": 90.1, "idle_timed_out": True, "idle_seconds": 90.0, "stdout_bytes": 0, "stderr_bytes": 12},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130200-00000005", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--idle-timeout")
+            self.assertEqual(payload["timeout_clock_s"], 90.0)
+
+    def test_autopsy_clock_stays_absent_for_other_ends(self):
+        # An agent that exits 124 itself fired neither yoyo clock, and a run
+        # that ended any other way keeps the shape it had before.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260711T130300-00000006",
+                {"run_id": "20260711T130300-00000006", "agent": "codex", "pid": 99999999, "started_at": "2026-07-11T13:03:00Z"},
+                result={"agent": "codex", "exit_code": 124, "duration_s": 5.0, "stdout": "", "stderr": "the agent chose 124"},
+            )
+            self._make_run(
+                tmp, "20260711T130400-00000007",
+                {"run_id": "20260711T130400-00000007", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-11T13:04:00Z"},
+                result={"exit_code": 0, "duration_s": 1.0, "stdout_bytes": 5, "stderr_bytes": 0},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130300-00000006", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIsNone(payload["timeout_clock"])
+            self.assertIsNone(payload["timeout_clock_s"])
+            self.assertIn("a real agent failure", payload["verdict"])
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260711T130400-00000007", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("timeout_clock", json.loads(stdout))
+
     def test_autopsy_picks_latest_run_and_accepts_explicit_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._make_run(
@@ -3293,6 +3975,426 @@ class AutopsyTests(CliTestCase):
             code, stdout, _ = self.run_cli(["runs", "autopsy", "20260711T110000-00000001", "--json"], env={"YOYO_STATE_DIR": tmp})
             self.assertEqual(code, 0)
             self.assertIn("exit code 3", json.loads(stdout)["verdict"])
+
+    def test_asked_line_skips_task_headings_inside_skills(self):
+        # Skill documents are injected verbatim ahead of the task, and one that
+        # carries its own "Task:" line was reported as the question.
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = (
+                "You are being called as an independent second-opinion agent.\n\n"
+                "Skill guidance: follow the practices in these skill documents.\n\n"
+                "<skill name=\"house\">\nBefore editing:\n\nTask:\n"
+                "restate the ask in one line.\n</skill>\n\n"
+                "Task:\nwhy does the retry loop double-charge\n\n"
+                "Calling context: cwd=/tmp; mode=full-access delegation; caller=x; trace_id=t1.\n"
+            )
+            self._make_run(
+                tmp, "20260712T100000-00000011",
+                {"run_id": "20260712T100000-00000011", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-12T10:00:00Z"},
+                result={"exit_code": 0, "duration_s": 1.0, "stdout_bytes": 5, "stderr_bytes": 0},
+                files={"prompt.txt": prompt},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260712T100000-00000011"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("asked:   why does the retry loop double-charge", stdout)
+            self.assertNotIn("restate the ask in one line", stdout)
+
+    def test_asked_line_absent_when_task_is_past_the_head(self):
+        # A skill larger than the retained 64 KB head pushes the task heading
+        # out of prompt.txt entirely. Reporting the skill text as the question
+        # is worse than reporting nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            head = (
+                "You are being called as an independent second-opinion agent.\n\n"
+                "<skill name=\"spec\">\nA line of the standing spec.\n" * 4
+            )
+            self._make_run(
+                tmp, "20260712T100100-00000012",
+                {"run_id": "20260712T100100-00000012", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-12T10:01:00Z"},
+                result={"exit_code": 0, "duration_s": 1.0, "stdout_bytes": 5, "stderr_bytes": 0},
+                files={"prompt.txt": head + "\n[prompt truncated by yoyo at 65536 of 92621 bytes]"},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260712T100100-00000012", "--json"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIsNone(json.loads(stdout)["asked"])
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260712T100100-00000012"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("asked:", stdout)
+
+    def test_asked_line_reports_a_prompt_with_no_skills(self):
+        # --raw and background parents store a prompt with no skill block and
+        # no task heading; the whole text is the question and must survive.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_run(
+                tmp, "20260712T100200-00000013",
+                {"run_id": "20260712T100200-00000013", "mode": "call", "agent": "codex", "pid": 99999999, "started_at": "2026-07-12T10:02:00Z"},
+                result={"exit_code": 0, "duration_s": 1.0, "stdout_bytes": 5, "stderr_bytes": 0},
+                files={"prompt.txt": "/review the checkout diff\n"},
+            )
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "20260712T100200-00000013"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("asked:   /review the checkout diff", stdout)
+
+
+class BufferedAgentGuardTests(CliTestCase):
+    """--idle-timeout is not a hang guard for agents that buffer their output."""
+
+    def test_buffering_agents_are_marked(self):
+        # Measured first-byte behavior: claude emits a little stderr then goes
+        # silent for the whole run, cursor and pi emit nothing until they exit.
+        # codex and grok stream, so their silence really is a stall.
+        agents = yoyo.DEFAULT_AGENTS
+        self.assertTrue(agents["claude"].buffers_output)
+        self.assertTrue(agents["cursor"].buffers_output)
+        self.assertTrue(agents["pi"].buffers_output)
+        self.assertFalse(agents["codex"].buffers_output)
+        self.assertFalse(agents["grok"].buffers_output)
+
+    def test_warning_names_the_agent_and_the_flag_that_works(self):
+        warning = yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], 180.0)
+        self.assertIsNotNone(warning)
+        self.assertIn("claude", warning)
+        self.assertIn("180", warning)
+        self.assertIn("--timeout", warning)
+
+    def test_streaming_agent_gets_no_warning(self):
+        self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["codex"], 180.0))
+
+    def test_no_idle_timeout_means_no_warning(self):
+        self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], None))
+
+
+class RunIdentityTests(CliTestCase):
+    """A recorded pid outlives the process that held it; the run must not."""
+
+    def _run_dir(self, tmp: str, meta: dict) -> Path:
+        run_dir = Path(tmp) / "20260827T000000-0000beef"
+        run_dir.mkdir()
+        (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return run_dir
+
+    def _live_pid(self) -> int:
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc.pid
+
+    def test_reused_pid_reads_as_dead(self):
+        pid = self._live_pid()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp, {
+                "run_id": "20260827T000000-0000beef",
+                "pid": pid,
+                "pid_started": "Sat Jan  1 00:00:00 2000",
+                "started_at": "2026-08-27T00:00:00Z",
+            })
+            self.assertEqual(yoyo.run_status(run_dir), "dead")
+
+    def test_recorded_process_reads_as_running(self):
+        pid = self._live_pid()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp, {
+                "run_id": "20260827T000000-0000beef",
+                "pid": pid,
+                "pid_started": yoyo.pid_start_time(pid),
+                "started_at": "2026-08-27T00:00:00Z",
+            })
+            self.assertEqual(yoyo.run_status(run_dir), "running")
+
+    def test_record_without_identity_stays_permissive(self):
+        # Runs written before pid_started existed keep the old answer rather
+        # than being declared dead on missing evidence.
+        pid = self._live_pid()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp, {
+                "run_id": "20260827T000000-0000beef",
+                "pid": pid,
+                "started_at": "2026-08-27T00:00:00Z",
+            })
+            self.assertEqual(yoyo.run_status(run_dir), "running")
+
+    def test_start_time_of_a_dead_pid_is_empty(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        proc.kill()
+        proc.wait()
+        self.assertEqual(yoyo.pid_start_time(proc.pid), "")
+
+
+class ReviewFixTests(CliTestCase):
+    """Defects a cross-vendor review of this release found, each reproduced first."""
+
+    def _stub_command(self, tmp, body):
+        script = Path(tmp) / "stub.py"
+        script.write_text(body, encoding="utf-8")
+        return f"python3 {shlex.quote(str(script))}"
+
+    def test_journal_opt_out_keeps_the_prompt_out_of_meta(self):
+        # prompt.txt is suppressed under the opt-out, but the background
+        # parent also stores the child's argv - and the prompt is a positional
+        # argument in it, uncapped and unredacted.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_NO_CALL_JOURNAL": "1",
+                "YOYO_AGENT_ECHO": "cat",
+            }
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "--json", "SECRETPHRASE-alpha"],
+                env=env,
+            )
+            self.assertEqual(code, 0, stderr)
+            run_dir = Path(json.loads(stdout)["run_dir"])
+            meta_text = (run_dir / "meta.json").read_text(encoding="utf-8")
+            self.assertNotIn("SECRETPHRASE-alpha", meta_text)
+            self.assertIn("ask", json.loads(meta_text)["argv"])
+
+    def _excerpt_of(self, tmp, prompt_text):
+        run_dir = Path(tmp) / "run"
+        run_dir.mkdir()
+        (run_dir / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+        return yoyo.prompt_excerpt(run_dir)
+
+    def test_asked_line_stops_before_attached_file_context(self):
+        # The excerpt ran from the task heading to the calling-context trailer,
+        # swallowing whatever --file put between them.
+        with tempfile.TemporaryDirectory() as tmp:
+            excerpt = self._excerpt_of(tmp, (
+                "You are a delegate.\n\n"
+                "Task:\nreview this config\n\n"
+                "Context files:\n<file path=\"creds.env\">\nAWS_SECRET=leaked-value\n</file>\n\n"
+                "Calling context: cwd=/tmp; mode=read-only delegation; caller=test.\n"
+            ))
+
+            self.assertEqual(excerpt, "review this config")
+
+    def test_asked_line_stops_before_stdin_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            excerpt = self._excerpt_of(tmp, (
+                "You are a delegate.\n\n"
+                "Task:\nsummarise the log\n\n"
+                "<stdin>\nSESSION_TOKEN=leaked-value\n</stdin>\n\n"
+                "Calling context: cwd=/tmp; mode=read-only delegation; caller=test.\n"
+            ))
+
+            self.assertEqual(excerpt, "summarise the log")
+
+    def test_asked_line_keeps_a_multiline_question(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            excerpt = self._excerpt_of(tmp, (
+                "You are a delegate.\n\n"
+                "Task:\nfirst line\nsecond line\n\n"
+                "Calling context: cwd=/tmp; mode=read-only delegation; caller=test.\n"
+            ))
+
+            self.assertEqual(excerpt, "first line second line")
+
+    def test_malformed_timeout_suffix_names_no_clock(self):
+        # A diagnostic tool must not be the thing that crashes: an agent whose
+        # own stderr ends in a lookalike line used to reach float("1..2").
+        self.assertIsNone(yoyo.timeout_clock({"exit_code": 124, "stderr": "Timed out after 1..2s"}))
+        self.assertEqual(
+            yoyo.timeout_clock({"exit_code": 124, "stderr": "Timed out after 300s"}),
+            (yoyo.HARD_TIMEOUT_CLOCK, 300.0),
+        )
+        self.assertEqual(
+            yoyo.timeout_clock({"exit_code": 124, "stderr": "Idle timeout after 12.5s with no output (0 bytes captured before the stall)"}),
+            (yoyo.IDLE_TIMEOUT_CLOCK, 12.5),
+        )
+
+    def test_loop_failure_tail_falls_back_to_stdout(self):
+        # An iteration that fails with everything on stdout and nothing on
+        # stderr used to print a blank reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            command = self._stub_command(tmp, (
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "print('TypeError: cannot read x')\n"
+                "sys.exit(1)\n"
+            ))
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_AGENT_STUB": command}
+
+            code, stdout, stderr = self.run_cli(
+                ["loop", "stub", "--cwd", tmp, "--max-iter", "1", "do the work"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("TypeError: cannot read x", stdout)
+
+    def test_orphan_check_ignores_a_lookalike_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            target = home / ".claude" / "skills" / "yoyo"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            for lookalike in ("yoyodyne", "yoyo2"):
+                other = home / ".claude" / "skills" / lookalike
+                other.mkdir(parents=True)
+                (other / "SKILL.md").write_text("# mine\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 0, stderr + stdout)
+            self.assertNotIn("yoyodyne", stdout)
+            self.assertNotIn("yoyo2", stdout)
+
+    def test_orphan_check_flags_a_copied_inbuilt_skill(self):
+        # yoyo-fable-mode is bundled but never installed, so a copy in an agent
+        # home is a stray that shadows the bundle - and must not be described
+        # as missing from it.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            for name in ("yoyo", "yoyo-fable-mode"):
+                (source / name).mkdir(parents=True)
+                (source / name / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            target = home / ".claude" / "skills" / "yoyo"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            stray = home / ".claude" / "skills" / "yoyo-fable-mode"
+            stray.mkdir(parents=True)
+            (stray / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skill yoyo-fable-mode: ORPHANED", stdout)
+            self.assertIn("yoyo installs no copy of it", stdout)
+
+    def test_journal_opt_out_redacts_a_prompt_split_around_flags(self):
+        # argparse lets the question sit on both sides of a flag, so matching
+        # one contiguous run of words left half of it in the stored argv.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_NO_CALL_JOURNAL": "1", "YOYO_AGENT_ECHO": "cat"}
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--background", "LEAKONE", "--json", "LEAKTWO"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            meta_text = (Path(json.loads(stdout)["run_dir"]) / "meta.json").read_text(encoding="utf-8")
+            self.assertNotIn("LEAKONE", meta_text)
+            self.assertNotIn("LEAKTWO", meta_text)
+
+    def test_journal_opt_out_covers_a_single_string_prompt(self):
+        # imagegen takes its prompt as prompt_text, not a word list, and it is
+        # just as positional in the argv the parent stores.
+        words = yoyo.prompt_words_of(argparse.Namespace(prompt_text="a red bicycle"))
+        argv = ["yoyo", "imagegen", "a red bicycle", "--out", "bike.png"]
+
+        self.assertEqual(words, ["a red bicycle"])
+        self.assertEqual(
+            yoyo.redact_prompt_args(argv, words),
+            ["yoyo", "imagegen", yoyo.REDACTED_PROMPT_ARG, "--out", "bike.png"],
+        )
+
+    def test_background_warns_about_buffering_before_it_detaches(self):
+        # The child inherits --idle-timeout, but its stderr goes to log.txt,
+        # where the caller reads the warning only after the run is over.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_AGENT_CLAUDE": "cat"}
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "claude", "--background", "--idle-timeout", "60", "--json", "hello"],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("--idle-timeout 60s is not a hang guard", stderr)
+
+    def test_poll_expiry_counts_a_background_parents_captures(self):
+        # A background parent has no stdout.txt: the child's stdout is the
+        # result envelope, and its stderr is log.txt.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "20260827T100000-00000031"
+            run_dir.mkdir()
+            (run_dir / "meta.json").write_text(json.dumps({"started_at": "2026-08-27T10:00:00Z"}), encoding="utf-8")
+            (run_dir / "result.json").write_text("x" * 40, encoding="utf-8")
+            (run_dir / "log.txt").write_text("y" * 12, encoding="utf-8")
+
+            report = yoyo.poll_expiry_report(run_dir.name, run_dir)
+
+            self.assertEqual(report["stdout_bytes"], 40)
+            self.assertEqual(report["stderr_bytes"], 12)
+
+    def test_timed_out_result_carries_the_clock_that_fired(self):
+        # A background parent's result.json is the child's envelope and has no
+        # flags of its own, so the envelope has to say which clock fired
+        # instead of leaving autopsy to trust a stderr suffix.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_AGENT_SLOW": "python3 -c \"import time; time.sleep(20)\"",
+            }
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "slow", "--timeout", "1", "--json", "hello"],
+                env=env,
+            )
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertTrue(payload["timed_out"])
+            self.assertEqual(payload["timeout_s"], 1.0)
+            self.assertEqual(
+                yoyo.timeout_clock(payload),
+                (yoyo.HARD_TIMEOUT_CLOCK, 1.0),
+            )
+
+    def test_co_citation_sees_a_repeated_agents_two_samples(self):
+        # `codex,codex` is a documented self-consistency sample: two
+        # independent answers that happen to share a name.
+        results = [
+            {"agent": "codex", "stdout": "the bug is at bin/yoyo:1338"},
+            {"agent": "codex", "stdout": "look at /repo/bin/yoyo:1338"},
+        ]
+
+        shared = yoyo.co_cited_sites(results)
+
+        # The fullest spelling of the two is what gets displayed.
+        self.assertEqual([entry["site"] for entry in shared], ["/repo/bin/yoyo:1338"])
+        self.assertEqual(shared[0]["agents"], ["codex", "codex"])
+
+    def test_co_citation_still_needs_two_answers(self):
+        results = [{"agent": "codex", "stdout": "bin/yoyo:1338 and bin/yoyo:1338 again"}]
+
+        self.assertEqual(yoyo.co_cited_sites(results), [])
+
+    def test_configured_agent_keeps_its_buffering_behavior(self):
+        # Overriding claude's command in agents.json must not quietly drop the
+        # measured fact that claude buffers.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            config.write_text(json.dumps({"agents": {
+                "claude": {"command": ["my-claude-wrapper", "-p"], "kind": "claude"},
+                "mine": {"command": ["mine"]},
+                "slow": {"command": ["slow"], "buffers_output": True},
+            }}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"YOYO_CONFIG": str(config)}):
+                agents = yoyo.load_agents()
+            self.assertTrue(agents["claude"].buffers_output)
+            self.assertFalse(agents["mine"].buffers_output)
+            self.assertTrue(agents["slow"].buffers_output)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,16 @@ yoyo wait "$run_id" --timeout 25    # 124 = still running, call wait again
 
 `--background` works on `ask`, `loop`, `research`, and `review`.
 
+### The two timeouts are not the same flag
+
+`yoyo wait --timeout 25` bounds **your poll**. It is safe: 124 means still running, and you call it again. `yoyo ask --timeout N` bounds **the agent's entire task**, and at N seconds kills it mid-thought.
+
+So do not pass `--timeout` or `--idle-timeout` to `ask`, `review`, or `research`. Their defaults sit deliberately far above any real call. In this machine's run ledger 145 of the 186 killed calls died on a hard `--timeout` a caller had typed — 300s, 180s, 600s, 900s, always a round number — and not one died on the default. Against a p90 call length of 13 minutes, a 5-minute budget is not a safety net, it is the failure.
+
+`--background` does not protect you from this: the detached child inherits the `--timeout` you passed and dies on schedule, having captured nothing.
+
+If an outer contract genuinely forces a bound, put it above the p99 — 1800s or more — and never below it because the call "should be quick".
+
 A call your harness cut off is **unavailable**, never *passed*. When you are unsure what happened to one, `yoyo runs autopsy` reconstructs the most recent run from recorded evidence — finished, failed, signal-killed, or still running.
 
 ## Agents
@@ -96,7 +106,7 @@ Be the judge yourself when you hold the decision context; use `--judge` when you
 - **Ask reviewers to falsify**: "find the strongest reason this is wrong" beats "review my plan".
 - **Demand artifacts.** "Return the failing input, the patch, or the counterexample" beats a status report. Ask for the exact commands run and their output, and for file/line pointers — reviewing captured evidence beats re-verifying prose.
 - **Name the return contract**: "return only when X holds and survives your own adversarial check; otherwise return the strongest verified partial result and its exact remaining gap."
-- **Give a persistence budget.** Codex especially calibrates effort to the prompt: "keep working until the tests pass; do not stop because the first approach failed" produces materially deeper runs. Pair a generous budget with `--background` and `--idle-timeout`, rather than shortening the ask.
+- **Give a persistence budget.** Codex especially calibrates effort to the prompt: "keep working until the tests pass; do not stop because the first approach failed" produces materially deeper runs. Pair a generous budget with `--background`, rather than shortening the ask. The budget belongs in the prose; a `--timeout` is a kill, not a budget.
 - **Enumerate the failure modes you want checked.** "Check for A, B, C" bites where "check your work" does not.
 - **Replace adjectives with observables.** Point at an exemplar in the repo ("follow the pattern in `HotDogWidget.php`") instead of describing "clean".
 - **Give a worker a check it can run** and ask it to iterate until the check passes. Otherwise "looks done" is its only stop signal.
@@ -109,6 +119,8 @@ Share context instead of paying for it repeatedly: write a dense repo brief once
 `yoyo loop` runs a task as independent fresh-context iterations. Each one reads the state file (default `.yoyo/loop-state.md`), does one increment, and rewrites it. A comma-separated agent list rotates vendors across iterations.
 
 It stops on `STATUS: DONE` in the state file, a `STOP` file, `--max-iter`, or `--max-fail` consecutive crashed iterations (which exits 1 — a human should look).
+
+A loop is the one place a runtime bound earns its keep: `--timeout` bounds a single iteration, and without one a wedged iteration holds the whole run for the four-hour default while `--max-fail` waits on a return that never comes. Set it well above a normal iteration — 1800s or more — never at one.
 
 Three files shape a good loop, and each earns its place:
 

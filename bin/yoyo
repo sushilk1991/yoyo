@@ -26,11 +26,15 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.22.0"
+VERSION = "0.23.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
-# --idle-timeout to catch stalls early on agents that stream output.
+# --idle-timeout to catch an agent that goes quiet after it has started
+# talking; it cannot see a stall before the first byte.
 DEFAULT_TIMEOUT_SECONDS = 14400
+# `ps` answers in milliseconds; the bound only exists so a wedged ps cannot
+# hang a status read.
+PS_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 DEFAULT_MAX_INPUT_BYTES = 2_000_000
 DEFAULT_HEARTBEAT_SECONDS = 20.0
@@ -148,6 +152,10 @@ class AgentSpec:
     flavor: str | None = None
     read_only_args: list[str] | None = None
     full_access_args: list[str] | None = None
+    # Measured, not guessed: claude emits a little stderr then goes silent for
+    # the whole run, cursor and pi emit nothing at all until they exit. Their
+    # silence is work, not a stall, which changes what --idle-timeout means.
+    buffers_output: bool = False
 
 
 # agy takes the prompt as the value of its -p flag rather than on stdin. The
@@ -160,15 +168,15 @@ AGY_PROMPT_SENTINEL = "\x00YOYO_AGY_PROMPT\x00"
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
-    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude"),
-    "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi"),
+    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude", buffers_output=True),
+    "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi", buffers_output=True),
     # On-demand agents: one-shot only (no --session), useful for cross-vendor
     # opinions. cursor-agent reads the prompt from piped stdin in print mode;
     # grok has no stdin sentinel, so the prompt arrives via --prompt-file
     # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
     # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
     # and has no headless read-only mode.
-    "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "text"], flavor="cursor"),
+    "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "text"], flavor="cursor", buffers_output=True),
     "agy": AgentSpec("agy", ["agy"], flavor="agy"),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
 }
@@ -334,6 +342,24 @@ def resolve_idle_timeout(args: argparse.Namespace) -> float | None:
     return None if value <= 0 else value
 
 
+def idle_timeout_warning(spec: AgentSpec, idle_timeout: float | None) -> str | None:
+    """Say so when --idle-timeout cannot mean what the caller thinks it means.
+
+    The idle clock arms on the first captured byte, so against an agent that
+    buffers everything until it exits the flag is bimodal and never a hang
+    guard: total silence never arms it, and one early stderr line arms it in
+    time to fire in the middle of healthy work. Report the mismatch and run the
+    call anyway — the caller chose the flag, and yoyo does not overrule it.
+    """
+    if idle_timeout is None or not spec.buffers_output:
+        return None
+    return (
+        f"yoyo: {spec.name} buffers its output until it exits, so --idle-timeout "
+        f"{idle_timeout:g}s is not a hang guard for it — it either never arms or "
+        f"fires mid-work. --timeout is the bound that applies."
+    )
+
+
 def config_path() -> Path:
     return Path(os.environ.get("YOYO_CONFIG", "~/.config/yoyo/agents.json")).expanduser()
 
@@ -481,7 +507,11 @@ def run_to_files(
 
         start = time.monotonic()
         last_size = 0
-        last_activity = start
+        # The idle clock arms on the first captured byte, not at spawn. Agents
+        # that buffer every byte until they exit (claude, cursor, pi) are silent
+        # while they work, not stalled; arming at spawn turns --idle-timeout N
+        # into a hard kill at N seconds. --timeout covers the never-starts case.
+        last_activity: float | None = None
         last_heartbeat = start
         try:
             while True:
@@ -495,7 +525,7 @@ def run_to_files(
                 if size != last_size:
                     last_size = size
                     last_activity = now
-                if idle_timeout is not None and now - last_activity >= idle_timeout:
+                if idle_timeout is not None and last_activity is not None and now - last_activity >= idle_timeout:
                     _terminate_child(proc, pgid)
                     proc.wait()
                     raise AgentIdleTimeout(round(now - last_activity, 1), size)
@@ -507,7 +537,7 @@ def run_to_files(
                 deadlines = [0.5]
                 if timeout is not None:
                     deadlines.append(timeout - (now - start))
-                if idle_timeout is not None:
+                if idle_timeout is not None and last_activity is not None:
                     deadlines.append(idle_timeout - (now - last_activity))
                 if heartbeat is not None:
                     deadlines.append(heartbeat - (now - last_heartbeat))
@@ -522,6 +552,17 @@ def run_to_files(
                 _unregister_child(pgid)
         feeder.join(timeout=1.0)
     return subprocess.CompletedProcess(cmd, proc.returncode)
+
+
+def default_buffers_output(name: str) -> bool:
+    """Whether a built-in of this name is known to buffer until it exits.
+
+    An override in agents.json or a YOYO_AGENT_* variable nearly always
+    points at the same binary through a wrapper, so the measured fact
+    survives the override; a config can still say otherwise outright.
+    """
+    spec = DEFAULT_AGENTS.get(name)
+    return bool(spec and spec.buffers_output)
 
 
 def load_configured_agents() -> dict[str, AgentSpec]:
@@ -540,6 +581,7 @@ def load_configured_agents() -> dict[str, AgentSpec]:
         read_only_args: list[str] = []
         full_access_args: list[str] = []
         flavor: str | None = None
+        buffers_output = default_buffers_output(name)
         if isinstance(raw, str):
             command = shlex.split(raw)
         elif isinstance(raw, dict) and isinstance(raw.get("command"), list):
@@ -549,11 +591,16 @@ def load_configured_agents() -> dict[str, AgentSpec]:
             flavor = raw.get("kind")
             if flavor is not None:
                 flavor = str(flavor)
+            if "buffers_output" in raw:
+                buffers_output = bool(raw["buffers_output"])
         else:
             raise YoyoError(f"Invalid agent config for {name!r}; use a string or {{\"command\": [...]}}")
         if not command:
             raise YoyoError(f"Agent {name!r} has an empty command")
-        agents[name] = AgentSpec(name, command, flavor=flavor, read_only_args=read_only_args, full_access_args=full_access_args)
+        agents[name] = AgentSpec(
+            name, command, flavor=flavor, read_only_args=read_only_args,
+            full_access_args=full_access_args, buffers_output=buffers_output,
+        )
     return agents
 
 
@@ -564,7 +611,7 @@ def load_agents() -> dict[str, AgentSpec]:
     for key, value in os.environ.items():
         if key.startswith("YOYO_AGENT_") and value.strip():
             name = key.removeprefix("YOYO_AGENT_").lower().replace("_", "-")
-            agents[name] = AgentSpec(name, shlex.split(value))
+            agents[name] = AgentSpec(name, shlex.split(value), buffers_output=default_buffers_output(name))
     return agents
 
 
@@ -1176,7 +1223,34 @@ def run_result(run_dir: Path) -> dict[str, Any] | None:
     return load_json_file(run_dir / "result.json")
 
 
-def pid_is_running(pid: Any) -> bool:
+def pid_start_time(pid: Any) -> str:
+    """When the OS says this pid started, or "" when it cannot say.
+
+    A pid is not an identity — the OS reuses it. A pid plus its start time is
+    unique for the life of the machine, and `ps` is the only place the stdlib
+    can read that for a process yoyo no longer owns.
+    """
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(value), "-o", "lstart="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=PS_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def pid_is_running(pid: Any, started: str | None = None) -> bool:
     try:
         value = int(pid)
     except (TypeError, ValueError):
@@ -1188,10 +1262,21 @@ def pid_is_running(pid: Any) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        pass
     except OSError:
         return False
-    return True
+
+    # os.kill(pid, 0) proves only that *a* process holds this pid. Once the OS
+    # recycles it, a run that died without writing result.json reads as
+    # `running` for good: `wait` polls a stranger's process until the caller
+    # gives up, and prune skips the directory forever. The recorded start time
+    # settles which process this actually is.
+    if not started:
+        return True
+    live = pid_start_time(value)
+    if not live:
+        return True
+    return live == started
 
 
 def run_status(run_dir: Path) -> str:
@@ -1200,7 +1285,7 @@ def run_status(run_dir: Path) -> str:
         return "unknown"
     if run_result(run_dir) is not None:
         return "done"
-    return "running" if pid_is_running(meta.get("pid")) else "dead"
+    return "running" if pid_is_running(meta.get("pid"), meta.get("pid_started")) else "dead"
 
 
 def run_started_at(meta: dict[str, Any] | None, run_dir: Path) -> datetime | None:
@@ -1252,11 +1337,29 @@ def call_journal_enabled() -> bool:
     return os.environ.get("YOYO_NO_CALL_JOURNAL", "") != "1"
 
 
+# A review prompt carries the whole diff and runs tens of KB, where the
+# captures beside it average a few, so the journal keeps a bounded head of it.
+# The true size is recorded as prompt_bytes and stays exact.
+PROMPT_JOURNAL_MAX_BYTES = 65_536
+PROMPT_TRUNCATION_MARKER = "\n[prompt truncated by yoyo at {kept} of {total} bytes]"
+
+
+def write_journal_prompt(run_dir: Path, prompt: str) -> None:
+    encoded = prompt.encode("utf-8")
+    if len(encoded) <= PROMPT_JOURNAL_MAX_BYTES:
+        (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        return
+    head = encoded[:PROMPT_JOURNAL_MAX_BYTES].decode("utf-8", errors="replace")
+    marker = PROMPT_TRUNCATION_MARKER.format(kept=PROMPT_JOURNAL_MAX_BYTES, total=len(encoded))
+    (run_dir / "prompt.txt").write_text(head + marker, encoding="utf-8")
+
+
 def journal_call_start(
     agent_name: str,
     cmd: list[str],
     args: argparse.Namespace,
     cwd: Path,
+    prompt: str,
 ) -> Path | None:
     """Record a foreground agent call in the runs ledger as it executes.
 
@@ -1282,10 +1385,15 @@ def journal_call_start(
             "trace_id": getattr(args, "trace_id", None),
             "caller": getattr(args, "caller", None),
             "command": cmd,
+            "prompt_bytes": len(prompt.encode("utf-8")),
             "pid": os.getpid(),
+            "pid_started": pid_start_time(os.getpid()),
             "started_at": iso_utc(utc_now()),
         }
         (run_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        # The command alone does not say what was asked: every agent takes the
+        # prompt on stdin, so a killed call left the question unrecoverable.
+        write_journal_prompt(run_dir, prompt)
     except OSError:
         return None
     with _ACTIVE_JOURNALS_LOCK:
@@ -1327,6 +1435,42 @@ def _flush_active_journals(signum: int) -> None:
             pass
 
 
+# What stands in for the question in a stored argv when the caller opted out
+# of the call journal. The child is spawned with the real words; only yoyo's
+# own readable copy loses them.
+REDACTED_PROMPT_ARG = "<redacted>"
+
+
+def prompt_words_of(args: argparse.Namespace) -> list[str]:
+    """Every command-line word that is the caller's question, not a flag.
+
+    `ask` and `loop` take the question as a list of positional words and
+    `imagegen` takes it as one `prompt_text` string. Both are positional, so
+    both land in the argv a background parent records.
+    """
+    words = [str(word) for word in (getattr(args, "prompt", None) or [])]
+    text = getattr(args, "prompt_text", None)
+    if isinstance(text, str) and text:
+        words.append(text)
+    return words
+
+
+def redact_prompt_args(argv: list[str], prompt_words: list[str]) -> list[str]:
+    """The child's argv with the question blanked out, for the ledger copy.
+
+    YOYO_NO_CALL_JOURNAL=1 suppresses prompt.txt, but a background parent
+    also records the argv it spawned — and the question sits in that argv as
+    positional arguments, uncapped. Matching is one element at a time
+    because argparse lets the question sit on both sides of a flag:
+    over-redacting a flag value that repeats a prompt word costs a reader
+    nothing, and under-redacting defeats the opt-out.
+    """
+    if not prompt_words:
+        return list(argv)
+    words = set(prompt_words)
+    return [REDACTED_PROMPT_ARG if item in words else item for item in argv]
+
+
 def background_child_argv(args: argparse.Namespace) -> list[str]:
     raw = list(getattr(args, "_raw_argv", sys.argv[1:]))
     filtered: list[str] = []
@@ -1354,7 +1498,28 @@ def background_child_argv(args: argparse.Namespace) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve())] + filtered
 
 
+def warn_buffered_idle_timeout(args: argparse.Namespace) -> None:
+    """Print the buffering warning in the foreground, before detaching.
+
+    A background child inherits --idle-timeout and warns about it on its own
+    stderr, which is log.txt — where the caller reads it only after the run
+    is over and the flag has already killed something.
+    """
+    idle_timeout = resolve_idle_timeout(args)
+    if idle_timeout is None:
+        return
+    agents = load_agents()
+    for name in str(getattr(args, "agent", "") or "").split(","):
+        spec = agents.get(name.strip())
+        if spec is None:
+            continue
+        warning = idle_timeout_warning(spec, idle_timeout)
+        if warning is not None:
+            eprint(warning)
+
+
 def start_background_run(args: argparse.Namespace) -> int:
+    warn_buffered_idle_timeout(args)
     stdin_bytes = read_background_stdin(args)
     # Commands without a positional prompt (review) validate their
     # own inputs before detaching; the guard below is for prompt-taking ones.
@@ -1380,6 +1545,12 @@ def start_background_run(args: argparse.Namespace) -> int:
         stdin_path.write_bytes(stdin_bytes)
 
     child_argv = background_child_argv(args)
+    # A background run needs its ledger record to detach, but its optional
+    # prompt capture follows the same privacy opt-out as foreground journals.
+    prompt_words = getattr(args, "prompt", None)
+    journal_prompt = " ".join(prompt_words) if prompt_words and call_journal_enabled() else None
+    stored_argv = child_argv if call_journal_enabled() else redact_prompt_args(child_argv, prompt_words_of(args))
+
     meta = {
         "run_id": run_id,
         # Fan-out commands carry --agents.
@@ -1388,12 +1559,20 @@ def start_background_run(args: argparse.Namespace) -> int:
         "cwd": str(resolve_cwd(args.cwd)),
         "trace_id": args.trace_id,
         "caller": args.caller,
-        "argv": child_argv,
+        "argv": stored_argv,
         "pid": None,
         "started_at": iso_utc(started),
     }
+    if journal_prompt is not None:
+        meta["prompt_bytes"] = len(journal_prompt.encode("utf-8"))
+
     meta_path = run_dir / "meta.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Only commands with a positional prompt have one to record here; review
+    # builds its prompt inside the child, whose own call record carries it.
+    if journal_prompt is not None:
+        write_journal_prompt(run_dir, journal_prompt)
 
     result_path = run_dir / "result.json"
     log_path = run_dir / "log.txt"
@@ -1416,6 +1595,7 @@ def start_background_run(args: argparse.Namespace) -> int:
             stdin_file.close()
 
     meta["pid"] = proc.pid
+    meta["pid_started"] = pid_start_time(proc.pid)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.json:
@@ -1498,6 +1678,120 @@ def spill_fanout_answers(trace_id: str, successful: list[dict[str, Any]]) -> Pat
         path.write_text(str(result.get("stdout", "")), encoding="utf-8")
         result["stdout_file"] = str(path)
     return answers_dir
+
+
+# A file:line citation. The path is one flat character run: nesting a repeat
+# inside a repeat here goes quadratic on a single long token, and agents do
+# paste base64. Shape is checked after the match instead — the path keeps a
+# separator (bin/yoyo:34, an extensionless file still counts) or an extension
+# (yoyo.py:34). One or the other must hold, and a match may not start
+# mid-token, so "http://host:8080" and a "2:1" ratio never hit.
+CITATION_RE = re.compile(r"(?<![\w:/+.-])([\w./+-]+):(\d{1,7})\b")
+CITATION_STEM_RE = re.compile(r"[A-Za-z]")
+CITATION_EXTENSION_RE = re.compile(r"[A-Za-z0-9_]{1,10}")
+
+
+def is_citation_path(path: str) -> bool:
+    if "/" in path:
+        return True
+    stem, separator, extension = path.rpartition(".")
+    if not separator:
+        return False
+    if CITATION_EXTENSION_RE.fullmatch(extension) is None:
+        return False
+    stem = stem.rsplit(".", 1)[-1]
+    return CITATION_STEM_RE.search(stem) is not None
+
+
+CO_CITED_HEADER = "=== cited by more than one agent (co-citation, not agreement on the verdict) ==="
+
+
+def citation_segments(path: str) -> tuple[str, ...]:
+    """A cited path as its directory segments, with empty and "." segments
+    dropped so "./bin/yoyo" and "bin/yoyo" compare equal. An absolute path
+    keeps its leading segments; the suffix test below is what pairs it with
+    the relative spelling.
+    """
+    return tuple(part for part in path.split("/") if part and part != ".")
+
+
+def co_cited_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The file:line sites that more than one answer in a fan-out names.
+
+    Fan-out answers are mostly disjoint, so the rare overlap is the one signal
+    no single answer carries. Two citations are the same site when the line
+    matches and one path is a suffix of the other, because one agent writes
+    bin/yoyo:1338 where another writes the absolute path; the fullest spelling
+    seen is the one displayed. Answers are counted by position, not by agent
+    name: `codex,codex` is a documented self-consistency sample, and two
+    samples that land on the same line is exactly what it is asking about.
+    """
+    by_path: dict[tuple[tuple[str, ...], str], dict[str, Any]] = {}
+    for index, result in enumerate(results):
+        for match in CITATION_RE.finditer(str(result.get("stdout") or "")):
+            path, line = match.group(1), match.group(2)
+            if not is_citation_path(path):
+                continue
+            segments = citation_segments(path)
+            if not segments:
+                # A run of slashes clears the shape check but names no file.
+                continue
+
+            entry = by_path.setdefault((segments, line), {"text": path, "segments": segments, "line": line, "answers": []})
+            if len(path) < len(entry["text"]):
+                # Identical segments, so the spellings differ only by a "./"
+                # or a doubled slash: show the reader the uncluttered one.
+                entry["text"] = path
+            if index not in entry["answers"]:
+                entry["answers"].append(index)
+
+    # A shorter spelling names the same site as a longer one when it is a
+    # suffix of it: "auth.py" and "bin/yoyo" name "src/auth.py" and
+    # "/tmp/bin/yoyo", while "src/auth.py" and "tests/auth.py" share only a
+    # basename and stay two sites. So each site is filed under every suffix of
+    # its own path, and looking a candidate up is one dict hit rather than a
+    # scan — bucketing by filename alone still scans, and a monorepo greps
+    # thousands of same-named files into a single bucket:
+    #
+    #   site  src/api/auth.py:42  files under  (auth.py, 42)
+    #                                          (api/auth.py, 42)
+    #                                          (src/api/auth.py, 42)
+    #   candidate  auth.py:42  hits the first key directly
+    sites: list[dict[str, Any]] = []
+    by_suffix: dict[tuple[tuple[str, ...], str], list[dict[str, Any]]] = {}
+    for entry in sorted(by_path.values(), key=lambda item: (-len(item["segments"]), item["text"])):
+        # Fullest spelling first, so a shorter one folds into the site it
+        # names. Two candidates means the spelling is ambiguous — a bare
+        # auth.py cited alongside both src/auth.py and tests/auth.py — and
+        # picking one would manufacture the agreement this block reports.
+        matches = by_suffix.get((entry["segments"], entry["line"]), [])
+        if len(matches) == 1:
+            matches[0]["answers"].extend(answer for answer in entry["answers"] if answer not in matches[0]["answers"])
+            continue
+
+        site = {**entry, "answers": list(entry["answers"])}
+        sites.append(site)
+        segments = site["segments"]
+        for depth in range(1, len(segments) + 1):
+            by_suffix.setdefault((segments[-depth:], site["line"]), []).append(site)
+
+    # A site is built fullest-spelling first, so restore the order the agents
+    # were asked in — that is the order the rest of the answer is printed in.
+    labels = [str(result.get("agent") or "") for result in results]
+    shared = [
+        {"site": f"{site['text']}:{site['line']}", "agents": [labels[answer] for answer in sorted(site["answers"])]}
+        for site in sites
+        if len(site["answers"]) > 1
+    ]
+    shared.sort(key=lambda entry: (-len(entry["agents"]), entry["site"]))
+    return shared
+
+
+def render_co_cited(shared: list[dict[str, Any]]) -> str:
+    if not shared:
+        return f"{CO_CITED_HEADER}\nno file:line site was cited by more than one agent"
+    body = "\n".join(f"{entry['site']} — {', '.join(entry['agents'])}" for entry in shared)
+    return f"{CO_CITED_HEADER}\n{body}"
 
 
 def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
@@ -1584,6 +1878,9 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
         eprint(f"ask {args.trace_id}: all fan-out agents failed")
         return 1
 
+    # Computed before --judge-only spills the answers and blanks their stdout.
+    co_cited = co_cited_sites(successful) if len(successful) > 1 else []
+
     verdict: dict[str, Any] | None = None
     if judge and len(successful) >= 2:
         candidates = "\n\n".join(
@@ -1620,6 +1917,7 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
             "agents": names,
             "results": results,
             "judge": verdict,
+            "co_cited": co_cited,
             "exit_code": 0,
         }
         if answers_dir is not None:
@@ -1629,11 +1927,15 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
         blocks = [f"=== judge ({judge}) ===\n{str(verdict['stdout']).strip()}"]
         listing = "\n".join(f"{r['agent']}: {r['stdout_file']}" for r in successful)
         blocks.append(f"=== raw answers (spilled to files) ===\n{listing}")
+        if len(successful) > 1:
+            blocks.append(render_co_cited(co_cited))
         print("\n\n".join(blocks))
     else:
         blocks = [f"=== {r['agent']} ===\n{str(r['stdout']).strip()}" for r in successful]
         if judge_ok:
             blocks.append(f"=== judge ({judge}) ===\n{str(verdict['stdout']).strip()}")
+        if len(successful) > 1:
+            blocks.append(render_co_cited(co_cited))
         print("\n\n".join(blocks))
     return 0
 
@@ -1667,10 +1969,22 @@ def _timeout_result(
     stdout_path: Path,
     stderr_path: Path,
     suffix: str,
+    codex_output_file: str | None = None,
 ) -> dict[str, Any]:
     elapsed = time.monotonic() - started
     stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
     stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+
+    # codex writes its answer to --output-last-message, not stdout, and it may
+    # land moments before the kill. The run still failed, but throwing away
+    # work the agent already finished helps nobody.
+    final_path = Path(codex_output_file) if codex_output_file else None
+    if final_path is not None and final_path.exists():
+        final_message, final_truncated = read_limited_text(final_path, args.max_output_bytes)
+        if final_message.strip():
+            stdout = final_message
+            stdout_truncated = final_truncated
+
     if stderr:
         stderr += "\n"
     stderr += suffix
@@ -1719,7 +2033,7 @@ def execute_agent_call(
             return result
 
         started = time.monotonic()
-        journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(agent_name, cmd, args, cwd)
+        journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(agent_name, cmd, args, cwd, prompt)
         # Captures live in the journal dir when one exists, so the evidence
         # (bytes written so far) survives even if the caller kills yoyo.
         capture_dir = journal_dir if journal_dir is not None else tmpdir
@@ -1727,6 +2041,9 @@ def execute_agent_call(
         stderr_path = capture_dir / "stderr.txt"
         heartbeat = resolve_heartbeat(args)
         idle_timeout = resolve_idle_timeout(args)
+        warning = idle_timeout_warning(agents[agent_name], idle_timeout)
+        if warning is not None:
+            eprint(warning)
         label = f"{agent_name} {args.trace_id}".strip()
 
         def finish_journal(exit_code: int | None, **extra: Any) -> None:
@@ -1759,7 +2076,12 @@ def execute_agent_call(
             result = _timeout_result(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Timed out after {args.timeout}s",
+                codex_output_file,
             )
+            # A background parent's result.json is this envelope verbatim and
+            # carries no flags of its own; without these it would have to read
+            # the clock off a stderr suffix an agent could have written itself.
+            result.update({"timed_out": True, "timeout_s": args.timeout})
             attach_session_result(args, agents[agent_name], result)
             return result
         except AgentIdleTimeout as exc:
@@ -1768,7 +2090,9 @@ def execute_agent_call(
                 agent_name, cmd, args, started, stdout_path, stderr_path,
                 f"Idle timeout after {exc.idle_seconds}s with no output "
                 f"({exc.captured_bytes} bytes captured before the stall)",
+                codex_output_file,
             )
+            result.update({"idle_timed_out": True, "idle_seconds": exc.idle_seconds})
             attach_session_result(args, agents[agent_name], result)
             return result
         finish_journal(proc.returncode)
@@ -1864,9 +2188,12 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
                 blocks.append(f"=== {item.get('agent')} ===\n{str(item['stdout']).strip()}")
             elif isinstance(item, dict) and item.get("stdout_file"):
                 blocks.append(f"=== {item.get('agent')} ===\n(answer spilled to {item['stdout_file']})")
+        answer_count = len(blocks)
         judge = result.get("judge")
         if isinstance(judge, dict) and int(judge.get("exit_code", 1)) == 0 and str(judge.get("stdout", "")).strip():
             blocks.append(f"=== judge ({judge.get('agent')}) ===\n{str(judge['stdout']).strip()}")
+        if answer_count > 1 and isinstance(result.get("co_cited"), list):
+            blocks.append(render_co_cited(result["co_cited"]))
         if blocks:
             stdout = "\n\n".join(blocks) + "\n"
     if stdout:
@@ -1916,6 +2243,111 @@ def signal_name(signum: Any) -> str:
         return f"signal {signum}"
 
 
+PROMPT_EXCERPT_CHARS = 220
+PROMPT_TASK_MARKER = "\nTask:\n"
+PROMPT_TRAILER_MARKER = "\n\nCalling context: "
+# What build_prompt appends after the task: piped input (:812) and --file
+# contents (:818). The excerpt is the question asked, never the material
+# attached to it — a preview that prints a credentials file is a leak.
+PROMPT_ATTACHMENT_MARKERS = ("\n\n<stdin>\n", "\n\nContext files:\n")
+# The <skill> wrapper build_prompt puts around every injected document (:711).
+PROMPT_SKILL_OPEN = '<skill name="'
+PROMPT_SKILL_CLOSE = "\n</skill>"
+
+
+def skill_region_end(text: str) -> int:
+    """Where injected skill documents stop and the caller's own prompt begins.
+
+    Skill text is verbatim, so a skill that happens to carry its own "Task:"
+    line would be read as the question. Returns 0 when no skill was injected,
+    and -1 when the last block never closes — the retained head was cut off
+    mid-skill, which puts the real task heading outside prompt.txt entirely.
+    """
+    opened = text.rfind(PROMPT_SKILL_OPEN)
+    if opened == -1:
+        return 0
+    closed = text.find(PROMPT_SKILL_CLOSE, opened)
+    if closed == -1:
+        return -1
+    return closed + len(PROMPT_SKILL_CLOSE)
+
+
+def prompt_excerpt(run_dir: Path) -> str | None:
+    """One-line preview of what the run was asked to do.
+
+    Both foreground calls and background parents store the prompt beside the
+    captures. Runs recorded before that, and those whose prompt was assembled
+    in a child, have none and get no preview. The role preamble and skill
+    blocks lead every prompt, so the excerpt starts at the caller's own task.
+    A wrong question reads as confidently as a right one, so anything the
+    stored head cannot pin down gets no preview at all, and attached files
+    and piped input end it rather than extending it.
+    """
+    try:
+        text = (run_dir / "prompt.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    skills_end = skill_region_end(text)
+    if skills_end == -1:
+        return None
+    marker = text.find(PROMPT_TASK_MARKER, skills_end)
+    if marker == -1 and skills_end > 0:
+        # Skills were injected and nothing follows them: the head stops short
+        # of the task heading, and the skill text is not what was asked.
+        return None
+    if marker != -1:
+        text = text[marker + len(PROMPT_TASK_MARKER):]
+    for cut in (PROMPT_TRAILER_MARKER,) + PROMPT_ATTACHMENT_MARKERS:
+        found = text.find(cut)
+        if found != -1:
+            text = text[:found]
+    text = " ".join(text.split())
+    if not text:
+        return None
+    return text if len(text) <= PROMPT_EXCERPT_CHARS else text[:PROMPT_EXCERPT_CHARS] + "…"
+
+
+TIMEOUT_EXIT_CODE = 124
+HARD_TIMEOUT_CLOCK = "--timeout"
+IDLE_TIMEOUT_CLOCK = "--idle-timeout"
+# The suffix execute_agent_call appends to a killed run's stderr. The killed
+# envelope now carries the clock as a flag, so this is the fallback for
+# records written before that — where the suffix was the only surviving
+# record of which clock fired.
+# A decimal, not "any run of digits and dots": autopsy is the tool a caller
+# reaches for when a run already failed, so an agent whose own stderr ends in
+# a lookalike line ("Timed out after 1..2s") must not crash it.
+HARD_TIMEOUT_SUFFIX_RE = re.compile(r"Timed out after (\d+(?:\.\d+)?)s$")
+IDLE_TIMEOUT_SUFFIX_RE = re.compile(r"Idle timeout after (\d+(?:\.\d+)?)s with no output")
+
+
+def timeout_clock(result: dict[str, Any]) -> tuple[str, Any] | None:
+    """Which of yoyo's two clocks killed an exit-124 run, and at what value.
+
+    The two need opposite fixes — a hard --timeout means the caller's budget
+    was too small, an --idle-timeout means the stream stalled — so a bare
+    "exit 124" is a non-diagnosis. Nothing is inferred: an agent that exits 124
+    on its own leaves neither flag nor suffix, and gets no clock named.
+    """
+    if result.get("timed_out"):
+        return HARD_TIMEOUT_CLOCK, result.get("timeout_s")
+    if result.get("idle_timed_out"):
+        return IDLE_TIMEOUT_CLOCK, result.get("idle_seconds")
+
+    stderr = result.get("stderr") or result.get("stderr_plain")
+    if not isinstance(stderr, str):
+        return None
+
+    last_line = stderr.rstrip().rsplit("\n", 1)[-1]
+    idle = IDLE_TIMEOUT_SUFFIX_RE.match(last_line)
+    if idle:
+        return IDLE_TIMEOUT_CLOCK, float(idle.group(1))
+    hard = HARD_TIMEOUT_SUFFIX_RE.match(last_line)
+    if hard:
+        return HARD_TIMEOUT_CLOCK, float(hard.group(1))
+    return None
+
+
 def autopsy_run(run_id: str | None, as_json: bool) -> int:
     """Explain how a run ended, from the recorded evidence.
 
@@ -1954,6 +2386,9 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
         return max(0.0, newest - started.timestamp()) if newest else None
 
     stdout_bytes, stderr_bytes = captured_bytes()
+    asked = prompt_excerpt(run_dir)
+    timeout_exit = result.get("exit_code") == TIMEOUT_EXIT_CODE if result is not None else False
+    clock = timeout_clock(result) if timeout_exit else None
     verdict: str
     advice: list[str] = []
     if result is not None and result.get("killed_by_signal") is not None:
@@ -1967,10 +2402,10 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
     elif status == "done" and result is not None:
         exit_code = result.get("exit_code")
         duration = result.get("duration_s")
-        if result.get("timed_out"):
-            verdict = f"hit yoyo's own --timeout ({result.get('timeout_s')}s); exit 124"
-        elif result.get("idle_timed_out"):
-            verdict = f"idle-timeout: no new output for {result.get('idle_seconds')}s; exit 124"
+        if clock is not None and clock[0] == HARD_TIMEOUT_CLOCK:
+            verdict = f"hit yoyo's own --timeout ({clock[1]}s); exit 124"
+        elif clock is not None:
+            verdict = f"idle-timeout: no new output for {clock[1]}s; exit 124"
         elif exit_code == 0:
             verdict = f"completed successfully in {duration}s"
         else:
@@ -1989,11 +2424,11 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
         advice.append("Rerun with --background so the run survives your tool's timeout: yoyo wait <id> --timeout 25 (repeat while exit 124).")
 
     notes: list[str] = []
-    if agent == "claude" and stdout_bytes == 0 and (result is None or result.get("exit_code") != 0):
-        notes.append("claude -p buffers all stdout until completion: 0 bytes captured mid-run is normal, not a hang.")
+    if stdout_bytes == 0 and default_buffers_output(str(agent or "")) and (result is None or result.get("exit_code") != 0):
+        notes.append(f"{agent} buffers all stdout until completion: 0 bytes captured mid-run is normal, not a hang.")
 
     if as_json:
-        print(json.dumps({
+        payload = {
             "run_id": resolved,
             "agent": agent,
             "mode": mode,
@@ -2001,17 +2436,26 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
             "started_at": iso_utc(started) if started is not None else None,
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
+            "asked": asked,
             "verdict": verdict,
             "notes": notes,
             "advice": advice,
             "run_dir": str(run_dir),
-        }, ensure_ascii=False))
+        }
+        # Only an exit-124 run carries these, so no other outcome's shape moves.
+        # Null says the record cannot tell, never that the clocks are innocent.
+        if timeout_exit:
+            payload["timeout_clock"] = clock[0] if clock is not None else None
+            payload["timeout_clock_s"] = clock[1] if clock is not None else None
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
 
     print(f"run:     {resolved}")
     print(f"agent:   {agent or '?'}  (mode: {mode})")
     if started is not None:
         print(f"started: {iso_utc(started)}")
+    if asked:
+        print(f"asked:   {asked}")
     print(f"output:  {stdout_bytes} bytes stdout, {stderr_bytes} bytes stderr (captured in {run_dir})")
     print(f"verdict: {verdict}")
     for note in notes:
@@ -2588,6 +3032,9 @@ def loop_summary_line(summary: dict[str, Any]) -> str:
     )
 
 
+LOOP_TAIL_MAX_CHARS = 120
+
+
 def print_loop_iteration_line(as_json: bool, iteration: int, ok: bool, duration: float, tail: str) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] iter {iteration:>3}  {'ok  ' if ok else 'FAIL'}  {duration:6.0f}s"
@@ -2746,8 +3193,14 @@ def cmd_loop(args: argparse.Namespace) -> int:
             ok = int(result.get("exit_code", 1)) == 0
             consecutive_failures = 0 if ok else consecutive_failures + 1
 
-            tail_lines = [line for line in str(result.get("stdout", "")).splitlines() if line.strip()]
-            tail = tail_lines[-1].strip()[:120] if tail_lines else ""
+            tail_text = result.get("stdout", "")
+            if not ok:
+                # Agents that report their own errors on stdout would otherwise
+                # have their iteration line read as a blank failure.
+                tail_text = result.get("stderr_plain") or result.get("stderr") or tail_text
+
+            tail_lines = [line for line in str(tail_text).splitlines() if line.strip()]
+            tail = tail_lines[-1].strip()[:LOOP_TAIL_MAX_CHARS] if tail_lines else ""
             duration = float(result.get("duration_s") or 0.0)
             print_loop_iteration_line(args.json, iteration, ok, duration, tail)
             rows.append(
@@ -3364,6 +3817,68 @@ def cmd_research(args: argparse.Namespace) -> int:
     return 0
 
 
+WAIT_LOG_TAIL_BYTES = 8192
+WAIT_HEARTBEAT_MARKER = "still running,"
+
+
+def last_progress_line(run_dir: Path) -> str | None:
+    """The freshest heartbeat a background run wrote to its log.
+
+    run_to_files prints "still running, Ns elapsed, N bytes captured" on the
+    child's stderr, which start_background_run parks in log.txt. Only the tail
+    is read: an hours-long run's log is unbounded and only the last line is
+    evidence of what the agent is doing right now.
+    """
+    try:
+        with (run_dir / "log.txt").open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - WAIT_LOG_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    for line in reversed(tail.splitlines()):
+        if WAIT_HEARTBEAT_MARKER in line:
+            return line.strip()
+    return None
+
+
+def poll_expiry_report(run_id: str, run_dir: Path) -> dict[str, Any]:
+    """Proof of life for a poll that expired while the run kept going.
+
+    Exit 124 is the most-polled surface yoyo has and its caller is an agent, to
+    whom a bare "timed out" reads as a dead run — when the run is alive and the
+    evidence is already on disk. Report the age and the freshest progress the
+    ledger holds; the caller still decides whether to keep polling.
+    """
+    meta = run_meta(run_dir)
+    elapsed = run_duration_seconds("running", meta, None, run_dir)
+    return {
+        "run_id": run_id,
+        "status": "timeout",
+        "run_status": "running",
+        "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
+        "last_progress": last_progress_line(run_dir),
+        # A background parent has no stdout.txt: the child writes its result
+        # envelope where stdout would be, and its stderr into log.txt.
+        "stdout_bytes": _safe_size(run_dir / "stdout.txt") or _safe_size(run_dir / "result.json"),
+        "stderr_bytes": _safe_size(run_dir / "stderr.txt") or _safe_size(run_dir / "log.txt"),
+    }
+
+
+def poll_expiry_text(report: dict[str, Any]) -> str:
+    elapsed = report.get("elapsed_s")
+    age = f", {elapsed}s elapsed" if elapsed is not None else ""
+    lines = [f"poll expired for run {report['run_id']} — the poll, not the run: it is still running{age}"]
+
+    progress = report.get("last_progress")
+    if progress:
+        lines.append(f"  last progress: {progress}")
+    else:
+        lines.append(f"  captured so far: {report['stdout_bytes']} bytes stdout, {report['stderr_bytes']} bytes stderr")
+    return "\n".join(lines)
+
+
 def wait_run(args: argparse.Namespace) -> int:
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
@@ -3385,10 +3900,11 @@ def wait_run(args: argparse.Namespace) -> int:
             return 4
         now = time.monotonic()
         if now >= deadline:
+            report = poll_expiry_report(args.run_id, run_dir)
             if args.json:
-                print(json.dumps({"run_id": args.run_id, "status": "timeout"}, ensure_ascii=False))
-            else:
-                eprint(f"timed out waiting for run {args.run_id}")
+                print(json.dumps(report, ensure_ascii=False))
+                return 124
+            eprint(poll_expiry_text(report))
             return 124
         time.sleep(min(args.poll, max(0.0, deadline - now)))
 
@@ -3485,6 +4001,26 @@ def list_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+def doctor_report_default_skills() -> None:
+    """Show the exact guidance every non-raw delegation will inherit.
+
+    Personal roots intentionally win skill lookup, so report shadowing without
+    judging whether the caller's configured default is right or wrong.
+    """
+    names = default_skills_from_env()
+    if not names:
+        print("default skills: none")
+        return
+
+    bundled_roots = [root.resolve() for root in bundled_skill_roots()]
+    for name in names:
+        path = resolve_skill(name)
+        resolved = path.resolve()
+        bundled = any(resolved.is_relative_to(root) for root in bundled_roots)
+        origin = "bundled" if bundled else "OUTSIDE YOYO BUNDLE"
+        print(f"default skill {name}: {origin} ({path})")
+
+
 def doctor(args: argparse.Namespace) -> int:
     if getattr(args, "live", False):
         return doctor_live(args)
@@ -3500,6 +4036,7 @@ def doctor(args: argparse.Namespace) -> int:
             print(f"{name}: missing ({spec.command[0]})")
             continue
         print(f"{name}: ok ({found})")
+    doctor_report_default_skills()
     failed += doctor_check_skill_sync()
     path = config_path()
     print(f"config: {path} ({'present' if path.exists() else 'not present'})")
@@ -3680,6 +4217,24 @@ def doctor_live(args: argparse.Namespace) -> int:
     return 1 if failed and args.strict else 0
 
 
+# yoyo's own skills all carry this prefix, which is what lets doctor speak
+# about strays in an agent home without commenting on the user's own skills.
+YOYO_SKILL_PREFIX = "yoyo"
+# Resolved from the yoyo bundle for delegates, never copied into an agent home:
+# it is a delegate-only harness and has no business in the caller's skill list.
+INBUILT_SKILL_NAME = "yoyo-fable-mode"
+
+
+def is_yoyo_skill_name(name: str) -> bool:
+    """Whether a skill directory belongs to yoyo's own namespace.
+
+    Bare `yoyo` and anything under `yoyo-`. A plain prefix test would claim
+    someone's own `yoyodyne` skill as a stray of ours and tell them to move
+    it aside.
+    """
+    return name == YOYO_SKILL_PREFIX or name.startswith(YOYO_SKILL_PREFIX + "-")
+
+
 def skill_target_roots() -> list[Path]:
     return [
         Path("~/.codex/skills").expanduser(),
@@ -3710,6 +4265,32 @@ def bundled_skills_source() -> Path | None:
     return recorded if recorded.exists() else None
 
 
+def doctor_report_orphan_skills(installable: set[str]) -> int:
+    """Report yoyo skill copies an agent home kept after the bundle dropped them.
+
+    Renaming or retiring a bundled skill leaves the old directory in all five
+    homes, still resolvable and still winning lookups: that is how the
+    pre-rename fable-mode went on shadowing the bundled harness for a month.
+    Naming the strays is yoyo's job. Deleting someone's file is not — the copy
+    stays until a human moves it.
+    """
+    orphans = 0
+    for root in skill_target_roots():
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or not is_yoyo_skill_name(child.name):
+                continue
+            if child.name in installable:
+                continue
+            orphans += 1
+            # The inbuilt skill is in the bundle and deliberately never copied
+            # out, so a copy here shadows it rather than outliving it.
+            reason = "yoyo installs no copy of it" if child.name == INBUILT_SKILL_NAME else "not in the bundle"
+            print(f"skill {child.name}: ORPHANED, {reason} ({child}) (move it aside to stop it resolving)")
+    return orphans
+
+
 def doctor_check_skill_sync() -> int:
     """Report installed skill copies that drifted from the bundled source.
 
@@ -3723,9 +4304,10 @@ def doctor_check_skill_sync() -> int:
         print("skills: bundled source not found; sync check skipped")
         return 0
     skill_dirs = [child for child in sorted(source.iterdir()) if child.is_dir() and (child / "SKILL.md").exists()]
-    drifted = 0
+    installable = {child.name for child in skill_dirs if child.name != INBUILT_SKILL_NAME}
+    drifted = doctor_report_orphan_skills(installable)
     for skill_dir in skill_dirs:
-        if skill_dir.name == "yoyo-fable-mode":
+        if skill_dir.name == INBUILT_SKILL_NAME:
             continue  # inbuilt: resolved from the bundle, never copied out
         try:
             source_text = (skill_dir / "SKILL.md").read_bytes()
@@ -3773,7 +4355,7 @@ def install_skill(args: argparse.Namespace) -> int:
     skill_requirements = {"yoyo-imagegen": "codex"}
     kept: list[Path] = []
     for skill_source in skill_sources:
-        if skill_source.name == "yoyo-fable-mode":
+        if skill_source.name == INBUILT_SKILL_NAME:
             # Inbuilt: yoyo resolves it from its own bundle (bundled_skill_roots),
             # and copying it out would put a delegate-only harness in the
             # caller's own skill list.
@@ -3845,6 +4427,25 @@ def update_yoyo(args: argparse.Namespace) -> int:
     return 0
 
 
+def default_timeout() -> float:
+    """The task timeout argparse will actually apply, override included."""
+    return float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS)))
+
+
+def timeout_default_text() -> str:
+    """The same budget as help text names it: seconds, whole ones without a `.0`.
+
+    Help is built in the same process as the default, so both read one value.
+    Quoting the constant instead advertised 14400s to a caller who had already
+    exported YOYO_TIMEOUT=300 — a wrong number on the flag that kills the most
+    runs, read by an agent with no other way to check it.
+    """
+    seconds = default_timeout()
+    if seconds.is_integer():
+        return f"{int(seconds)}s"
+    return f"{seconds}s"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="yoyo", description="Tiny cross-agent delegation CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -3879,11 +4480,11 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--cwd", default=os.getcwd())
     ask.add_argument("--file", action="append", default=[], help="Add a file as explicit context")
     ask.add_argument("--skill", action="append", default=[], help="Inject a named skill (SKILL.md) as guidance for the target agent; repeatable")
-    ask.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
+    ask.add_argument("--timeout", type=float, default=default_timeout(), help=f"Hard kill of the agent's whole task (default {timeout_default_text()}). Real calls run 13min at the 90th percentile, so a smaller budget kills work that would have succeeded: use --background and poll instead of shortening this")
     ask.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     ask.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     ask.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
-    ask.add_argument("--idle-timeout", type=float, default=None, help="Kill the agent if it emits no output for this many seconds (hang guard)")
+    ask.add_argument("--idle-timeout", type=float, default=None, help="Kill the agent if it goes this many seconds without new output after its first byte (hang guard; silence before the first byte is thinking, not a stall)")
     ask.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     ask.add_argument("--stdin-wait", type=float, default=None, help="Seconds to wait for piped stdin before giving up (default 0: read only if already available)")
     ask.add_argument("--no-stdin", action="store_true", help="Never read stdin as context, even when piped")
@@ -3907,7 +4508,7 @@ def build_parser() -> argparse.ArgumentParser:
     imagegen.add_argument("--cwd", default=os.getcwd())
     imagegen.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     imagegen.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
-    imagegen.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
+    imagegen.add_argument("--timeout", type=float, default=default_timeout())
     imagegen.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
     imagegen.add_argument("--model", help="Pass a model name to agents that support --model")
     imagegen.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
@@ -3937,8 +4538,8 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument(
         "--timeout",
         type=float,
-        default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))),
-        help="Per-iteration timeout in seconds",
+        default=default_timeout(),
+        help=f"Per-iteration hard kill (default {timeout_default_text()}); set it well above a normal iteration (1800s or more), never at one",
     )
     loop.add_argument(
         "--trace-id",
@@ -3947,7 +4548,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     loop.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
-    loop.add_argument("--idle-timeout", type=float, default=None, help="Kill an iteration if it emits no output for this many seconds (hang guard)")
+    loop.add_argument("--idle-timeout", type=float, default=None, help="Kill an iteration if it goes this many seconds without new output after its first byte (hang guard)")
     loop.add_argument("--quiet", action="store_true", help="Suppress the periodic progress heartbeat on stderr")
     loop.add_argument("--model", help="Pass a model name to agents that support --model")
     loop.add_argument(
@@ -3998,7 +4599,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--pr", action="store_true", help="Post the consolidated review as a GitHub PR comment via gh")
     review.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     review.add_argument("--cwd", default=os.getcwd())
-    review.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))), help="Per-agent timeout in seconds")
+    review.add_argument("--timeout", type=float, default=default_timeout(), help=f"Per-agent hard kill (default {timeout_default_text()}); a smaller budget kills a review that would have succeeded, so use --background and poll instead")
     review.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     review.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     review.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
@@ -4047,7 +4648,7 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--read-only", action="store_true", help="Constrain researchers to read-only mode (limits web/tool access on some agents; default is full-access so investigation tools work)")
     research.add_argument("--caller", default=os.environ.get("YOYO_CALLER", "unknown"))
     research.add_argument("--cwd", default=os.getcwd())
-    research.add_argument("--timeout", type=float, default=float(os.environ.get("YOYO_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))), help="Per-agent timeout in seconds")
+    research.add_argument("--timeout", type=float, default=default_timeout(), help=f"Per-agent hard kill (default {timeout_default_text()}); a smaller budget kills a run that would have succeeded, so use --background and poll instead")
     research.add_argument("--trace-id", default=os.environ.get("YOYO_TRACE_ID") or uuid.uuid4().hex)
     research.add_argument("--max-input-bytes", type=int, default=int(os.environ.get("YOYO_MAX_INPUT_BYTES", str(DEFAULT_MAX_INPUT_BYTES))))
     research.add_argument("--max-output-bytes", type=int, default=int(os.environ.get("YOYO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))))
@@ -4069,7 +4670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     wait = sub.add_parser("wait", help="Wait for a background run to finish")
     wait.add_argument("run_id")
-    wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    wait.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="Seconds this poll waits before returning 124 (still running); safe to repeat. Bounds your poll, not the agent's task")
     wait.add_argument("--poll", type=float, default=2.0)
     wait.add_argument("--json", action="store_true")
     wait.set_defaults(func=wait_run)
