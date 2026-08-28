@@ -9,7 +9,7 @@ The full flag-level reference. For the tour, see the [README](../README.md).
 | `codex` | `codex exec` | Default reviewer/second opinion; powers `imagegen` |
 | `claude` | `claude -p` | Default worker for scoped edits |
 | `pi` | `pi -p --mode text` | Lightweight and cheap |
-| `cursor` | `cursor-agent -p` | On-demand worker and model picker (`--model composer-2.5`, `cursor-grok-4.5-high`, …) |
+| `cursor` | `cursor-agent -p --output-format stream-json` | On-demand worker and model picker (`--model composer-2.5`, `cursor-grok-4.5-high`, …) |
 | `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). **Full-access only** — no read-only mode |
 | `grok` | `grok` | On-demand. A fourth independent vendor for adversarial cross-checks |
 
@@ -27,6 +27,10 @@ yoyo ask cursor --role worker --model composer-2.5 --cwd "$PWD" "Make the scoped
 ```
 
 Cursor model IDs are account- and version-dependent; YOYO deliberately forwards `--model` instead of maintaining a stale allowlist. Cursor is one-shot under `yoyo ask` (`--session` is rejected), uses Cursor plan mode—not an OS sandbox—for `--read-only`, and uses `--force` only for the default full-access worker path. Pair write delegations with focused tests or another independent verification step.
+
+yoyo drives cursor over `--output-format stream-json`, not its `text` mode, and reduces the event stream back to prose itself. The reason is measured, not stylistic: in `text` mode `cursor-agent` holds the entire answer in memory and flushes it once on exit, so when its transport drops mid-run — `Connection lost, reconnecting to …` then `RetriableError: WritableIterable is closed` — the process exits 1 with **empty stdout** even though the edits already landed on disk. On a five-run write-heavy sample (three files written and read back per run, cursor-agent 2026.08.04) four of five text-mode runs ended exactly that way: exit 1, zero bytes of answer, all three files correctly written. The same workload over `stream-json` kept every answer, because each chunk is already on disk when the transport dies.
+
+Two consequences worth knowing. A cursor answer may now arrive with a note on stderr — `cursor stream ended without a result event; answer stitched from N partial chunks` — which means the text is real but possibly incomplete; treat it as a partial. And the raw capture in the run ledger is JSONL rather than prose, so read a cursor run's answer through `yoyo runs show` rather than by eyeballing `stdout.txt`.
 
 ## Ask
 
@@ -57,7 +61,7 @@ yoyo ask codex,claude,grok --judge cursor --judge-only "..."   # verdict only; r
 
 **Writing good prompts:** put the instruction first; attach context with `--cwd`/`--file`/stdin; state the success criterion, scope, and exclusions; ask reviewers to falsify ("find the strongest reason this is wrong"); replace vague words with observable criteria. Let the worktree be the source of truth.
 
-**Other flags:** `--raw` sends the prompt verbatim (no role/context wrapper) so a leading `/command` reaches the target CLI; `--json` emits a result envelope; `--trace-id` tags a call; `--model` passes a model through; `--max-output-bytes` / `--max-input-bytes` cap output and (stdin + `--file`) input. Calls default to a four-hour timeout — a hung-process deadman guard, not a progress budget (`YOYO_TIMEOUT` or `--timeout` to change). A periodic stderr heartbeat keeps a working agent from looking hung (`--quiet` to disable); `--idle-timeout` adds a hang guard that fires when an agent goes quiet after its first byte. Against an agent that buffers its output it is not a hang guard at all, and yoyo says so on stderr before the call: `cursor-agent -p` and `pi -p` emit nothing until they exit, so the guard never arms; `claude -p` emits a little stderr in its first second and then goes silent for the rest of the run, so the guard arms and fires in the middle of healthy work. `--timeout` is what bounds a run that never starts.
+**Other flags:** `--raw` sends the prompt verbatim (no role/context wrapper) so a leading `/command` reaches the target CLI; `--json` emits a result envelope; `--trace-id` tags a call; `--model` passes a model through; `--max-output-bytes` / `--max-input-bytes` cap output and (stdin + `--file`) input. Calls default to a four-hour timeout — a hung-process deadman guard, not a progress budget (`YOYO_TIMEOUT` or `--timeout` to change). A periodic stderr heartbeat keeps a working agent from looking hung (`--quiet` to disable); `--idle-timeout` adds a hang guard that fires when an agent goes quiet after its first byte. Against an agent that buffers its output it is not a hang guard at all, and yoyo says so on stderr before the call: `pi -p` emits nothing until it exits, so the guard never arms; `claude -p` emits a little stderr in its first second and then goes silent for the rest of the run, so the guard arms and fires in the middle of healthy work. `--timeout` is what bounds a run that never starts. `cursor-agent` is asked for `--output-format stream-json` precisely so it streams: its text mode holds the whole answer until exit, and a dropped connection then loses it (see below), so the guard is real for cursor after its first event — roughly fifteen seconds of silent thinking.
 
 ## Research
 

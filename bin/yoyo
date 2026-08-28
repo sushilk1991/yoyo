@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.23.0"
+VERSION = "0.24.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -153,8 +153,10 @@ class AgentSpec:
     read_only_args: list[str] | None = None
     full_access_args: list[str] | None = None
     # Measured, not guessed: claude emits a little stderr then goes silent for
-    # the whole run, cursor and pi emit nothing at all until they exit. Their
-    # silence is work, not a stall, which changes what --idle-timeout means.
+    # the whole run, and pi emits nothing at all until it exits. Their silence
+    # is work, not a stall, which changes what --idle-timeout means. cursor
+    # buffers only in text mode; on stream-json it flushes every chunk (0 bytes
+    # for ~15s of thinking, then steady growth), so it is not marked here.
     buffers_output: bool = False
 
 
@@ -171,12 +173,15 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude", buffers_output=True),
     "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi", buffers_output=True),
     # On-demand agents: one-shot only (no --session), useful for cross-vendor
-    # opinions. cursor-agent reads the prompt from piped stdin in print mode;
-    # grok has no stdin sentinel, so the prompt arrives via --prompt-file
+    # opinions. cursor-agent reads the prompt from piped stdin in print mode and
+    # speaks stream-json, because its text mode buffers the whole answer until
+    # exit and a transport drop then loses work that already landed on disk
+    # (see decode_cursor_stream). grok has no stdin sentinel, so the prompt
+    # arrives via --prompt-file
     # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
     # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
     # and has no headless read-only mode.
-    "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "text"], flavor="cursor", buffers_output=True),
+    "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "stream-json"], flavor="cursor"),
     "agy": AgentSpec("agy", ["agy"], flavor="agy"),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
 }
@@ -425,6 +430,97 @@ def read_limited_text(path: Path, limit: int) -> tuple[str, bool]:
     if truncated:
         text += f"\n...[truncated after {limit} bytes]\n"
     return text, truncated
+
+
+# cursor-agent's stream-json event types, in the order a healthy run emits them.
+# Only two carry the answer; the rest are progress or transport chatter.
+CURSOR_RESULT_EVENT = "result"
+CURSOR_ASSISTANT_EVENT = "assistant"
+CURSOR_TRANSPORT_EVENTS = ("connection", "retry")
+
+
+def decode_cursor_stream(raw: str) -> tuple[str, str]:
+    """Reduce cursor-agent's stream-json JSONL to (answer, note).
+
+    Measured on cursor-agent 2026.08.04: `--output-format text` holds the whole
+    answer in memory and flushes it on exit, so when the transport drops during
+    a long tool-using run the process exits 1 with an *empty* stdout even
+    though the work landed on disk. `--output-format stream-json` writes every
+    chunk as it arrives, so the answer survives that drop.
+
+        {"type":"result","subtype":"success","result":"..."}       <- final answer
+        {"type":"assistant","message":{"content":[{"text":...}]}}  <- partial fallback
+        {"type":"connection"|"retry",...}                          <- transport chatter
+
+    Prefer the result event, the way codex's --output-last-message is preferred
+    over its transcript. With no result event, stitch the assistant chunks back
+    together and say so in the note, so a partial answer is never mistaken for
+    a whole one.
+    """
+    final = ""
+    chunks: list[str] = []
+    dropped = 0
+    saw_json = False
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        saw_json = True
+        kind = event.get("type")
+
+        if kind in CURSOR_TRANSPORT_EVENTS:
+            dropped += 1
+            continue
+
+        if kind == CURSOR_RESULT_EVENT:
+            text = event.get("result")
+            if isinstance(text, str) and text.strip():
+                final = text
+            continue
+
+        if kind == CURSOR_ASSISTANT_EVENT:
+            content = event.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    chunks.append(block["text"])
+
+    # Not stream-json at all (a --agent-arg override, or a crash before the
+    # first event). Hand the capture back untouched rather than blanking it.
+    if not saw_json:
+        return raw, ""
+
+    if final:
+        return final, ""
+
+    stitched = "".join(chunks).strip()
+    if not stitched:
+        return "", "cursor produced no answer text before the stream ended"
+
+    note = f"cursor stream ended without a result event; answer stitched from {len(chunks)} partial chunks"
+    if dropped:
+        note += f" after {dropped} transport reconnect events"
+    return stitched, note
+
+
+def decode_agent_stdout(spec: AgentSpec, raw: str) -> tuple[str, str]:
+    """Turn one agent's raw stdout capture into (answer, note).
+
+    Every flavor but cursor already writes plain text, so this is a no-op for
+    them. cursor speaks stream-json, which has to be reduced back to prose.
+    """
+    if spec.flavor != "cursor":
+        return raw, ""
+    return decode_cursor_stream(raw)
 
 
 def read_limited_stdin(limit: int) -> tuple[str, bool, int]:
@@ -1963,6 +2059,7 @@ def run_agent(args: argparse.Namespace) -> int:
 
 def _timeout_result(
     agent_name: str,
+    spec: AgentSpec,
     cmd: list[str],
     args: argparse.Namespace,
     started: float,
@@ -1974,6 +2071,12 @@ def _timeout_result(
     elapsed = time.monotonic() - started
     stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
     stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+
+    # A killed cursor run has no result event by definition, so whatever it
+    # streamed before the kill is all the answer there is. Recover it.
+    stdout, cursor_note = decode_agent_stdout(spec, stdout)
+    if cursor_note:
+        stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
 
     # codex writes its answer to --output-last-message, not stdout, and it may
     # land moments before the kill. The run still failed, but throwing away
@@ -2074,7 +2177,7 @@ def execute_agent_call(
         except subprocess.TimeoutExpired:
             finish_journal(124, timed_out=True, timeout_s=args.timeout)
             result = _timeout_result(
-                agent_name, cmd, args, started, stdout_path, stderr_path,
+                agent_name, agents[agent_name], cmd, args, started, stdout_path, stderr_path,
                 f"Timed out after {args.timeout}s",
                 codex_output_file,
             )
@@ -2087,7 +2190,7 @@ def execute_agent_call(
         except AgentIdleTimeout as exc:
             finish_journal(124, idle_timed_out=True, idle_seconds=exc.idle_seconds)
             result = _timeout_result(
-                agent_name, cmd, args, started, stdout_path, stderr_path,
+                agent_name, agents[agent_name], cmd, args, started, stdout_path, stderr_path,
                 f"Idle timeout after {exc.idle_seconds}s with no output "
                 f"({exc.captured_bytes} bytes captured before the stall)",
                 codex_output_file,
@@ -2099,6 +2202,9 @@ def execute_agent_call(
 
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+        stdout, cursor_note = decode_agent_stdout(agents[agent_name], stdout)
+        if cursor_note:
+            stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
         if codex_output_file:
             path = Path(codex_output_file)
             if path.exists():

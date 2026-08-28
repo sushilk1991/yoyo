@@ -57,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.23.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.24.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -733,7 +733,7 @@ class YoyoTests(CliTestCase):
         )
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn("cursor-agent -p --output-format text --trust --force", stdout)
+        self.assertIn("cursor-agent -p --output-format stream-json --trust --force", stdout)
         self.assertIn("mode=full-access delegation", stdout)
 
     def test_ask_read_only_constrains_cursor(self):
@@ -742,7 +742,7 @@ class YoyoTests(CliTestCase):
         )
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn("cursor-agent -p --output-format text --trust --mode plan", stdout)
+        self.assertIn("cursor-agent -p --output-format stream-json --trust --mode plan", stdout)
         self.assertNotIn("--force", stdout)
         self.assertIn("mode=read-only delegation", stdout)
 
@@ -4045,14 +4045,17 @@ class BufferedAgentGuardTests(CliTestCase):
 
     def test_buffering_agents_are_marked(self):
         # Measured first-byte behavior: claude emits a little stderr then goes
-        # silent for the whole run, cursor and pi emit nothing until they exit.
-        # codex and grok stream, so their silence really is a stall.
+        # silent for the whole run, and pi emits nothing until it exits. codex,
+        # grok and cursor stream, so their silence really is a stall. cursor
+        # only qualifies on stream-json — its text mode buffers to exit, which
+        # is why the spec no longer asks for text.
         agents = yoyo.DEFAULT_AGENTS
         self.assertTrue(agents["claude"].buffers_output)
-        self.assertTrue(agents["cursor"].buffers_output)
         self.assertTrue(agents["pi"].buffers_output)
         self.assertFalse(agents["codex"].buffers_output)
         self.assertFalse(agents["grok"].buffers_output)
+        self.assertFalse(agents["cursor"].buffers_output)
+        self.assertIn("stream-json", agents["cursor"].command)
 
     def test_warning_names_the_agent_and_the_flag_that_works(self):
         warning = yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], 180.0)
@@ -4066,6 +4069,74 @@ class BufferedAgentGuardTests(CliTestCase):
 
     def test_no_idle_timeout_means_no_warning(self):
         self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], None))
+
+
+class CursorStreamDecodeTests(CliTestCase):
+    """cursor's answer must survive a transport drop that kills the process."""
+
+    @staticmethod
+    def _line(event: dict) -> str:
+        return json.dumps(event) + "\n"
+
+    def _assistant(self, text: str) -> str:
+        return self._line({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+
+    def test_result_event_is_the_answer(self):
+        raw = (
+            self._line({"type": "system", "subtype": "init", "model": "Composer 2.5"})
+            + self._assistant("thinking out loud")
+            + self._line({"type": "result", "subtype": "success", "is_error": False, "result": "the final answer"})
+        )
+        answer, note = yoyo.decode_cursor_stream(raw)
+        self.assertEqual(answer, "the final answer")
+        self.assertEqual(note, "")
+
+    def test_partial_answer_survives_a_dropped_stream(self):
+        # The measured failure: cursor writes the file, streams its prose, then
+        # the transport dies before any result event. Text mode loses all of it.
+        raw = (
+            self._assistant("Created the file. ")
+            + self._line({"type": "tool_call", "subtype": "completed"})
+            + self._assistant("Here is what it contains.")
+            + self._line({"type": "connection", "subtype": "reconnecting"})
+            + self._line({"type": "retry", "subtype": "starting"})
+        )
+        answer, note = yoyo.decode_cursor_stream(raw)
+        self.assertEqual(answer, "Created the file. Here is what it contains.")
+        self.assertIn("without a result event", note)
+        self.assertIn("2 partial chunks", note)
+        self.assertIn("2 transport reconnect", note)
+
+    def test_transport_chatter_never_reaches_the_answer(self):
+        raw = (
+            self._line({"type": "connection", "subtype": "reconnecting"})
+            + self._line({"type": "retry", "subtype": "starting"})
+            + self._line({"type": "result", "subtype": "success", "result": "clean"})
+        )
+        answer, note = yoyo.decode_cursor_stream(raw)
+        self.assertEqual(answer, "clean")
+        self.assertNotIn("reconnect", answer)
+
+    def test_empty_stream_says_so_instead_of_returning_nothing(self):
+        raw = self._line({"type": "connection", "subtype": "reconnecting"})
+        answer, note = yoyo.decode_cursor_stream(raw)
+        self.assertEqual(answer, "")
+        self.assertIn("no answer text", note)
+
+    def test_non_json_capture_passes_through_untouched(self):
+        # An --agent-arg override can put cursor back on text; a crash can beat
+        # the first event. Blanking the capture would destroy the evidence.
+        raw = "RetriableError: WritableIterable is closed\n"
+        answer, note = yoyo.decode_cursor_stream(raw)
+        self.assertEqual(answer, raw)
+        self.assertEqual(note, "")
+
+    def test_other_flavors_are_untouched(self):
+        for name in ("codex", "claude", "pi", "grok"):
+            raw = '{"type":"result","result":"not cursor"}\n'
+            answer, note = yoyo.decode_agent_stdout(yoyo.DEFAULT_AGENTS[name], raw)
+            self.assertEqual(answer, raw, name)
+            self.assertEqual(note, "", name)
 
 
 class RunIdentityTests(CliTestCase):
