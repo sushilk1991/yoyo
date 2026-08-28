@@ -93,6 +93,7 @@ Model IDs drift by account and CLI version, so yoyo forwards `--model` rather th
 | `yoyo research "..."` | Parallel perspectives (lenses fully yours to define) → decision brief |
 | `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with `--queue`, `--brief`, and `--spec` |
 | `yoyo wait` / `runs autopsy` | Poll a detached run; reconstruct one that died |
+| `yoyo runs audit` | Per-agent outcomes and p50/p90 over a window of the ledger |
 | `yoyo imagegen "..."` | Real raster images via GPT-image |
 | `--session` / `--background` | Durable and detached calls |
 | inbuilt `yoyo-fable-mode` skill | Evidence discipline injected into every delegation (`YOYO_DEFAULT_SKILLS=""` disables) |

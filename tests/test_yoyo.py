@@ -57,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.24.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.25.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -3005,13 +3005,26 @@ class YoyoTests(CliTestCase):
             YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('bin/yoyo:34 sets it, see http://host:8080, a 2:1 ratio')\"",
             YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('[bin/yoyo](/Users/me/code/bin/yoyo:34), http://host:8080, 2:1')\"",
         )
-        code, stdout, stderr = self.run_cli(["ask", "a,b", "--json", "compare this"], env=env)
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "bin").mkdir()
+            (Path(tmp) / "bin" / "yoyo").write_text("\n".join(f"line {n}" for n in range(1, 41)))
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--cwd", tmp, "--json", "compare this"], env=env
+            )
 
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
+        # The site displays the absolute spelling, which resolves outside the
+        # run cwd; the relative spelling of the same site is what disk answers,
+        # and read_as names it so the note is not read as coming from the
+        # absolute path.
         self.assertEqual(
             payload["co_cited"],
-            [{"site": "/Users/me/code/bin/yoyo:34", "agents": ["a", "b"]}],
+            [{
+                "site": "/Users/me/code/bin/yoyo:34",
+                "agents": ["a", "b"],
+                "disk": {"status": "line", "text": "line 34", "read_as": "bin/yoyo"},
+            }],
         )
 
     def test_co_citation_keeps_two_directories_apart(self):
@@ -3036,7 +3049,7 @@ class YoyoTests(CliTestCase):
 
         self.assertEqual(
             yoyo.co_cited_sites(results),
-            [{"site": "src/auth.py:42", "agents": ["a", "b"]}],
+            [{"site": "src/auth.py:42", "agents": ["a", "b"], "spellings": ["src/auth.py"]}],
         )
 
     def test_co_citation_merges_spellings_of_one_file(self):
@@ -3051,8 +3064,16 @@ class YoyoTests(CliTestCase):
         self.assertEqual(
             yoyo.co_cited_sites(results),
             [
-                {"site": "/Users/me/code/bin/yoyo:34", "agents": ["a", "b", "c"]},
-                {"site": "src/lib/auth.py:9", "agents": ["a", "b"]},
+                {
+                    "site": "/Users/me/code/bin/yoyo:34",
+                    "agents": ["a", "b", "c"],
+                    "spellings": ["/Users/me/code/bin/yoyo", "bin/yoyo"],
+                },
+                {
+                    "site": "src/lib/auth.py:9",
+                    "agents": ["a", "b"],
+                    "spellings": ["src/lib/auth.py", "lib/auth.py"],
+                },
             ],
         )
 
@@ -3111,13 +3132,20 @@ class YoyoTests(CliTestCase):
             YOYO_AGENT_A="python3 -c \"import sys; sys.stdin.read(); print('src/auth.ts:112 leaks')\"",
             YOYO_AGENT_B="python3 -c \"import sys; sys.stdin.read(); print('confirm src/auth.ts:112')\"",
         )
-        code, stdout, stderr = self.run_cli(["ask", "a,b", "--json", "compare this"], env=env)
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["ask", "a,b", "--cwd", tmp, "--json", "compare this"], env=env
+            )
 
         self.assertEqual(code, 0, stderr)
         payload = json.loads(stdout)
         self.assertEqual(
             payload["co_cited"],
-            [{"site": "src/auth.ts:112", "agents": ["a", "b"]}],
+            [{
+                "site": "src/auth.ts:112",
+                "agents": ["a", "b"],
+                "disk": {"status": "missing"},
+            }],
         )
 
     def test_ask_fanout_judge_sees_all_candidates_and_the_task(self):
@@ -4137,6 +4165,354 @@ class CursorStreamDecodeTests(CliTestCase):
             answer, note = yoyo.decode_agent_stdout(yoyo.DEFAULT_AGENTS[name], raw)
             self.assertEqual(answer, raw, name)
             self.assertEqual(note, "", name)
+
+
+class CitationResolutionTests(CliTestCase):
+    """What disk says about a co-cited file:line, and what it refuses to say."""
+
+    def resolve(self, tmp, text, line):
+        return yoyo.resolve_citation(text, line, Path(tmp))
+
+    def test_a_real_line_comes_back_verbatim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "auth.py").write_text("import os\nSECRET = compute()\nreturn None\n")
+
+            self.assertEqual(
+                self.resolve(tmp, "auth.py", "2"),
+                {"status": "line", "text": "SECRET = compute()"},
+            )
+
+    def test_a_missing_file_says_missing_and_nothing_more(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.resolve(tmp, "src/ghost.py", "9"), {"status": "missing"})
+
+    def test_a_line_past_the_end_reports_the_real_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "short.py").write_text("one\ntwo\n")
+
+            self.assertEqual(
+                self.resolve(tmp, "short.py", "9999"),
+                {"status": "line_out_of_range", "line_count": 2},
+            )
+
+    def test_a_path_outside_the_cwd_is_never_read(self):
+        # An answer is untrusted text. A delegate that cites an absolute path
+        # must not turn yoyo into a reader of the caller's home directory.
+        with tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "id_rsa"
+            secret.write_text("PRIVATE KEY MATERIAL\n")
+            with tempfile.TemporaryDirectory() as tmp:
+                disk = self.resolve(tmp, str(secret), "1")
+
+            self.assertEqual(disk, {"status": "outside_cwd"})
+            self.assertNotIn("PRIVATE", json.dumps(disk))
+
+    def test_a_parent_escape_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "repo"
+            nested.mkdir()
+            (Path(tmp) / "outside.txt").write_text("secret\n")
+
+            self.assertEqual(
+                yoyo.resolve_citation("../outside.txt", "1", nested),
+                {"status": "outside_cwd"},
+            )
+
+    def test_a_symlink_pointing_out_of_the_cwd_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            (Path(outside) / "secret.txt").write_text("secret\n")
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "link.txt").symlink_to(Path(outside) / "secret.txt")
+
+                self.assertEqual(self.resolve(tmp, "link.txt", "1"), {"status": "outside_cwd"})
+
+    def test_a_directory_is_not_a_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "src").mkdir()
+
+            self.assertEqual(self.resolve(tmp, "src/", "1"), {"status": "not_a_file"})
+
+    def test_control_bytes_never_reach_the_answer(self):
+        # A cited line can carry ANSI escapes or NULs; they would otherwise be
+        # replayed into the calling agent's terminal.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "noisy.txt").write_bytes(b"before\x1b[31mred\x00after\n")
+
+            disk = self.resolve(tmp, "noisy.txt", "1")
+
+            self.assertEqual(disk["status"], "line")
+            self.assertNotIn("\x1b", disk["text"])
+            self.assertNotIn("\x00", disk["text"])
+
+    def test_a_long_line_is_truncated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "min.js").write_text("x" * 5000 + "\n")
+
+            disk = self.resolve(tmp, "min.js", "1")
+
+            self.assertEqual(disk["status"], "line")
+            self.assertEqual(len(disk["text"]), yoyo.CITATION_LINE_MAX_CHARS + 3)
+
+    def test_a_line_past_the_scan_cap_is_not_called_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "huge.log"
+            path.write_bytes(b"x" * (yoyo.CITATION_SCAN_MAX_BYTES + 10))
+
+            self.assertEqual(
+                self.resolve(tmp, "huge.log", "2"),
+                {"status": "scan_limit", "scanned_bytes": yoyo.CITATION_SCAN_MAX_BYTES},
+            )
+
+    def test_the_note_reads_as_evidence_not_a_verdict(self):
+        rendered = yoyo.render_co_cited([
+            {"site": "auth.py:2", "agents": ["a", "b"], "disk": {"status": "missing"}},
+        ])
+
+        self.assertIn("auth.py:2 — a, b", rendered)
+        self.assertIn("no such file under the run cwd", rendered)
+        for verdict in ("hallucinated", "invalid", "verified", "\u2713", "\u2717"):
+            self.assertNotIn(verdict, rendered)
+
+    def test_resolution_never_reorders_or_drops_a_site(self):
+        shared = [
+            {"site": "ghost.py:1", "agents": ["a", "b"], "spellings": ["ghost.py"]},
+            {"site": "real.py:1", "agents": ["a", "b"], "spellings": ["real.py"]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "real.py").write_text("kept\n")
+            yoyo.resolve_co_cited(shared, Path(tmp))
+
+        self.assertEqual([entry["site"] for entry in shared], ["ghost.py:1", "real.py:1"])
+        self.assertEqual([entry["disk"]["status"] for entry in shared], ["missing", "line"])
+
+
+class BriefCitationTests(CliTestCase):
+    def test_a_brief_citing_a_path_that_is_not_there_warns_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "present.py").write_text("x = 1\n", encoding="utf-8")
+            text = "See present.py:4 and gone.py:9 and gone.py:12."
+
+            self.assertEqual(yoyo.missing_brief_citations(text, cwd), ["gone.py"])
+
+    def test_a_line_past_the_end_of_a_present_file_is_not_a_missing_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "short.py").write_text("x = 1\n", encoding="utf-8")
+            self.assertEqual(yoyo.missing_brief_citations("short.py:900", cwd), [])
+
+    def test_a_brief_with_no_citations_says_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(yoyo.missing_brief_citations("plain prose, version 1.2", Path(tmp)), [])
+            self.assertEqual(yoyo.missing_brief_citations(None, Path(tmp)), [])
+
+    def test_a_path_outside_the_cwd_is_not_reported_as_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(yoyo.missing_brief_citations("/etc/hosts:1", Path(tmp)), [])
+
+    def test_the_warning_names_a_sample_and_counts_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = " ".join(f"gone{index}.py:{index + 1}" for index in range(8))
+            with mock.patch.object(yoyo.sys, "stderr", new=io.StringIO()) as stderr:
+                yoyo.warn_missing_brief_citations(text, Path(tmp))
+            message = stderr.getvalue()
+            self.assertIn("cites 8 path(s) not present", message)
+            self.assertIn("gone0.py", message)
+            self.assertIn("(+3 more)", message)
+            self.assertNotIn("gone7.py", message)
+
+
+class CitationReviewFixTests(CliTestCase):
+    def test_a_line_cut_by_the_scan_cap_is_not_offered_as_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            target = cwd / "big.txt"
+            # One short row, then a row long enough that the cap lands inside it.
+            target.write_bytes(b"first\n" + b"x" * (yoyo.CITATION_SCAN_MAX_BYTES + 10))
+
+            self.assertEqual(yoyo.resolve_citation("big.txt", "1", cwd)["status"], "line")
+            self.assertEqual(yoyo.resolve_citation("big.txt", "2", cwd)["status"], "scan_limit")
+
+    def test_a_c1_control_is_stripped_like_a_c0_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "esc.txt").write_bytes("before\u009b2Kafter\n".encode("utf-8"))
+
+            text = yoyo.resolve_citation("esc.txt", "1", cwd)["text"]
+            self.assertNotIn("\u009b", text)
+            self.assertIn("before", text)
+            self.assertIn("after", text)
+
+    def test_one_file_is_read_once_across_every_site_that_cites_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "shared.py").write_text("\n".join(f"line {n}" for n in range(1, 10)), encoding="utf-8")
+            shared = [
+                {"site": "shared.py:2", "agents": ["a", "b"], "spellings": ["shared.py", "./shared.py"]},
+                {"site": "shared.py:4", "agents": ["a", "b"], "spellings": ["shared.py"]},
+            ]
+            real_open = Path.open
+            opened: list[str] = []
+
+            def counting_open(self, *rest, **kwargs):
+                opened.append(self.name)
+                return real_open(self, *rest, **kwargs)
+
+            with mock.patch.object(Path, "open", counting_open):
+                yoyo.resolve_co_cited(shared, cwd)
+
+            self.assertEqual(opened, ["shared.py"])
+            self.assertEqual(shared[0]["disk"]["text"], "line 2")
+            self.assertEqual(shared[1]["disk"]["text"], "line 4")
+
+    def test_two_spellings_of_one_absent_path_are_one_missing_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = "gone/a.py:1 and ./gone/a.py:9 and gone/b.py:3"
+            self.assertEqual(yoyo.missing_brief_citations(text, Path(tmp)), ["gone/a.py", "gone/b.py"])
+
+    def test_an_existence_check_never_opens_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "present.py").write_text("x\n", encoding="utf-8")
+
+            def refuse_open(self, *rest, **kwargs):
+                raise AssertionError(f"opened {self}")
+
+            with mock.patch.object(Path, "open", refuse_open):
+                self.assertEqual(yoyo.missing_brief_citations("present.py:1 gone.py:2", cwd), ["gone.py"])
+
+
+class RunsAuditTests(CliTestCase):
+    """The ledger nests, so the audit's first job is not to double-count it."""
+
+    def _write_record(self, state_dir, run_id, *, meta, result=None, started_at=None):
+        run_dir = Path(state_dir) / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"run_id": run_id, "started_at": started_at or yoyo.iso_utc(yoyo.utc_now())}
+        payload.update(meta)
+        (run_dir / "meta.json").write_text(json.dumps(payload), encoding="utf-8")
+        if result is not None:
+            (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        return run_dir
+
+    def _call(self, state_dir, run_id, agent, result, **kwargs):
+        return self._write_record(state_dir, run_id, meta={"mode": "call", "agent": agent}, result=result, **kwargs)
+
+    def _audit(self, state_dir, *extra):
+        code, stdout, stderr = self.run_cli(["runs", "audit", "--json", *extra], env={"YOYO_STATE_DIR": state_dir})
+        self.assertEqual(code, 0, stderr)
+        return json.loads(stdout)
+
+    def test_outcomes_ignore_the_parent_and_loop_records_that_wrap_a_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-aaaa", "codex", {"exit_code": 0, "duration_s": 12.0, "stdout_bytes": 40})
+            self._write_record(tmp, "20260101T000002-bbbb", meta={"agent": "codex", "argv": ["yoyo", "ask", "codex"]})
+            self._write_record(tmp, "20260101T000003-cccc", meta={"agent": "codex", "loop_id": "loop-1"})
+
+            report = self._audit(tmp)
+            self.assertEqual(report["cohorts"], {"call": 1, "background parent": 1, "loop iteration": 1, "other": 0})
+            self.assertEqual([row["agent"] for row in report["agents"]], ["codex"])
+            self.assertEqual(report["agents"][0]["calls"], 1)
+
+    def test_every_ending_a_call_can_have_gets_its_own_name(self):
+        cases = [
+            ({"exit_code": 0}, "ok"),
+            ({"exit_code": 124, "timed_out": True, "timeout_s": 300}, "hard-timeout"),
+            ({"exit_code": 124, "idle_timed_out": True, "idle_seconds": 90}, "idle-timeout"),
+            ({"exit_code": 124}, "exit-124"),
+            ({"exit_code": None, "killed_by_signal": 15}, "signal"),
+            ({"exit_code": 1}, "nonzero"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, (result, _) in enumerate(cases):
+                self._call(tmp, f"20260101T00000{index}-dddd", "codex", result)
+
+            outcomes = self._audit(tmp)["agents"][0]["outcomes"]
+            for _, expected in cases:
+                self.assertEqual(outcomes[expected], 1, f"{expected}: {outcomes}")
+
+    def test_a_call_still_in_flight_is_running_not_a_missing_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_record(tmp, "20260101T000001-8888", meta={"mode": "call", "agent": "codex", "pid": os.getpid()})
+            self._write_record(tmp, "20260101T000002-9999", meta={"mode": "call", "agent": "codex", "pid": 99999999})
+
+            outcomes = self._audit(tmp)["agents"][0]["outcomes"]
+            self.assertEqual(outcomes["running"], 1)
+            self.assertEqual(outcomes["no-result"], 1)
+
+    def test_a_record_with_no_usable_exit_code_is_not_blamed_on_the_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-abcd", "codex", {"duration_s": 3.0})
+
+            outcomes = self._audit(tmp)["agents"][0]["outcomes"]
+            self.assertEqual(outcomes["unreadable"], 1)
+            self.assertEqual(outcomes["nonzero"], 0)
+
+    def test_an_old_stderr_suffix_still_names_the_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-eeee", "claude", {"exit_code": 124, "stderr": "Idle timeout after 90.0s with no output"})
+            self.assertEqual(self._audit(tmp)["agents"][0]["outcomes"]["idle-timeout"], 1)
+
+    def test_a_record_that_never_stamped_itself_is_not_an_agent_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-ffff", "codex", None)
+            (Path(tmp) / "runs" / "20260101T000002-0000").mkdir(parents=True)
+            (Path(tmp) / "runs" / "20260101T000002-0000" / "meta.json").write_text("{not json", encoding="utf-8")
+
+            report = self._audit(tmp)
+            self.assertEqual(report["agents"][0]["outcomes"]["no-result"], 1)
+            self.assertEqual(report["agents"][0]["outcomes"]["nonzero"], 0)
+            self.assertEqual(report["records_without_meta"], 1)
+
+    def test_a_result_file_that_will_not_parse_is_unreadable_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._call(tmp, "20260101T000001-1111", "codex", None)
+            (run_dir / "result.json").write_text("{truncated", encoding="utf-8")
+            self.assertEqual(self._audit(tmp)["agents"][0]["outcomes"]["unreadable"], 1)
+
+    def test_the_days_window_excludes_a_record_older_than_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20200101T000001-2222", "codex", {"exit_code": 0}, started_at="2020-01-01T00:00:00Z")
+            self._call(tmp, "20260101T000002-3333", "codex", {"exit_code": 0})
+
+            report = self._audit(tmp, "--days", "7")
+            self.assertEqual(report["cohorts"]["call"], 1)
+            self.assertEqual(self._audit(tmp, "--days", "36500")["cohorts"]["call"], 2)
+
+    def test_an_empty_answer_is_reported_with_its_denominator_not_as_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-4444", "codex", {"exit_code": 0, "stdout_bytes": 0})
+            self._call(tmp, "20260101T000002-5555", "codex", {"exit_code": 0, "stdout_bytes": 800})
+
+            report = self._audit(tmp)
+            self.assertEqual(report["zero_stdout_bytes"], {"count": 1, "of_sized_calls": 2})
+            self.assertEqual(report["agents"][0]["outcomes"]["ok"], 2)
+
+    def test_percentiles_report_a_duration_some_call_actually_took(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, seconds in enumerate([10.0, 20.0, 30.0, 40.0]):
+                self._call(tmp, f"20260101T00000{index}-6666", "codex", {"exit_code": 0, "duration_s": seconds})
+
+            row = self._audit(tmp)["agents"][0]
+            self.assertEqual(row["timed_calls"], 4)
+            self.assertEqual(row["p50_s"], 20.0)
+            self.assertEqual(row["p90_s"], 40.0)
+
+    def test_the_table_omits_an_outcome_nobody_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call(tmp, "20260101T000001-7777", "codex", {"exit_code": 0, "duration_s": 5.0})
+
+            code, stdout, stderr = self.run_cli(["runs", "audit"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("ok", stdout)
+            self.assertNotIn("hard-timeout", stdout)
+            self.assertIn("call records only", stdout)
+
+    def test_audit_refuses_a_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, stderr = self.run_cli(["runs", "audit", "someid"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 2)
+            self.assertIn("does not accept a run_id", stderr)
 
 
 class RunIdentityTests(CliTestCase):

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.24.0"
+VERSION = "0.25.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -1799,6 +1799,157 @@ def is_citation_path(path: str) -> bool:
     return CITATION_STEM_RE.search(stem) is not None
 
 
+# An answer is untrusted text, so a cited path is resolved only inside the
+# run's own cwd. The citation grammar accepts any absolute path, so a
+# delegate that writes "/Users/me/.ssh/id_rsa:1" into its answer would
+# otherwise make yoyo read that line and print it back to the caller — the
+# same reason the judge is forced read-only over candidate answers.
+#
+# The scan cap keeps a cited minified bundle or a binary from being walked
+# end to end just to count newlines; past it the line is reported as not
+# reached rather than as missing.
+CITATION_SCAN_MAX_BYTES = 4_000_000
+CITATION_LINE_MAX_CHARS = 200
+# C1 as well as C0: U+009B is a bare CSI, so an answer that smuggles one
+# through a cited line would steer the caller's terminal.
+CITATION_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def citation_target(text: str, cwd: Path) -> tuple[Path | None, str]:
+    """Where a cited path lands under this cwd, without opening it.
+
+    Split out so an existence question costs a stat rather than a 4 MB read.
+    """
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    try:
+        resolved = path.resolve()
+        root = cwd.resolve()
+    except OSError:
+        return None, "io_error"
+
+    # Symlinks are followed first, so a link inside the tree pointing out of
+    # it is caught here rather than read.
+    if resolved != root and root not in resolved.parents:
+        return None, "outside_cwd"
+    if not resolved.exists():
+        return None, "missing"
+    if not resolved.is_file():
+        return None, "not_a_file"
+    return resolved, "ok"
+
+
+def read_citation_rows(resolved: Path, cache: dict[Path, Any] | None) -> tuple[list[bytes] | None, bool]:
+    """The capped head of a file, split into lines, read at most once.
+
+    One answer cites the same file on many lines and each site is tried in
+    several spellings, so without the cache a 4 MB file is re-read per site.
+    """
+    if cache is not None and resolved in cache:
+        return cache[resolved]
+
+    try:
+        with resolved.open("rb") as handle:
+            data = handle.read(CITATION_SCAN_MAX_BYTES + 1)
+    except OSError:
+        rows: list[bytes] | None = None
+        capped = False
+    else:
+        capped = len(data) > CITATION_SCAN_MAX_BYTES
+        rows = data[:CITATION_SCAN_MAX_BYTES].split(b"\n")
+        if rows and rows[-1] == b"":
+            rows.pop()
+
+    if cache is not None:
+        cache[resolved] = (rows, capped)
+    return rows, capped
+
+
+def resolve_citation(text: str, line: str, cwd: Path, cache: dict[Path, Any] | None = None) -> dict[str, Any]:
+    """What is on disk right now at a cited file:line, under this cwd.
+
+    Reports the fact and never the verdict. "no such file under the run cwd"
+    and "the file has 4750 lines" are evidence the reader can act on, where
+    "hallucinated" or "verified" would be yoyo grading an answer it has no
+    standing to grade. A full-access agent may also have edited the file
+    between citing it and this read, which is why every caller labels the
+    result as of print time.
+    """
+    try:
+        number = int(line)
+    except ValueError:
+        return {"status": "io_error"}
+
+    resolved, status = citation_target(text, cwd)
+    if resolved is None:
+        return {"status": status}
+
+    rows, capped = read_citation_rows(resolved, cache)
+    if rows is None:
+        return {"status": "io_error"}
+
+    # A cap that lands mid-line leaves a fragment, and a fragment presented as
+    # the line would be evidence yoyo cannot stand behind.
+    if 1 <= number <= len(rows) and not (capped and number == len(rows)):
+        snippet = rows[number - 1].decode("utf-8", errors="replace")
+        snippet = CITATION_CONTROL_RE.sub(" ", snippet).strip()
+        if len(snippet) > CITATION_LINE_MAX_CHARS:
+            snippet = snippet[:CITATION_LINE_MAX_CHARS] + "..."
+        return {"status": "line", "text": snippet}
+    if capped:
+        return {"status": "scan_limit", "scanned_bytes": CITATION_SCAN_MAX_BYTES}
+    return {"status": "line_out_of_range", "line_count": len(rows)}
+
+
+CITATION_DISK_NOTES = {
+    "line": "on disk now: {text}",
+    "line_read_as": "on disk now at {read_as}: {text}",
+    "missing": "on disk now: no such file under the run cwd",
+    "outside_cwd": "not read: the path resolves outside the run cwd",
+    "not_a_file": "on disk now: not a regular file",
+    "line_out_of_range": "on disk now: the file has {line_count} lines",
+    "scan_limit": "on disk now: that line is past the first {scanned_bytes} bytes",
+    "io_error": "on disk now: unreadable",
+}
+
+
+def citation_disk_note(disk: dict[str, Any] | None) -> str:
+    if not isinstance(disk, dict):
+        return ""
+    key = str(disk.get("status"))
+    if key == "line" and disk.get("read_as"):
+        key = "line_read_as"
+    template = CITATION_DISK_NOTES.get(key)
+    if template is None:
+        return ""
+    return template.format(**disk)
+
+
+def resolve_co_cited(shared: list[dict[str, Any]], cwd: Path) -> None:
+    """Attach what disk says to each co-cited site, in place.
+
+    Agents spell the same site differently — one writes bin/yoyo:1338 where
+    another writes the absolute path — and the site keeps the fullest
+    spelling for display. That spelling can be the one that does not resolve,
+    so every spelling seen is tried, shortest first, and the first that lands
+    on a line is the one reported.
+    """
+    cache: dict[Path, Any] = {}
+    for entry in shared:
+        spellings = sorted(entry.pop("spellings", []), key=len)
+        shown, _, line = entry["site"].rpartition(":")
+        outcomes = [(text, resolve_citation(text, line, cwd, cache)) for text in spellings]
+        found = next(((text, disk) for text, disk in outcomes if disk["status"] == "line"), None)
+        read_as, disk = found or (outcomes[0] if outcomes else ("", {"status": "io_error"}))
+
+        # Suffix matching merges two spellings that could name different files,
+        # so a note about a path other than the one displayed says so.
+        if disk["status"] == "line" and read_as != shown:
+            disk = {**disk, "read_as": read_as}
+        entry["disk"] = disk
+
+
 CO_CITED_HEADER = "=== cited by more than one agent (co-citation, not agreement on the verdict) ==="
 
 
@@ -1863,9 +2014,10 @@ def co_cited_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         matches = by_suffix.get((entry["segments"], entry["line"]), [])
         if len(matches) == 1:
             matches[0]["answers"].extend(answer for answer in entry["answers"] if answer not in matches[0]["answers"])
+            matches[0]["spellings"].append(entry["text"])
             continue
 
-        site = {**entry, "answers": list(entry["answers"])}
+        site = {**entry, "answers": list(entry["answers"]), "spellings": [entry["text"]]}
         sites.append(site)
         segments = site["segments"]
         for depth in range(1, len(segments) + 1):
@@ -1875,7 +2027,11 @@ def co_cited_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # were asked in — that is the order the rest of the answer is printed in.
     labels = [str(result.get("agent") or "") for result in results]
     shared = [
-        {"site": f"{site['text']}:{site['line']}", "agents": [labels[answer] for answer in sorted(site["answers"])]}
+        {
+            "site": f"{site['text']}:{site['line']}",
+            "agents": [labels[answer] for answer in sorted(site["answers"])],
+            "spellings": site["spellings"],
+        }
         for site in sites
         if len(site["answers"]) > 1
     ]
@@ -1886,8 +2042,13 @@ def co_cited_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def render_co_cited(shared: list[dict[str, Any]]) -> str:
     if not shared:
         return f"{CO_CITED_HEADER}\nno file:line site was cited by more than one agent"
-    body = "\n".join(f"{entry['site']} — {', '.join(entry['agents'])}" for entry in shared)
-    return f"{CO_CITED_HEADER}\n{body}"
+    lines: list[str] = []
+    for entry in shared:
+        lines.append(f"{entry['site']} — {', '.join(entry['agents'])}")
+        note = citation_disk_note(entry.get("disk"))
+        if note:
+            lines.append(f"  {note}")
+    return f"{CO_CITED_HEADER}\n" + "\n".join(lines)
 
 
 def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
@@ -1976,6 +2137,7 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
 
     # Computed before --judge-only spills the answers and blanks their stdout.
     co_cited = co_cited_sites(successful) if len(successful) > 1 else []
+    resolve_co_cited(co_cited, cwd)
 
     verdict: dict[str, Any] | None = None
     if judge and len(successful) >= 2:
@@ -2583,6 +2745,10 @@ def cmd_runs(args: argparse.Namespace) -> int:
         if args.run_id:
             raise YoyoError("runs prune does not accept a run_id")
         return prune_runs(args)
+    if action == "audit":
+        if args.run_id:
+            raise YoyoError("runs audit does not accept a run_id")
+        return audit_runs(args)
     if action != "list":
         raise YoyoError(f"Unknown runs action: {action}")
     if args.run_id:
@@ -2643,6 +2809,210 @@ def prune_runs(args: argparse.Namespace) -> int:
             shutil.rmtree(path)
     action = "would delete" if args.dry_run else "deleted"
     print(f"{len(selected)} run dirs {action}")
+    return 0
+
+
+# The ledger holds three record shapes in one directory, and they nest: an
+# `ask codex,claude --background` writes a parent record plus one call record
+# per agent, and every loop iteration mirrors the call it wraps. Summing
+# directories therefore counts the same work up to three times, so outcomes
+# are aggregated from call records alone and the other cohorts are reported
+# as coverage instead of being folded in.
+#
+#   ask codex,claude --background   -> 1 parent  + 2 call records
+#   loop --agent codex (3 rounds)   -> 3 mirrors + 3 call records
+CALL_RECORD = "call"
+PARENT_RECORD = "background parent"
+LOOP_RECORD = "loop iteration"
+OTHER_RECORD = "other"
+
+# Every way a call record can end, kept apart because they need opposite
+# fixes: a hard timeout means the caller's budget was too small, an idle
+# timeout means the stream stalled, and a signal means the caller killed yoyo
+# rather than the agent failing at all.
+AUDIT_OUTCOMES = (
+    "ok",
+    "running",
+    "hard-timeout",
+    "idle-timeout",
+    "exit-124",
+    "signal",
+    "nonzero",
+    "no-result",
+    "unreadable",
+)
+
+
+def run_cohort(meta: dict[str, Any]) -> str:
+    if meta.get("mode") == CALL_RECORD:
+        return CALL_RECORD
+    if meta.get("loop_id") is not None:
+        return LOOP_RECORD
+    if "argv" in meta:
+        return PARENT_RECORD
+    return OTHER_RECORD
+
+
+def run_outcome(result: dict[str, Any] | None, recorded: bool, live: bool = False) -> str:
+    """How one call record ended, from what it recorded and nothing more.
+
+    A record with no result.json is still running if its process is alive, and
+    otherwise died without stamping itself; one that will not parse is corrupt.
+    None of the three is an agent failure, so each keeps its own name rather
+    than joining a rate that would blame an agent for it.
+    """
+    if not recorded:
+        return "running" if live else "no-result"
+    if result is None:
+        return "unreadable"
+    if result.get("killed_by_signal") is not None:
+        return "signal"
+    try:
+        exit_code = int(result.get("exit_code"))
+    except (TypeError, ValueError):
+        return "unreadable"
+    if exit_code == 0:
+        return "ok"
+
+    # Records predating the timed_out/idle_timed_out flags carry only a stderr
+    # suffix, which timeout_clock already reads; an agent that exits 124 on its
+    # own leaves neither, and gets no clock named.
+    clock = timeout_clock(result)
+    if clock is not None:
+        return "hard-timeout" if clock[0] == HARD_TIMEOUT_CLOCK else "idle-timeout"
+    return "exit-124" if exit_code == 124 else "nonzero"
+
+
+def percentile(values: list[float], percent: int) -> float | None:
+    """Nearest-rank percentile over a sorted list.
+
+    Interpolating between two samples would report a duration no call took.
+    """
+    if not values:
+        return None
+    rank = max(1, (percent * len(values) + 99) // 100)
+    return values[rank - 1]
+
+
+def collect_audit(days: int) -> dict[str, Any]:
+    """Aggregate the run ledger without re-deriving anything it did not record.
+
+    Deliberately does not go through run_summary: that reports a still-running
+    duration as now-minus-start, which turns a record that died in June into a
+    two-month call, and it probes the pid of every record, which is a
+    subprocess per directory over thousands of them.
+    """
+    cutoff = utc_now().timestamp() - (days * 86400)
+    cohorts: dict[str, int] = {name: 0 for name in (CALL_RECORD, PARENT_RECORD, LOOP_RECORD, OTHER_RECORD)}
+    by_agent: dict[str, dict[str, Any]] = {}
+    no_meta = 0
+    zero_stdout = 0
+    sized = 0
+
+    root = runs_root()
+    for run_dir in sorted(root.iterdir()) if root.is_dir() else []:
+        if not run_dir.is_dir():
+            continue
+        meta = run_meta(run_dir)
+        if meta is None:
+            no_meta += 1
+            continue
+        started = run_started_at(meta, run_dir)
+        if started is None or started.timestamp() < cutoff:
+            continue
+
+        cohort = run_cohort(meta)
+        cohorts[cohort] += 1
+        if cohort != CALL_RECORD:
+            continue
+
+        result_path = run_dir / "result.json"
+        recorded = result_path.exists()
+        result = load_json_file(result_path) if recorded else None
+        # The pid is probed only for the handful of records with no result yet,
+        # never for the whole ledger — os.kill(pid, 0) on a finished run is the
+        # cost this avoids paying thousands of times.
+        live = not recorded and pid_is_running(meta.get("pid"), meta.get("pid_started"))
+        outcome = run_outcome(result, recorded, live)
+
+        agent = str(meta.get("agent") or "unknown")
+        row = by_agent.setdefault(agent, {"agent": agent, "calls": 0, "outcomes": {name: 0 for name in AUDIT_OUTCOMES}, "durations": []})
+        row["calls"] += 1
+        row["outcomes"][outcome] += 1
+
+        if result is None:
+            continue
+        try:
+            row["durations"].append(float(result["duration_s"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        # codex writes its answer to --output-last-message, so a zero capture
+        # is normal for it. Reported as its own number with its denominator,
+        # never as a failure.
+        if "stdout_bytes" in result:
+            sized += 1
+            zero_stdout += 1 if result["stdout_bytes"] == 0 else 0
+
+    agents = []
+    for row in sorted(by_agent.values(), key=lambda item: (-item["calls"], item["agent"])):
+        durations = sorted(row.pop("durations"))
+        row["p50_s"] = percentile(durations, 50)
+        row["p90_s"] = percentile(durations, 90)
+        row["timed_calls"] = len(durations)
+        agents.append(row)
+
+    return {
+        "days": days,
+        "since": iso_utc(datetime.fromtimestamp(cutoff, timezone.utc)),
+        "cohorts": cohorts,
+        "records_without_meta": no_meta,
+        "agents": agents,
+        "zero_stdout_bytes": {"count": zero_stdout, "of_sized_calls": sized},
+    }
+
+
+def audit_runs(args: argparse.Namespace) -> int:
+    if args.days < 1:
+        raise YoyoError("--days must be at least 1")
+    report = collect_audit(args.days)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+
+    cohorts = report["cohorts"]
+    coverage = ", ".join(f"{count} {name}" for name, count in cohorts.items() if count)
+    print(f"runs audit: last {report['days']} days, since {report['since']}")
+    # The window is read from started_at, which a directory without meta.json
+    # does not have, so that count is all-time and is labelled as such.
+    strays = f", {report['records_without_meta']} without meta.json (all time)" if report["records_without_meta"] else ""
+    print(f"records: {coverage or 'none'}{strays}")
+    print("outcomes below count call records only; parents and loop mirrors wrap the same calls")
+    print()
+
+    if not report["agents"]:
+        print("no call records in this window")
+        return 0
+
+    # An outcome nobody hit adds a column of zeros to every row, so only the
+    # ones that actually happened are printed. --json always carries all of them.
+    columns = [name for name in AUDIT_OUTCOMES if any(row["outcomes"][name] for row in report["agents"])]
+    widths = {name: max(len(name), 5) for name in columns}
+    agent_width = max(6, *(len(row["agent"]) for row in report["agents"]))
+
+    header = f"{'agent':<{agent_width}}  {'calls':>5}  " + "  ".join(f"{name:>{widths[name]}}" for name in columns)
+    print(header + f"  {'p50':>8}  {'p90':>8}")
+    for row in report["agents"]:
+        counts = "  ".join(f"{row['outcomes'][name]:>{widths[name]}}" for name in columns)
+        p50 = "-" if row["p50_s"] is None else f"{row['p50_s']:.1f}s"
+        p90 = "-" if row["p90_s"] is None else f"{row['p90_s']:.1f}s"
+        print(f"{row['agent']:<{agent_width}}  {row['calls']:>5}  {counts}  {p50:>8}  {p90:>8}")
+
+    sized = report["zero_stdout_bytes"]
+    print()
+    print(
+        f"zero stdout bytes: {sized['count']} of {sized['of_sized_calls']} calls that recorded a size "
+        "(normal for codex, which answers via --output-last-message)"
+    )
     return 0
 
 
@@ -2947,6 +3317,57 @@ def read_loop_brief(brief_path: Path | None, max_bytes: int) -> str | None:
     return text.strip()
 
 
+# How many missing paths to name before the warning becomes a wall of text.
+BRIEF_CITATION_SAMPLE = 5
+
+
+def missing_brief_citations(text: str | None, cwd: Path) -> list[str]:
+    """Paths the brief cites by file:line that are not there under the cwd.
+
+    Existence only, never the line number: a brief written last week cites a
+    line that has since moved, and reporting that as a problem would flag
+    ordinary drift the worker is already told to expect. A path that is simply
+    absent is a fact that does not go stale, and it is the one a fresh-context
+    worker cannot recover from — it will hunt for the file, not for the truth.
+    """
+    if not text:
+        return []
+    missing: list[str] = []
+    seen: set[Path] = set()
+    for path, _ in CITATION_RE.findall(text):
+        if not is_citation_path(path):
+            continue
+        resolved, status = citation_target(path, cwd)
+        if status != "missing":
+            continue
+
+        # "missing/foo.py" and "./missing/foo.py" are one absent file, and
+        # would otherwise take two of the five slots the warning names.
+        target = (cwd / path).expanduser()
+        if target in seen:
+            continue
+        seen.add(target)
+        missing.append(path)
+    return missing
+
+
+def warn_missing_brief_citations(text: str | None, cwd: Path) -> None:
+    """Say it once, at loop start, and let the loop run.
+
+    Checking per iteration would repeat one warning for every round of a long
+    loop, and yoyo has no standing to stop the run over it: the brief is the
+    caller's document, and a path may be one the loop is about to create.
+    """
+    missing = missing_brief_citations(text, cwd)
+    if not missing:
+        return
+
+    shown = ", ".join(missing[:BRIEF_CITATION_SAMPLE])
+    extra = len(missing) - BRIEF_CITATION_SAMPLE
+    more = f" (+{extra} more)" if extra > 0 else ""
+    eprint(f"warning: the brief cites {len(missing)} path(s) not present under {cwd}: {shown}{more}")
+
+
 QUEUE_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(\S.*)$")
 
 
@@ -3189,6 +3610,10 @@ def cmd_loop(args: argparse.Namespace) -> int:
     spec_text = read_loop_spec(spec_path, args.max_input_bytes)
     queue_path = resolve_loop_queue_path(args)
     brief_path = resolve_loop_brief_path(args)
+    # The detached child re-enters here without --background and warns there,
+    # so warning in the parent too would print the same line twice.
+    if not getattr(args, "background", False):
+        warn_missing_brief_citations(read_loop_brief(brief_path, args.max_input_bytes), resolve_cwd(args.cwd))
     # Fail loudly on flag problems (e.g. --read-only on a custom agent without
     # read_only_args) before seeding state or detaching — for every rotation agent.
     for name in dict.fromkeys(loop_agents):
@@ -4765,12 +5190,12 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--background", action="store_true", help="Detach the research run and record it in the run ledger (poll with `yoyo wait`)")
     research.set_defaults(func=cmd_research, collect_unknown_prompt=True, use_stdin_context=False)
 
-    runs = sub.add_parser("runs", help="List, show, autopsy, and prune run records")
-    runs.add_argument("runs_action", nargs="?", choices=["list", "show", "autopsy", "prune"], default="list")
+    runs = sub.add_parser("runs", help="List, show, autopsy, audit, and prune run records")
+    runs.add_argument("runs_action", nargs="?", choices=["list", "show", "autopsy", "audit", "prune"], default="list")
     runs.add_argument("run_id", nargs="?")
     runs.add_argument("--json", action="store_true")
     runs.add_argument("--limit", type=int, default=20)
-    runs.add_argument("--days", type=int, default=7)
+    runs.add_argument("--days", type=int, default=7, help="Window for audit and prune, in days")
     runs.add_argument("--dry-run", action="store_true")
     runs.set_defaults(func=cmd_runs)
 
