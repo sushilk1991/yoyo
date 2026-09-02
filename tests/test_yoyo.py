@@ -57,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.25.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.25.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -1210,16 +1210,21 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("yoyo", stdout)
             self.assertIn("yoyo-workflow", stdout)
-            self.assertTrue((pi_dir.resolve() / "skills" / "yoyo" / "SKILL.md").exists())
-            self.assertTrue((pi_dir.resolve() / "skills" / "yoyo-workflow" / "SKILL.md").exists())
+            for root in (".codex", ".claude", ".agents", ".config/opencode"):
+                self.assertTrue((home / root / "skills" / "yoyo" / "SKILL.md").exists(), root)
+                self.assertTrue((home / root / "skills" / "yoyo-workflow" / "SKILL.md").exists(), root)
+            # Pi's own skills dir is not an install target: pi reads
+            # ~/.agents/skills natively, so a copy there would collide.
+            self.assertFalse((pi_dir.resolve() / "skills" / "yoyo").exists())
+            self.assertFalse((pi_dir.resolve() / "skills" / "yoyo-workflow").exists())
 
     def test_install_skill_prunes_stale_files_from_existing_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "skills"
             (source / "yoyo").mkdir(parents=True)
             (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
-            pi_dir = Path(tmp) / "pi"
-            stale = pi_dir / "skills" / "yoyo" / "old.txt"
+            home = Path(tmp) / "home"
+            stale = home / ".agents" / "skills" / "yoyo" / "old.txt"
             stale.parent.mkdir(parents=True)
             stale.write_text("stale", encoding="utf-8")
 
@@ -1227,14 +1232,288 @@ class YoyoTests(CliTestCase):
                 ["install-skill"],
                 env={
                     "YOYO_SKILL_SOURCE": str(source),
-                    "HOME": str(Path(tmp) / "home"),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(Path(tmp) / "pi"),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(stale.exists())
+            self.assertTrue((home / ".agents" / "skills" / "yoyo" / "SKILL.md").exists())
+
+    def test_install_skill_removes_legacy_pi_home_skill_copies(self):
+        # Pi reads ~/.agents/skills natively, so a bundled-skill copy in pi's
+        # own skills dir collides with the shared one at pi startup. Yoyo
+        # installed that copy in older releases, so yoyo takes it back out.
+        # A directory that is not part of the bundle is none of its business.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("base", encoding="utf-8")
+            foreign = pi_dir / "skills" / "no-ai-slop"
+            foreign.mkdir(parents=True)
+            (foreign / "SKILL.md").write_text("mine", encoding="utf-8")
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
                     "PI_CODING_AGENT_DIR": str(pi_dir),
                 },
             )
 
             self.assertEqual(code, 0, stderr)
-            self.assertFalse((pi_dir.resolve() / "skills" / "yoyo" / "old.txt").exists())
-            self.assertTrue((pi_dir.resolve() / "skills" / "yoyo" / "SKILL.md").exists())
+            self.assertFalse(legacy.exists())
+            self.assertIn("removed legacy skill", stdout)
+            self.assertTrue(foreign.exists())
+
+    def test_install_skill_moves_modified_pi_home_skill_copies_aside_intact(self):
+        # Only a copy identical to the current bundle is yoyo's own artifact.
+        # Anything else — a hand-edited SKILL.md, a copy from an older release
+        # whose SKILL.md has since changed — still collides, so it is moved
+        # aside recoverably instead of deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("canonical", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("from an older release", encoding="utf-8")
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_dir),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(legacy.exists())
+            self.assertNotIn("removed legacy skill", stdout)
+            self.assertIn("moved legacy skill aside", stdout)
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            self.assertTrue(aside.is_dir())
+            self.assertEqual((aside / "SKILL.md").read_text(encoding="utf-8"), "from an older release")
+
+    def test_install_skill_never_deletes_a_copy_with_extra_user_files(self):
+        # An unchanged SKILL.md is not proof the directory is yoyo's: user
+        # files sitting beside it must survive. The copy is moved aside whole.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("base", encoding="utf-8")
+            (legacy / "notes.txt").write_text("mine", encoding="utf-8")
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_dir),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(legacy.exists())
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            self.assertTrue(aside.is_dir())
+            self.assertEqual((aside / "notes.txt").read_text(encoding="utf-8"), "mine")
+            self.assertIn("moved legacy skill aside", stdout)
+
+    def test_install_skill_moves_a_symlinked_pi_home_skill_aside_without_touching_the_target(self):
+        # Pi follows directory symlinks during skill discovery, so a symlink
+        # in the pi home collides like a real copy. The link is renamed aside
+        # whole — the directory it points at is never touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            target_dir = Path(tmp) / "elsewhere" / "yoyo"
+            target_dir.mkdir(parents=True)
+            (target_dir / "SKILL.md").write_text("external", encoding="utf-8")
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.parent.mkdir(parents=True)
+            legacy.symlink_to(target_dir)
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_dir),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(os.path.lexists(str(legacy)))
+            self.assertTrue(target_dir.is_dir())
+            self.assertEqual((target_dir / "SKILL.md").read_text(encoding="utf-8"), "external")
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            self.assertTrue(aside.is_symlink())
+            self.assertEqual((aside / "SKILL.md").read_text(encoding="utf-8"), "external")
+            self.assertIn("moved legacy skill symlink aside", stdout)
+
+    def test_install_skill_moves_a_copy_with_an_extra_empty_directory_aside(self):
+        # Directories count in the ownership comparison: a copy that is
+        # byte-identical in its files but holds an extra (even empty) user
+        # directory is not provably yoyo's and is moved aside, not deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("base", encoding="utf-8")
+            (legacy / "user-notes").mkdir()
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_dir),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(legacy.exists())
+            self.assertIn("moved legacy skill aside", stdout)
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            self.assertTrue((aside / "user-notes").is_dir())
+
+    def test_install_skill_moves_a_copy_with_an_unreadable_subdirectory_aside(self):
+        # An unreadable subdirectory makes the tree unprovable — it must fail
+        # closed (move aside) rather than being treated as an identical copy.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("base", encoding="utf-8")
+            locked = legacy / "locked"
+            locked.mkdir()
+            (locked / "inner.txt").write_text("secret-ish", encoding="utf-8")
+            locked.chmod(0o000)
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            try:
+                code, stdout, stderr = self.run_cli(
+                    ["install-skill"],
+                    env={
+                        "YOYO_SKILL_SOURCE": str(source),
+                        "HOME": str(home),
+                        "PI_CODING_AGENT_DIR": str(pi_dir),
+                    },
+                )
+            finally:
+                # The whole tree may have been moved aside under the lock.
+                for candidate in (locked, aside / "locked"):
+                    if candidate.is_dir():
+                        candidate.chmod(0o755)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(legacy.exists())
+            self.assertIn("moved legacy skill aside", stdout)
+            aside = pi_dir / "yoyo.legacy-moved-by-yoyo"
+            self.assertEqual((aside / "locked" / "inner.txt").read_text(encoding="utf-8"), "secret-ish")
+
+    def test_doctor_spares_shared_home_when_pi_dir_aliases_it(self):
+        # PI_CODING_AGENT_DIR=~/.agents makes pi's skills dir the shared
+        # install target: one healthy copy, nothing legacy to report.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            shared = home / ".agents" / "skills" / "yoyo"
+            shared.mkdir(parents=True)
+            (shared / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(home / ".agents"),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("in sync", stdout)
+            self.assertNotIn("LEGACY", stdout)
+
+    def test_install_skill_spares_shared_home_when_pi_dir_aliases_it(self):
+        # PI_CODING_AGENT_DIR pointing at ~/.agents makes pi's skills dir the
+        # same directory as the shared install target; the installer must not
+        # then delete what it just installed as "legacy".
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("base", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = home / ".agents"
+
+            code, stdout, stderr = self.run_cli(
+                ["install-skill"],
+                env={
+                    "YOYO_SKILL_SOURCE": str(source),
+                    "HOME": str(home),
+                    "PI_CODING_AGENT_DIR": str(pi_dir),
+                },
+            )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((home / ".agents" / "skills" / "yoyo" / "SKILL.md").exists())
+            self.assertNotIn("removed legacy skill", stdout)
+
+    def test_install_skill_removes_legacy_copies_of_skipped_skills(self):
+        # Cleanup covers every bundled skill, including ones skipped this run
+        # because their powering agent is missing — otherwise doctor keeps
+        # recommending an install-skill run that cannot fix the warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "skills"
+            (source / "yoyo-imagegen").mkdir(parents=True)
+            (source / "yoyo-imagegen" / "SKILL.md").write_text("imagegen", encoding="utf-8")
+            home = Path(tmp) / "home"
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo-imagegen"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("imagegen", encoding="utf-8")
+
+            env = {
+                "YOYO_SKILL_SOURCE": str(source),
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(pi_dir),
+            }
+            real_which = yoyo.shutil.which
+            with mock.patch.object(yoyo.shutil, "which", side_effect=lambda name: None if name == "codex" else real_which(name)):
+                code, stdout, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skipped skill: yoyo-imagegen (requires codex on PATH)", stdout)
+            self.assertFalse((home / ".agents" / "skills" / "yoyo-imagegen").exists())
+            self.assertFalse(legacy.exists())
+            self.assertIn("removed legacy skill", stdout)
 
 
 
@@ -3657,6 +3936,21 @@ class SkillGuardTests(CliTestCase):
         missing = [why for why, anchor in self.LOAD_BEARING_ANCHORS.items() if anchor not in text]
         self.assertEqual(missing, [], f"SKILL.md lost load-bearing content: {missing}")
 
+    def test_bundled_skill_descriptions_have_no_plain_scalar_colon_space(self):
+        # Narrow regression guard (no YAML parser in the stdlib): harnesses
+        # parse SKILL.md frontmatter as YAML, and a colon-space inside a plain
+        # (unquoted) scalar — yoyo-watch once had "video: YouTube/..." in its
+        # description — makes the whole document fail to parse. Quoted
+        # descriptions may contain anything.
+        for skill_md in sorted((ROOT / "skills").glob("*/SKILL.md")):
+            front = skill_md.read_text(encoding="utf-8").split("---")[1]
+            for line in front.splitlines():
+                if line.startswith("description: "):
+                    value = line[len("description: "):]
+                    if value.startswith('"'):
+                        continue  # quoted scalars may contain anything
+                    self.assertNotIn(": ", value, f"{skill_md}: unquoted description contains a colon-space")
+
     def test_doctor_reports_resolved_default_skills(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -3727,6 +4021,39 @@ class SkillGuardTests(CliTestCase):
             code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
             self.assertEqual(code, 0, stderr + stdout)
             self.assertIn("skill yoyo: in sync (1 homes)", stdout)
+
+    def test_doctor_flags_legacy_pi_home_skill_copy(self):
+        # Pi reads ~/.agents/skills natively, so a bundled copy in pi's own
+        # skills dir collides with the shared one; doctor names it and
+        # install-skill removes it.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = Path(tmp) / "source"
+            (source / "yoyo").mkdir(parents=True)
+            (source / "yoyo" / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            pi_dir = Path(tmp) / "pi"
+            legacy = pi_dir / "skills" / "yoyo"
+            legacy.mkdir(parents=True)
+            (legacy / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            shared = home / ".agents" / "skills" / "yoyo"
+            shared.mkdir(parents=True)
+            (shared / "SKILL.md").write_text("# canonical\n", encoding="utf-8")
+            env = {
+                "HOME": str(home),
+                "PI_CODING_AGENT_DIR": str(pi_dir),
+                "YOYO_SKILL_SOURCE": str(source),
+                "YOYO_STATE_DIR": tmp,
+                "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            }
+
+            code, stdout, stderr = self.run_cli(["doctor"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("skill yoyo: LEGACY", stdout)
+            self.assertIn(str(legacy), stdout)
+            self.assertNotIn("in sync", stdout, "the colliding legacy copy must not read as a healthy home")
+
+            code, _, _ = self.run_cli(["doctor", "--strict"], env=env)
+            self.assertEqual(code, 1, "a legacy pi-home skill copy must fail doctor --strict")
 
     def test_doctor_reports_an_orphaned_skill_copy(self):
         # Renaming a bundled skill leaves the old directory behind in every

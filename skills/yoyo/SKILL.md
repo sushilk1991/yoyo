@@ -141,6 +141,7 @@ DONE is what the worker says it is. Read the diff before you believe it.
 ## More
 
 - `yoyo imagegen "<prompt>" --out file.png` — real raster images; see the `yoyo-imagegen` skill.
+- Images you cannot see (screenshots, error dialogs) — see the `yoyo-vision` skill.
 - Video (YouTube, Loom, screen recordings) — see the `yoyo-watch` skill.
 - `yoyo research` in depth — see the `yoyo-research` skill.
 - `yoyo runs list` / `autopsy` / `prune`, `yoyo sessions`, `yoyo agents`, `yoyo skills`, `yoyo doctor --live`, `yoyo update`.

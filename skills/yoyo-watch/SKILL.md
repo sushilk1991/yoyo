@@ -1,6 +1,6 @@
 ---
 name: yoyo-watch
-description: Understand any video (URL or local file) — summarize it, answer questions about it, diagnose a bug from a screen recording, break down someone's content. Runs the bundled watch pipeline (yt-dlp + ffmpeg + captions/Whisper) directly, or delegates the whole watch to a yoyo agent so frames never enter your context. Use when a task involves a video: YouTube/Loom/TikTok/X links, .mp4/.mov/.mkv/.webm files, screen recordings.
+description: "Understand any video (URL or local file) — summarize it, answer questions about it, diagnose a bug from a screen recording, break down someone's content. Runs the bundled watch pipeline (yt-dlp + ffmpeg + captions/Whisper) directly, or delegates the whole watch to a yoyo agent so frames never enter your context. Use when a task involves a video - YouTube/Loom/TikTok/X links, .mp4/.mov/.mkv/.webm files, screen recordings."
 ---
 
 # Yoyo Watch

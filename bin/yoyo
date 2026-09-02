@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.25.0"
+VERSION = "0.25.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -4766,14 +4766,88 @@ def is_yoyo_skill_name(name: str) -> bool:
     return name == YOYO_SKILL_PREFIX or name.startswith(YOYO_SKILL_PREFIX + "-")
 
 
+def pi_agent_skills_dir() -> Path:
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills"
+
+
+def pi_dir_aliases_install_target(pi_skills: Path) -> bool:
+    """True when pi's skills dir is the same directory as one of the install
+    targets (e.g. PI_CODING_AGENT_DIR=~/.agents) — then there is exactly one
+    copy of each bundled skill and nothing about it is legacy."""
+    return any(os.path.realpath(str(pi_skills)) == os.path.realpath(str(root)) for root in skill_target_roots())
+
+
+def tree_manifest(root: Path) -> list[tuple[str, bytes]] | None:
+    """Deterministic manifest of the whole tree — directories included — or
+    None when anything is a symlink, unreadable, or neither file nor
+    directory (socket, fifo, …). Walks with scandir/lstat so every traversal
+    error fails closed instead of being silently skipped."""
+    entries: list[tuple[str, bytes]] = []
+
+    def walk(dir_path: Path, prefix: str) -> bool:
+        try:
+            children = sorted(os.scandir(dir_path), key=lambda e: e.name)
+        except OSError:
+            return False
+        for entry in children:
+            rel = f"{prefix}{entry.name}"
+            try:
+                if entry.is_symlink():
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    entries.append((rel + "/", b""))
+                    if not walk(Path(entry.path), rel + "/"):
+                        return False
+                elif entry.is_file(follow_symlinks=False):
+                    entries.append((rel, Path(entry.path).read_bytes()))
+                else:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    if not walk(root, ""):
+        return None
+    return entries
+
+
+def is_unmodified_bundled_copy(legacy: Path, source_dir: Path) -> bool:
+    """True when a legacy copy is the artifact install-skill itself put there:
+    a real directory (no symlinks) whose every file matches the bundled
+    source byte for byte. Comparing the whole tree, not just SKILL.md — an
+    unchanged SKILL.md says nothing about user files sitting beside it."""
+    if legacy.is_symlink() or not legacy.is_dir():
+        return False
+    mine = tree_manifest(legacy)
+    theirs = tree_manifest(source_dir)
+    return mine is not None and mine == theirs
+
+
 def skill_target_roots() -> list[Path]:
+    """Agent homes yoyo installs bundled skills into.
+
+    Pi's own skills dir is deliberately absent: pi reads ~/.agents/skills
+    natively (one of its global skill locations), so a copy in the pi home
+    collides with the shared one — pi warns about the duplicate name and
+    skips one of the two at every startup. Pi picks the skills up from the
+    shared dir like every other harness that reads it.
+    """
     return [
         Path("~/.codex/skills").expanduser(),
         Path("~/.claude/skills").expanduser(),
         Path("~/.agents/skills").expanduser(),
         Path("~/.config/opencode/skills").expanduser(),
-        Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
     ]
+
+
+def agent_skill_homes() -> list[Path]:
+    """Every agent home where a yoyo skill copy can live: the install targets
+    plus pi's own skills dir, where older releases installed and where a
+    leftover copy still collides with the shared one. When pi's dir aliases
+    an install target there is no second home to watch."""
+    targets = skill_target_roots()
+    pi_dir = pi_agent_skills_dir()
+    return targets if pi_dir_aliases_install_target(pi_dir) else targets + [pi_dir]
 
 
 def bundled_skills_source() -> Path | None:
@@ -4806,7 +4880,7 @@ def doctor_report_orphan_skills(installable: set[str]) -> int:
     stays until a human moves it.
     """
     orphans = 0
-    for root in skill_target_roots():
+    for root in agent_skill_homes():
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
@@ -4856,11 +4930,21 @@ def doctor_check_skill_sync() -> int:
                     stale.append(target)
             except OSError:
                 stale.append(target)
+        pi_skills = pi_agent_skills_dir()
+        legacy = pi_skills / skill_dir.name
+        has_legacy = not pi_dir_aliases_install_target(pi_skills) and os.path.lexists(str(legacy))
+        if has_legacy:
+            drifted += 1
+            hint = "run: yoyo install-skill" if is_unmodified_bundled_copy(legacy, skill_dir) else "install-skill moves it aside intact; or move it away yourself"
+            print(
+                f"skill {skill_dir.name}: LEGACY at {legacy} "
+                f"(pi loads ~/.agents/skills; a copy here collides with it) ({hint})"
+            )
         if stale:
             drifted += len(stale)
             for target in stale:
                 print(f"skill {skill_dir.name}: OUT OF SYNC at {target} (run: yoyo install-skill)")
-        elif installed:
+        elif installed and not has_legacy:
             print(f"skill {skill_dir.name}: in sync ({installed} homes)")
     return drifted
 
@@ -4880,6 +4964,7 @@ def install_skill(args: argparse.Namespace) -> int:
         skill_sources = [child for child in source.iterdir() if child.is_dir() and (child / "SKILL.md").exists()]
     if not skill_sources:
         raise YoyoError(f"No bundled skills found under: {source}")
+    bundled_dirs = list(skill_sources)
 
     # Some bundled skills only make sense when the agent that powers them is
     # actually installed.
@@ -4908,6 +4993,47 @@ def install_skill(args: argparse.Namespace) -> int:
                 shutil.rmtree(target)
             shutil.copytree(skill_source, target, dirs_exist_ok=True)
             print(f"installed skill: {target}")
+
+    # Older releases also installed into pi's own skills dir. Pi reads
+    # ~/.agents/skills natively, so those copies collide with the shared one
+    # at startup (pi warns and skips one of the two). Copies whose every file
+    # still matches the bundle byte for byte are yoyo's own artifacts and get
+    # taken back out — for every bundled skill, including ones skipped this
+    # run (a missing codex must not leave yoyo-imagegen colliding in pi
+    # forever). Anything else — a copy from an older release, a hand-edited
+    # one, user files beside an unchanged SKILL.md, a symlink — still
+    # collides, so it is moved aside intact instead of deleted; nothing in
+    # the pi home is destroyed for having the wrong bytes.
+    pi_skills = pi_agent_skills_dir()
+    if not pi_dir_aliases_install_target(pi_skills):
+        for source_dir in bundled_dirs:
+            if source_dir.name == INBUILT_SKILL_NAME:
+                continue  # inbuilt: never copied out, so a copy here was never ours
+            legacy = pi_skills / source_dir.name
+            if not os.path.lexists(str(legacy)):
+                continue
+            if not legacy.is_symlink() and is_unmodified_bundled_copy(legacy, source_dir):
+                shutil.rmtree(legacy)
+                print(f"removed legacy skill: {legacy} (pi loads ~/.agents/skills; a copy here collided)")
+                continue
+            aside_base = pi_skills.parent / f"{source_dir.name}.legacy-moved-by-yoyo"
+            aside = aside_base
+            n = 1
+            while os.path.lexists(str(aside)):
+                n += 1
+                aside = pi_skills.parent / f"{aside_base.name}-{n}"
+            was_symlink = legacy.is_symlink()
+            legacy.rename(aside)  # renames the symlink itself, never its target
+            if was_symlink:
+                print(
+                    f"moved legacy skill symlink aside: {legacy} -> {aside} "
+                    "(pi follows symlinks during discovery, so it collided here; target untouched)"
+                )
+            else:
+                print(
+                    f"moved legacy skill aside: {legacy} -> {aside} "
+                    "(pi loads ~/.agents/skills; the copy here collided; not identical to the bundle, so kept intact)"
+                )
     return 0
 
 
