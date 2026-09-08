@@ -10,7 +10,7 @@ The full flag-level reference. For the tour, see the [README](../README.md).
 | `claude` | `claude -p` | Default worker for scoped edits |
 | `pi` | `pi -p --mode text` | Lightweight and cheap |
 | `cursor` | `cursor-agent -p --output-format stream-json` | On-demand worker and model picker (`--model composer-2.5`, `cursor-grok-4.5-high`, …) |
-| `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). Supports `--read-only` via plan mode (`--mode plan`) |
+| `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). Supports `--read-only` via plan mode (`--mode plan`). yoyo forwards `--timeout` as `--print-timeout` (agy's own default is 5m) |
 | `grok` | `grok` | On-demand. A fourth independent vendor for adversarial cross-checks |
 
 `codex`, `claude`, and `pi` support `--session` follow-ups and are the battle-tested defaults. The on-demand agents are one-shot only — reach for them when a specific edge fits (a model the others don't expose, a third vendor to break a tie). On-demand agents authenticate through their own CLIs.

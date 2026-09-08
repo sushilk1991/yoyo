@@ -57,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.26.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.26.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -755,6 +755,7 @@ class YoyoTests(CliTestCase):
         # agy carries the prompt as the -p value and runs full-access by default.
         self.assertIn("agy -p", stdout)
         self.assertIn("--add-dir", stdout)
+        self.assertIn("--print-timeout", stdout)
         self.assertIn("--dangerously-skip-permissions", stdout)
         self.assertIn("mode=full-access delegation", stdout)
 
@@ -767,8 +768,40 @@ class YoyoTests(CliTestCase):
         self.assertIn("agy -p", stdout)
         self.assertIn("--add-dir", stdout)
         self.assertIn("--mode plan", stdout)
+        self.assertIn("--print-timeout", stdout)
         self.assertIn("--dangerously-skip-permissions", stdout)
         self.assertIn("mode=read-only delegation", stdout)
+
+    def test_format_go_duration_matches_parse_duration(self):
+        self.assertEqual(yoyo.format_go_duration(14400.0), "14400s")
+        self.assertEqual(yoyo.format_go_duration(1800), "1800s")
+        self.assertEqual(yoyo.format_go_duration(90.5), "90.5s")
+
+    def test_ask_agy_forwards_timeout_as_print_timeout(self):
+        # agy's print mode defaults --print-timeout to 5m. A caller who omits
+        # --timeout still gets yoyo's four-hour deadman, which must reach agy
+        # or a long review dies on agy's clock. An explicit --timeout must
+        # match, including fractional seconds (Go ParseDuration).
+        code, stdout, stderr = self.run_cli(
+            ["ask", "agy", "--dry-run", "--timeout", "1800", "Do it."],
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--print-timeout 1800s", stdout)
+
+        code, stdout, stderr = self.run_cli(
+            ["ask", "agy", "--dry-run", "--timeout", "90.5", "Do it."],
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--print-timeout 90.5s", stdout)
+
+        code, stdout, stderr = self.run_cli(
+            ["ask", "agy", "--dry-run", "Do it."],
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(
+            f"--print-timeout {yoyo.format_go_duration(yoyo.default_timeout())}",
+            stdout,
+        )
 
     def test_ask_defaults_to_full_access_for_grok(self):
         code, stdout, stderr = self.run_cli(

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.26.0"
+VERSION = "0.26.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -180,7 +180,9 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     # arrives via --prompt-file
     # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
     # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
-    # and has plan mode (--mode plan) for headless read-only review.
+    # and has plan mode (--mode plan) for headless read-only review. Its print
+    # mode defaults --print-timeout to 5m, so command_for_agent forwards
+    # yoyo's --timeout or a p90 call dies on agy's clock.
     "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "stream-json"], flavor="cursor"),
     "agy": AgentSpec("agy", ["agy"], flavor="agy", buffers_output=True),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
@@ -946,6 +948,14 @@ def build_prompt(args: argparse.Namespace) -> str:
     return prompt + "\n"
 
 
+def format_go_duration(seconds: float) -> str:
+    """Seconds as a Go duration (agy --print-timeout uses time.ParseDuration)."""
+    value = float(seconds)
+    if value.is_integer():
+        return f"{int(value)}s"
+    return f"{value}s"
+
+
 def command_for_agent(
     spec: AgentSpec,
     args: argparse.Namespace,
@@ -1017,7 +1027,14 @@ def command_for_agent(
     elif spec.flavor == "agy":
         # agy reads the prompt as the value of -p (not stdin); execute_agent_call
         # swaps the sentinel for the real prompt and feeds empty stdin instead.
+        # Print mode has its own wait clock (default 5m). Forward yoyo's
+        # --timeout so a long review is not killed by agy while yoyo's deadman
+        # is still hours away.
         cmd = [spec.command[0], "-p", AGY_PROMPT_SENTINEL, "--add-dir", cwd]
+        timeout = getattr(args, "timeout", None)
+        if timeout is None or float(timeout) <= 0:
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        cmd.extend(["--print-timeout", format_go_duration(float(timeout))])
         if args.read_only:
             cmd.extend(["--mode", "plan", "--dangerously-skip-permissions"])
         else:
