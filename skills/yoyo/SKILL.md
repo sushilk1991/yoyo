@@ -1,6 +1,6 @@
 ---
 name: yoyo
-description: Delegates work to another vendor's coding agent through the yoyo CLI — Codex, Claude, Pi, Cursor, Grok. Use for an independent second opinion, cross-vendor code review, best-of-n comparison, deep research, or a fresh-context loop over a long task.
+description: Delegates work to another vendor's coding agent through the yoyo CLI — Codex, Claude, Pi, Cursor, Antigravity (agy), Grok. Use for an independent second opinion, cross-vendor code review, best-of-n comparison, deep research, or a fresh-context loop over a long task.
 ---
 
 # Yoyo
@@ -46,8 +46,8 @@ A call your harness cut off is **unavailable**, never *passed*. When you are uns
 | `claude` | Anthropic | Default worker for scoped edits |
 | `pi` | Pi | Small, cheap, fast questions |
 | `cursor` | Cursor | A worker on a different model family (needs `cursor-agent login`) |
-| `grok` | xAI | A fourth vendor to break a tie |
-| `agy` | Google | On-demand: Gemini-family tiebreaker (supports `--read-only` via plan mode) |
+| `grok` | xAI | A fourth vendor to break a tie; `--read-only` gives it read tools only, no shell, web, or MCP |
+| `agy` | Google | Gemini-family tiebreaker; `--read-only` is its plan mode with writes and unlisted shell commands auto-denied |
 
 Each agent runs whatever model its own CLI is configured for. Check availability with `yoyo agents`, health with `yoyo doctor --live`.
 
@@ -57,7 +57,8 @@ Each agent runs whatever model its own CLI is configured for. Check availability
 
 - **Default-first quality rule.** For complex, ambiguous, multi-file, architectural, security, or release work, omit `--model` and take the target CLI's configured default. Reach for a smaller tier only on bounded tasks that have an objective check. Never trade correctness or completeness for lower cost or latency.
 - A `-fast` variant means **lower latency, not lower cost**.
-- Cursor's `--read-only` is its plan mode, not an OS sandbox. Pair any Cursor write with a focused test and read the diff yourself.
+- Cursor's and agy's `--read-only` are their plan mode, not an OS sandbox; grok's is a tool allowlist with no shell, web, or MCP. Under agy read-only any shell command it has not allowlisted itself is denied, and a denied call ends the run with no answer, which yoyo reports as exit 1 — keep read-only agy asks to reads (a review of a diff in the prompt is fine), give it full access when the job needs a shell, and treat a one-line agy answer as no answer. Pair any Cursor write with a focused test and read the diff yourself.
+- agy's own 5-minute print timeout is overridden by yoyo automatically; there is nothing to work around. Its prompt travels in argv, so a call with megabytes of `--file` context fails loudly on agy — send big context to codex, claude, or pi.
 - One `ask` fan-out shares a single `--model` across its candidates. Use separate calls when the agents need different models.
 
 ## The primitives

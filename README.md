@@ -77,8 +77,8 @@ yoyo imagegen "Hand-drawn architecture diagram, four boxes, bold arrows" --out a
 | `claude` | Anthropic | Default worker for scoped edits |
 | `pi` | Pi | Cheap, fast, small scoped tasks |
 | `cursor` | Cursor | On-demand worker on a different model family |
-| `agy` | Google | On-demand: Gemini-family tiebreaker (supports `--read-only` via plan mode) |
-| `grok` | xAI | On-demand: fourth vendor for adversarial cross-checks |
+| `agy` | Google | On-demand: Gemini-family tiebreaker; `--read-only` is its plan mode with writes auto-denied |
+| `grok` | xAI | On-demand: fourth vendor for adversarial cross-checks; `--read-only` is a read-tools-only allowlist |
 
 Custom agents are a JSON entry away. Check everything works with `yoyo doctor --live`.
 

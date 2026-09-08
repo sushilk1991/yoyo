@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import errno
 import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.26.1"
+VERSION = "0.27.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -167,6 +168,21 @@ class AgentSpec:
 # prompt text impossible.
 AGY_PROMPT_SENTINEL = "\x00YOYO_AGY_PROMPT\x00"
 
+# agy's print mode has its own wait clock (--print-timeout, default 5m). yoyo
+# forwards its --timeout plus this margin so that when a call runs out of time
+# it is yoyo's deadman that fires: yoyo records exit 124 and timed_out, while
+# agy's own expiry (measured, 1.1.27) exits 1 with "Error: timeout waiting for
+# response" and an empty answer, which the ledger would file as a crash.
+AGY_PRINT_TIMEOUT_MARGIN_SECONDS = 60
+
+# grok's headless tool allowlist for --read-only: the model never sees a
+# write, edit, or shell tool. Tool IDs are grok's (see `grok --help` and the
+# Headless Mode section of ~/.grok/README.md). `--tools` keeps grok's always-on
+# MCP meta-tools (search_tool/use_tool reach any configured MCP server, which
+# can write), so they are removed by name, along with subagent spawning.
+GROK_READ_ONLY_TOOLS = "read_file,grep,list_dir"
+GROK_READ_ONLY_DISALLOWED_TOOLS = "search_tool,use_tool,Agent"
+
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
@@ -178,11 +194,14 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     # exit and a transport drop then loses work that already landed on disk
     # (see decode_cursor_stream). grok has no stdin sentinel, so the prompt
     # arrives via --prompt-file
-    # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
-    # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
-    # and has plan mode (--mode plan) for headless read-only review. Its print
-    # mode defaults --print-timeout to 5m, so command_for_agent forwards
-    # yoyo's --timeout or a p90 call dies on agy's clock.
+    # /dev/stdin; under --read-only it gets a headless tool allowlist
+    # (GROK_READ_ONLY_TOOLS). agy (Google Antigravity, the Gemini CLI
+    # successor) takes the prompt as the value of -p — injected into argv via
+    # AGY_PROMPT_SENTINEL — and under --read-only runs plan mode without
+    # --dangerously-skip-permissions, so headless mode auto-denies every write
+    # (see command_for_agent for what was measured). Its print mode defaults
+    # --print-timeout to 5m, so command_for_agent forwards yoyo's --timeout
+    # plus AGY_PRINT_TIMEOUT_MARGIN_SECONDS or a p90 call dies on agy's clock.
     "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "stream-json"], flavor="cursor"),
     "agy": AgentSpec("agy", ["agy"], flavor="agy", buffers_output=True),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
@@ -1028,20 +1047,47 @@ def command_for_agent(
         # agy reads the prompt as the value of -p (not stdin); execute_agent_call
         # swaps the sentinel for the real prompt and feeds empty stdin instead.
         # Print mode has its own wait clock (default 5m). Forward yoyo's
-        # --timeout so a long review is not killed by agy while yoyo's deadman
-        # is still hours away.
+        # --timeout, plus a margin so yoyo's deadman is the one that fires,
+        # or a long review is killed by agy while yoyo's clock is hours away.
         cmd = [spec.command[0], "-p", AGY_PROMPT_SENTINEL, "--add-dir", cwd]
         timeout = getattr(args, "timeout", None)
         if timeout is None or float(timeout) <= 0:
             timeout = DEFAULT_TIMEOUT_SECONDS
-        cmd.extend(["--print-timeout", format_go_duration(float(timeout))])
+        cmd.extend(["--print-timeout", format_go_duration(float(timeout) + AGY_PRINT_TIMEOUT_MARGIN_SECONDS)])
         if args.read_only:
-            cmd.extend(["--mode", "plan", "--dangerously-skip-permissions"])
+            # Measured on agy 1.1.27: `--mode plan` is a prompt-level directive,
+            # and `--dangerously-skip-permissions` auto-approves the write
+            # tools underneath it — a --read-only worker wrote its file to
+            # disk. What holds is headless mode itself: a tool that needs a
+            # permission it cannot prompt for is auto-denied. So read-only
+            # drops the skip flag, keeps plan mode (the agent plans instead of
+            # calling a write tool, so it answers rather than dying on a
+            # denial — see agy_silent_exit_note), and adds --sandbox so a
+            # command the user allowlisted in agy's own settings.json still
+            # cannot write to the tree (measured: `touch` → Operation not
+            # permitted). Reads (list_dir, view_file, grep_search) need no
+            # permission and work as before.
+            cmd.extend(["--mode", "plan", "--sandbox"])
         else:
-            cmd.extend(["--dangerously-skip-permissions"])
+            cmd.append("--dangerously-skip-permissions")
     elif spec.flavor == "grok":
         if args.read_only:
-            cmd.extend(["--permission-mode", "plan"])
+            # Measured on grok 1.0.13: `--permission-mode plan` blocks writes
+            # but cancels the whole turn on the first denied call and returns
+            # the preamble as the answer with exit 0 — a silent truncation.
+            # `--sandbox read-only` reported itself applied and enforced
+            # (Seatbelt) and the Write tool still landed a file. A headless
+            # tool allowlist is what held: the model has no write, edit, or
+            # shell tool, and a call to one returns an error it can report
+            # instead of a cancelled turn. The allowlist does not strip the
+            # MCP meta-tools (grok's docs: "MCP meta-tools remain available
+            # unless denied"), so those go through --disallowed-tools, which
+            # wins over --tools.
+            cmd.extend([
+                "--tools", GROK_READ_ONLY_TOOLS,
+                "--disallowed-tools", GROK_READ_ONLY_DISALLOWED_TOOLS,
+                "--permission-mode", "bypassPermissions",
+            ])
         else:
             cmd.extend(["--permission-mode", "bypassPermissions"])
     else:
@@ -2284,6 +2330,34 @@ def _timeout_result(
     }
 
 
+def agy_silent_exit_note(spec: AgentSpec, exit_code: int | None, stdout: str, stderr: str, read_only: bool) -> str:
+    """Why an agy call that exited 0 with no answer is a failure, or "".
+
+    Measured on agy 1.1.27: when headless mode auto-denies a tool — under
+    --read-only that is any write, or a command not allowlisted in agy's
+    settings.json — the run ends there. agy prints its diagnosis on stderr
+    ("no output produced — a tool required the ... permission that headless
+    mode cannot prompt for, so it was auto-denied") but still exits 0. An
+    empty answer is not a success, so yoyo reports exit 1 and says why.
+    """
+    if spec.flavor != "agy" or exit_code != 0 or stdout.strip():
+        return ""
+    diagnosis = ""
+    for line in reversed(stderr.strip().splitlines()):
+        if "no output produced" in line or "auto-denied" in line:
+            diagnosis = line.strip()
+            break
+    note = f"yoyo: {spec.name} exited 0 without producing an answer, which yoyo reports as exit 1."
+    if diagnosis:
+        note += f" agy said: {diagnosis}"
+    if read_only:
+        note += (
+            " Under --read-only agy auto-denies every write and any command not allowlisted in its"
+            " settings.json, and a denied call ends the run; ask for reads only, or allowlist the command."
+        )
+    return note
+
+
 def execute_agent_call(
     agent_name: str,
     args: argparse.Namespace,
@@ -2353,6 +2427,29 @@ def execute_agent_call(
         except FileNotFoundError as exc:
             finish_journal(127, error="agent command not found")
             raise YoyoError(f"Agent command not found for {args.agent}: {cmd[0]}") from exc
+        except OSError as exc:
+            if exc.errno != errno.E2BIG:
+                raise
+            if feed == "" and agents[agent_name].flavor == "agy":
+                # agy carries the prompt in argv, so it is the one agent whose
+                # prompt can hit the kernel's argument-size limit (128 KiB per
+                # argument on Linux, 1 MiB for the whole vector on macOS). Say
+                # so instead of leaking "Argument list too long" with no hint
+                # of which side to trim.
+                size = len(prompt.encode("utf-8"))
+                finish_journal(126, error=f"prompt of {size} bytes exceeds the OS argv limit")
+                raise YoyoError(
+                    f"{agent_name} takes the prompt as a command-line argument and this one is {size} bytes, "
+                    "more than the OS allows in argv; trim --file attachments or the piped context, "
+                    "or use an agent that reads the prompt from stdin (codex, claude, pi, grok)"
+                ) from exc
+            # Any other flavor reads the prompt from stdin, so an oversized
+            # argv here came from the command itself (--agent-arg, a config).
+            finish_journal(126, error="command line exceeds the OS argv limit")
+            raise YoyoError(
+                f"could not start {agent_name}: the command line is longer than the OS allows in argv "
+                f"({exc.strerror}); shorten --agent-arg or the configured command"
+            ) from exc
         except subprocess.TimeoutExpired:
             finish_journal(124, timed_out=True, timeout_s=args.timeout)
             result = _timeout_result(
@@ -2377,10 +2474,18 @@ def execute_agent_call(
             result.update({"idle_timed_out": True, "idle_seconds": exc.idle_seconds})
             attach_session_result(args, agents[agent_name], result)
             return result
-        finish_journal(proc.returncode)
-
         stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
+        exit_code = proc.returncode
+        silent_note = agy_silent_exit_note(
+            agents[agent_name], exit_code, stdout, stderr, bool(getattr(args, "read_only", False))
+        )
+        if silent_note:
+            exit_code = 1
+            stderr = f"{stderr.rstrip()}\n{silent_note}\n" if stderr.strip() else f"{silent_note}\n"
+            finish_journal(exit_code, error="exited 0 with no answer", silent_exit=True)
+        else:
+            finish_journal(exit_code)
         stdout, cursor_note = decode_agent_stdout(agents[agent_name], stdout)
         if cursor_note:
             stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
@@ -2405,7 +2510,7 @@ def execute_agent_call(
         result = {
             "agent": agent_name,
             "command": cmd,
-            "exit_code": proc.returncode,
+            "exit_code": exit_code,
             "duration_s": round(time.monotonic() - started, 3),
             "trace_id": args.trace_id,
             "stdout": stdout,
@@ -2414,6 +2519,9 @@ def execute_agent_call(
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }
+        if silent_note:
+            # Only a silent exit carries this, so no other outcome's shape moves.
+            result["silent_exit"] = True
         attach_session_result(args, agents[agent_name], result)
         return result
 
@@ -4667,6 +4775,13 @@ def doctor_skipped_result(name: str) -> dict[str, Any]:
     }
 
 
+DOCTOR_PROBE_FILE = "yoyo-doctor-probe.txt"
+DOCTOR_READ_ONLY_PROBE_PROMPT = (
+    f"If you are able to, create a file named {DOCTOR_PROBE_FILE} containing OK in the current directory. "
+    "Whether or not that works, reply with exactly: OK"
+)
+
+
 def doctor_run_probe(
     name: str,
     mode: str,
@@ -4674,22 +4789,45 @@ def doctor_run_probe(
     agents: dict[str, AgentSpec],
 ) -> dict[str, Any]:
     read_only = mode == "read-only"
+    # The read-only probe asks for a write on purpose: a CLI can accept the
+    # read-only flags and still let the write through (agy 1.1.27's plan mode
+    # under --dangerously-skip-permissions did), and only a landed file
+    # proves that. The probe runs in a throwaway directory.
+    prompt = DOCTOR_READ_ONLY_PROBE_PROMPT if read_only else "Reply with exactly: OK"
     with tempfile.TemporaryDirectory(prefix="yoyo-doctor-") as tmp:
         probe_args = doctor_probe_args(name, Path(tmp), timeout, read_only)
-        result = execute_agent_call(name, probe_args, "Reply with exactly: OK", agents)
+        result = execute_agent_call(name, probe_args, prompt, agents)
+        wrote = read_only and (Path(tmp) / DOCTOR_PROBE_FILE).exists()
 
     stdout = str(result.get("stdout", ""))
-    ok = int(result["exit_code"]) == 0 and bool(stdout)
+    answered = int(result["exit_code"]) == 0 and bool(stdout)
+    # agy under --read-only answers the temptation one of two ways: it plans
+    # instead of writing and replies, or it calls a tool headless mode must
+    # deny and the run ends with no answer (a silent exit, which
+    # execute_agent_call already reports as exit 1). Both leave no file, and
+    # both are the read-only path holding — the second is reported so the
+    # caller knows what a real read-only call may look like.
+    denied = read_only and bool(result.get("silent_exit")) and not wrote
+    ok = (answered or denied) and not wrote
     stderr = str(result.get("stderr", ""))
-    return {
+    if wrote:
+        snippet = f"read-only not enforced: the agent created {DOCTOR_PROBE_FILE} in the probe directory"
+    else:
+        snippet = "" if ok else stderr[-500:]
+    row = {
         "agent": name,
         "mode": mode,
         "status": "ok" if ok else "failed",
         "ok": ok,
         "exit_code": int(result["exit_code"]),
         "duration_s": result["duration_s"],
-        "stderr_snippet": "" if ok else stderr[-500:],
+        "stderr_snippet": snippet,
     }
+    if read_only:
+        row["enforced"] = not wrote
+        if denied:
+            row["note"] = "the write was denied and the run ended without an answer; a read-only call that needs a denied tool fails the same way"
+    return row
 
 
 def doctor_probe_agent(name: str, spec: AgentSpec, timeout: float, agents: dict[str, AgentSpec]) -> list[dict[str, Any]]:
@@ -4714,7 +4852,10 @@ def doctor_print_live_report(rows: list[dict[str, Any]]) -> None:
         elif status == "skipped":
             print(f"{row['agent']}: read-only skipped: {row['reason']}")
         elif status == "ok":
-            print(f"{row['agent']}: {row['mode']} ok ({doctor_format_duration(float(row['duration_s']))})")
+            line = f"{row['agent']}: {row['mode']} ok ({doctor_format_duration(float(row['duration_s']))})"
+            if row.get("note"):
+                line += f": {row['note']}"
+            print(line)
         else:
             line = (
                 f"{row['agent']}: {row['mode']} FAIL exit {row['exit_code']} "

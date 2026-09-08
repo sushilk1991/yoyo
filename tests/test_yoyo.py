@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import importlib.machinery
+import errno
 import io
 import json
 import os
@@ -57,7 +58,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.26.1")
+        self.assertEqual(stdout.strip(), "yoyo 0.27.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -757,6 +758,8 @@ class YoyoTests(CliTestCase):
         self.assertIn("--add-dir", stdout)
         self.assertIn("--print-timeout", stdout)
         self.assertIn("--dangerously-skip-permissions", stdout)
+        self.assertNotIn("--mode plan", stdout)
+        self.assertNotIn("--sandbox", stdout)
         self.assertIn("mode=full-access delegation", stdout)
 
     def test_ask_read_only_constrains_agy(self):
@@ -768,8 +771,12 @@ class YoyoTests(CliTestCase):
         self.assertIn("agy -p", stdout)
         self.assertIn("--add-dir", stdout)
         self.assertIn("--mode plan", stdout)
+        self.assertIn("--sandbox", stdout)
         self.assertIn("--print-timeout", stdout)
-        self.assertIn("--dangerously-skip-permissions", stdout)
+        # Measured on agy 1.1.27: with --dangerously-skip-permissions, plan
+        # mode still let write_to_file land a file. Headless auto-denial is
+        # the enforcement, and it only exists while the skip flag is absent.
+        self.assertNotIn("--dangerously-skip-permissions", stdout)
         self.assertIn("mode=read-only delegation", stdout)
 
     def test_format_go_duration_matches_parse_duration(self):
@@ -780,28 +787,128 @@ class YoyoTests(CliTestCase):
     def test_ask_agy_forwards_timeout_as_print_timeout(self):
         # agy's print mode defaults --print-timeout to 5m. A caller who omits
         # --timeout still gets yoyo's four-hour deadman, which must reach agy
-        # or a long review dies on agy's clock. An explicit --timeout must
-        # match, including fractional seconds (Go ParseDuration).
+        # or a long review dies on agy's clock. The forwarded value sits a
+        # margin above yoyo's own clock so that yoyo's deadman fires first
+        # and the ledger records a timeout (exit 124), not agy's own expiry
+        # (exit 1, "timeout waiting for response", empty answer). Fractional
+        # seconds must survive (Go ParseDuration).
+        margin = yoyo.AGY_PRINT_TIMEOUT_MARGIN_SECONDS
+        self.assertGreater(margin, 0)
+
         code, stdout, stderr = self.run_cli(
             ["ask", "agy", "--dry-run", "--timeout", "1800", "Do it."],
         )
         self.assertEqual(code, 0, stderr)
-        self.assertIn("--print-timeout 1800s", stdout)
+        self.assertIn(f"--print-timeout {yoyo.format_go_duration(1800 + margin)}", stdout)
 
         code, stdout, stderr = self.run_cli(
             ["ask", "agy", "--dry-run", "--timeout", "90.5", "Do it."],
         )
         self.assertEqual(code, 0, stderr)
-        self.assertIn("--print-timeout 90.5s", stdout)
+        self.assertIn(f"--print-timeout {yoyo.format_go_duration(90.5 + margin)}", stdout)
 
         code, stdout, stderr = self.run_cli(
             ["ask", "agy", "--dry-run", "Do it."],
         )
         self.assertEqual(code, 0, stderr)
         self.assertIn(
-            f"--print-timeout {yoyo.format_go_duration(yoyo.default_timeout())}",
+            f"--print-timeout {yoyo.format_go_duration(yoyo.default_timeout() + margin)}",
             stdout,
         )
+
+    def _fake_agy_config(self, tmp, body, name="fakeagy"):
+        """An agy-flavored agent backed by a shell script.
+
+        The agy branch of command_for_agent keeps only command[0] and rebuilds
+        the rest of argv itself, so the fake has to be a single executable.
+        """
+        script = Path(tmp) / f"{name}.sh"
+        script.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        script.chmod(0o755)
+        config = Path(tmp) / "agents.json"
+        config.write_text(json.dumps({"agents": {name: {"command": [str(script)], "kind": "agy"}}}), encoding="utf-8")
+        return config
+
+    def test_ask_agy_exit_zero_with_no_answer_is_a_failure(self):
+        # Measured on agy 1.1.27: a headless auto-denial ends the run with
+        # exit 0, an empty stdout, and a diagnosis on stderr. An empty answer
+        # is not a success; yoyo must say so instead of printing nothing.
+        diagnosis = (
+            'jetski: no output produced — a tool required the "command" permission that '
+            "headless mode cannot prompt for, so it was auto-denied."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._fake_agy_config(tmp, f"printf '%s\\n' {shlex.quote(diagnosis)} >&2\nexit 0\n")
+            code, stdout, stderr = self.run_cli(
+                ["ask", "fakeagy", "--read-only", "--cwd", tmp, "--json", "Review it."],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 1, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertEqual(payload["stdout"], "")
+        self.assertIn("exited 0 without producing an answer", payload["stderr"])
+        self.assertIn("auto-denied", payload["stderr"])
+        self.assertIn("allowlist", payload["stderr"])
+
+    def test_ask_agy_real_answer_with_exit_zero_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # $2 is the prompt: the fake receives `-p <prompt> --add-dir ...`.
+            config = self._fake_agy_config(tmp, 'printf \'\\nanswer to: %s\\n\' "$2"\n')
+            code, stdout, stderr = self.run_cli(
+                ["ask", "fakeagy", "--raw", "--cwd", tmp, "--json", "Say hi."],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertIn("answer to: Say hi.", payload["stdout"])
+        self.assertNotIn("without producing an answer", payload["stderr"])
+
+    def test_ask_agy_prompt_over_argv_limit_fails_loudly(self):
+        # agy is the one agent that carries the prompt in argv, so it is the
+        # one that can hit the kernel's argument-size limit (1 MiB total on
+        # macOS, 128 KiB per argument on Linux). The failure must name the
+        # cause, not leak "Argument list too long".
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.txt"
+            big.write_text("x" * 1_200_000, encoding="utf-8")
+            config = self._fake_agy_config(tmp, "echo OK\n")
+            # The input cap must sit above the file, or the prompt is clipped
+            # before it can exceed ARG_MAX and the fake simply answers.
+            code, stdout, stderr = self.run_cli(
+                [
+                    "ask", "fakeagy", "--raw", "--cwd", tmp, "--max-input-bytes", "5000000",
+                    "--file", str(big), "Review it.",
+                ],
+                env={"YOYO_CONFIG": str(config), "YOYO_MAX_INPUT_BYTES": None},
+            )
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("command-line argument", stderr)
+        self.assertIn("argv", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_argv_limit_on_a_stdin_agent_is_not_blamed_on_the_prompt(self):
+        # Every other flavor reads the prompt from stdin, so an E2BIG there
+        # came from the command line itself (--agent-arg, a config), and the
+        # message must not tell the caller to shrink the prompt.
+        def raise_e2big(*args, **kwargs):
+            raise OSError(errno.E2BIG, "Argument list too long")
+
+        with mock.patch.object(yoyo, "run_to_files", raise_e2big):
+            code, stdout, stderr = self.run_cli(
+                ["ask", "echo", "--raw", "Do it."],
+                env={"YOYO_AGENT_ECHO": "cat"},
+            )
+
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("could not start echo", stderr)
+        self.assertIn("--agent-arg", stderr)
+        self.assertNotIn("command-line argument", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_ask_defaults_to_full_access_for_grok(self):
         code, stdout, stderr = self.run_cli(
@@ -818,8 +925,38 @@ class YoyoTests(CliTestCase):
         )
 
         self.assertEqual(code, 0, stderr)
-        self.assertIn("grok --prompt-file /dev/stdin --output-format plain --permission-mode plan", stdout)
+        # Measured on grok 1.0.13: plan mode blocks writes but cancels the
+        # turn on the first denied call (truncated answer, exit 0), and
+        # --sandbox read-only let the Write tool land a file. The headless
+        # tool allowlist is the mechanism that held.
+        self.assertIn(
+            "grok --prompt-file /dev/stdin --output-format plain "
+            f"--tools {yoyo.GROK_READ_ONLY_TOOLS} "
+            f"--disallowed-tools {yoyo.GROK_READ_ONLY_DISALLOWED_TOOLS} "
+            "--permission-mode bypassPermissions",
+            stdout,
+        )
+        self.assertNotIn("--permission-mode plan", stdout)
+        self.assertNotIn("--sandbox", stdout)
         self.assertIn("mode=read-only delegation", stdout)
+
+    def test_ask_full_access_grok_keeps_its_tools(self):
+        code, stdout, stderr = self.run_cli(["ask", "grok", "--dry-run", "Do it."])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("--tools", stdout)
+        self.assertNotIn("--disallowed-tools", stdout)
+
+    def test_grok_read_only_allowlist_has_no_write_shell_or_mcp_tool(self):
+        tools = set(yoyo.GROK_READ_ONLY_TOOLS.split(","))
+        self.assertEqual(tools, {"read_file", "grep", "list_dir"})
+        for forbidden in ("search_replace", "run_terminal_cmd", "web_fetch", "web_search", "task"):
+            self.assertNotIn(forbidden, tools)
+        # `--tools` leaves grok's MCP meta-tools in place (its docs: "MCP
+        # meta-tools remain available unless denied"); a configured MCP server
+        # can write, so they must be removed by name, with subagent spawning.
+        disallowed = set(yoyo.GROK_READ_ONLY_DISALLOWED_TOOLS.split(","))
+        self.assertEqual(disallowed, {"search_tool", "use_tool", "Agent"})
 
     def test_on_demand_agents_pass_model_flag(self):
         for agent, model in (("cursor", "composer-2.5"), ("agy", "gemini-3.1-pro"), ("grok", "grok-4")):
@@ -1146,7 +1283,7 @@ class YoyoTests(CliTestCase):
                     "python3",
                     "-c",
                     "import sys; data = sys.stdin.read(); "
-                    "print('OK') if data == 'Reply with exactly: OK' else sys.exit(9)",
+                    "print('OK') if data.lower().endswith('reply with exactly: ok') else sys.exit(9)",
                 ],
                 read_only_args=["--safe"],
             )
@@ -1159,6 +1296,108 @@ class YoyoTests(CliTestCase):
         self.assertEqual(stderr, "")
         self.assertIn("probe: read-only ok", stdout)
         self.assertIn("probe: full-access ok", stdout)
+
+    def test_doctor_live_read_only_probe_asks_for_a_write_and_checks_disk(self):
+        # A CLI can accept its read-only flags and still let a write through
+        # (agy 1.1.27 did under --dangerously-skip-permissions); only a landed
+        # file proves the mode. The probe asks for one and looks.
+        self.assertIn(yoyo.DOCTOR_PROBE_FILE, yoyo.DOCTOR_READ_ONLY_PROBE_PROMPT)
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = Path(tmp) / "prompts.txt"
+            config = self._doctor_agent_config(
+                tmp,
+                "leaky",
+                [
+                    "python3",
+                    "-c",
+                    "import os, sys; data = sys.stdin.read(); "
+                    f"open({str(seen)!r}, 'a').write(data + '\\n---\\n'); "
+                    "open('yoyo-doctor-probe.txt', 'w').write('OK') if '--safe' in sys.argv else None; "
+                    "print('OK')",
+                ],
+                read_only_args=["--safe"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "leaky", "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+            prompts = seen.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("yoyo-doctor-probe.txt", prompts)
+        self.assertIn("Reply with exactly: OK", prompts)
+        rows = {row["mode"]: row for row in json.loads(stdout)}
+        self.assertFalse(rows["read-only"]["ok"])
+        self.assertEqual(rows["read-only"]["status"], "failed")
+        self.assertEqual(rows["read-only"]["exit_code"], 0)
+        self.assertFalse(rows["read-only"]["enforced"])
+        self.assertIn("read-only not enforced", rows["read-only"]["stderr_snippet"])
+        self.assertTrue(rows["full-access"]["ok"])
+        self.assertNotIn("enforced", rows["full-access"])
+
+    def test_doctor_live_passes_a_denied_write_that_ended_the_run(self):
+        # agy under --read-only may answer the temptation by calling a tool
+        # headless mode must deny; the run then ends with exit 0 and no
+        # answer. No file landed, so the read-only path held — doctor says
+        # ok, and says what happened, because a real call can end that way.
+        diagnosis = (
+            'jetski: no output produced — a tool required the "write_file" permission that '
+            "headless mode cannot prompt for, so it was auto-denied."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            body = (
+                "case \"$*\" in *--sandbox*) printf '%s\\n' " + shlex.quote(diagnosis) + " >&2; exit 0;; esac\n"
+                "echo OK\n"
+            )
+            config = self._fake_agy_config(tmp, body)
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "fakeagy", "--json"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        rows = {row["mode"]: row for row in json.loads(stdout)}
+        self.assertTrue(rows["read-only"]["ok"])
+        self.assertEqual(rows["read-only"]["status"], "ok")
+        self.assertEqual(rows["read-only"]["exit_code"], 1)
+        self.assertTrue(rows["read-only"]["enforced"])
+        self.assertIn("denied", rows["read-only"]["note"])
+        self.assertTrue(rows["full-access"]["ok"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._fake_agy_config(tmp, body)
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "fakeagy", "--strict"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("fakeagy: read-only ok", stdout)
+        self.assertIn("denied", stdout)
+
+    def test_doctor_live_strict_fails_on_an_unenforced_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._doctor_agent_config(
+                tmp,
+                "leaky",
+                [
+                    "python3",
+                    "-c",
+                    "import sys; sys.stdin.read(); "
+                    "open('yoyo-doctor-probe.txt', 'w').write('OK') if '--safe' in sys.argv else None; "
+                    "print('OK')",
+                ],
+                read_only_args=["--safe"],
+            )
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "leaky", "--strict"],
+                env={"YOYO_CONFIG": str(config)},
+            )
+
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("leaky: read-only FAIL exit 0", stdout)
+        self.assertIn("read-only not enforced", stdout)
+        self.assertIn("leaky: full-access ok", stdout)
 
     def test_doctor_live_strict_exits_one_when_probe_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3958,6 +4197,9 @@ class SkillGuardTests(CliTestCase):
         "quality is never traded for efficiency": "Never trade correctness or completeness",
         "fast variants are not called cost-efficient": "lower latency, not lower cost",
         "cursor read-only is plan mode, not a sandbox": "plan mode, not an OS sandbox",
+        "agy read-only dies on a denied tool, and yoyo says so": "a denied call ends the run with no answer",
+        "grok read-only is a tool allowlist without a shell": "tool allowlist with no shell",
+        "agy prompts travel in argv": "prompt travels in argv",
         "delegated output is confirmed only after the caller confirms it": "only after you confirmed it",
         "irreversible work needs the human to ask": "only when the human asked",
         "loop DONE is self-declared and needs a diff read": "Read the diff before you believe it",
