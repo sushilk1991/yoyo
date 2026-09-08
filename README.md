@@ -30,7 +30,7 @@ yoyo doesn't grade or constrain agent output — you (or your agent) stay the or
 git clone https://github.com/sushilk1991/yoyo.git && cd yoyo && ./install.sh
 ```
 
-Installs `~/.local/bin/yoyo` plus skills that teach Claude Code, Codex, Pi, and OpenCode how to use it. Requires Python 3.9+ and at least one supported agent CLI (`codex`, `claude`, `pi`, `cursor-agent`, `agy`, or `grok`) on PATH. Update later with `yoyo update`, which reinstalls the CLI and re-syncs those skills into every agent home; `yoyo doctor` reports any copy that drifted from the bundle or was left behind by a rename.
+Installs `~/.local/bin/yoyo` plus skills that teach Claude Code, Codex, Pi, OpenCode, Antigravity (AGY), and Grok how to use it. Requires Python 3.9+ and at least one supported agent CLI (`codex`, `claude`, `pi`, `cursor-agent`, `agy`, or `grok`) on PATH. Update later with `yoyo update`, which reinstalls the CLI and re-syncs those skills into every agent home; `yoyo doctor` reports any copy that drifted from the bundle or was left behind by a rename.
 
 ## Run it in the background
 
@@ -77,7 +77,7 @@ yoyo imagegen "Hand-drawn architecture diagram, four boxes, bold arrows" --out a
 | `claude` | Anthropic | Default worker for scoped edits |
 | `pi` | Pi | Cheap, fast, small scoped tasks |
 | `cursor` | Cursor | On-demand worker on a different model family |
-| `agy` | Google | On-demand: Gemini-family tiebreaker (full-access only) |
+| `agy` | Google | On-demand: Gemini-family tiebreaker (supports `--read-only` via plan mode) |
 | `grok` | xAI | On-demand: fourth vendor for adversarial cross-checks |
 
 Custom agents are a JSON entry away. Check everything works with `yoyo doctor --live`.

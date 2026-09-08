@@ -10,7 +10,7 @@ The full flag-level reference. For the tour, see the [README](../README.md).
 | `claude` | `claude -p` | Default worker for scoped edits |
 | `pi` | `pi -p --mode text` | Lightweight and cheap |
 | `cursor` | `cursor-agent -p --output-format stream-json` | On-demand worker and model picker (`--model composer-2.5`, `cursor-grok-4.5-high`, …) |
-| `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). **Full-access only** — no read-only mode |
+| `agy` | `agy` | On-demand. Google Antigravity (Gemini CLI successor). Supports `--read-only` via plan mode (`--mode plan`) |
 | `grok` | `grok` | On-demand. A fourth independent vendor for adversarial cross-checks |
 
 `codex`, `claude`, and `pi` support `--session` follow-ups and are the battle-tested defaults. The on-demand agents are one-shot only — reach for them when a specific edge fits (a model the others don't expose, a third vendor to break a tie). On-demand agents authenticate through their own CLIs.
@@ -43,7 +43,7 @@ yoyo ask pi --role worker --cwd "$PWD" "Fix the failing test. Don't touch unrela
 git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff against the worktree."
 ```
 
-**Fan-out (best-of-n).** A comma-separated agent list runs the same prompt on every agent in parallel. Add `--judge <agent>` to have an independent judge compare the answers on correctness/evidence/completeness and recommend the best (or a merge). The default judge verdict leads with a **convergence/divergence map**: what the answers independently agree on, then every genuine conflict with the narrowest check that would settle it — divergence is the caller's verification work list, and cross-vendor agreement is treated as signal, not proof. `--judge-prompt "..."` replaces the judging instructions (used verbatim; the task and candidate answers are appended). Without `--judge`, you get all answers in tagged sections and judge them yourself. The judge always runs **read-only** — its prompt embeds untrusted candidate output — so the judge agent must support a read-only mode (not `agy`). Exit is 0 if at least one agent succeeded and a failed judge falls back to the raw answers; scripted callers should use `--json` and inspect per-result `exit_code`s. Repeating an agent (`codex,codex`) is allowed — that's a self-consistency sample. Prefer a judge that isn't among the candidates: models measurably favor their own answers.
+**Fan-out (best-of-n).** A comma-separated agent list runs the same prompt on every agent in parallel. Add `--judge <agent>` to have an independent judge compare the answers on correctness/evidence/completeness and recommend the best (or a merge). The default judge verdict leads with a **convergence/divergence map**: what the answers independently agree on, then every genuine conflict with the narrowest check that would settle it — divergence is the caller's verification work list, and cross-vendor agreement is treated as signal, not proof. `--judge-prompt "..."` replaces the judging instructions (used verbatim; the task and candidate answers are appended). Without `--judge`, you get all answers in tagged sections and judge them yourself. The judge always runs **read-only** — its prompt embeds untrusted candidate output — so the judge agent must support a read-only mode. Exit is 0 if at least one agent succeeded and a failed judge falls back to the raw answers; scripted callers should use `--json` and inspect per-result `exit_code`s. Repeating an agent (`codex,codex`) is allowed — that's a self-consistency sample. Prefer a judge that isn't among the candidates: models measurably favor their own answers.
 
 ```bash
 yoyo ask codex,claude --cwd "$PWD" "Design the rate limiter. Name the riskiest assumption." --judge grok
@@ -86,7 +86,7 @@ Research defaults to **full-access** so agents can use web search, fetch, and co
 
 ```bash
 yoyo review --cwd "$PWD"                         # codex + claude in parallel
-yoyo review --agents codex,claude,grok --json    # three vendors (review needs read-only, so not agy)
+yoyo review --agents codex,claude,agy --json     # three vendors with independent architectures
 yoyo review --base main --pr                     # review committed work, post as a PR comment via gh
 yoyo review --stance unanimous                   # precision: only findings ALL reviewers raised
 yoyo review --stance any                         # recall: every distinct finding, tagged with reviewer count

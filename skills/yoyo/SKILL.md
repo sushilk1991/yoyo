@@ -47,7 +47,7 @@ A call your harness cut off is **unavailable**, never *passed*. When you are uns
 | `pi` | Pi | Small, cheap, fast questions |
 | `cursor` | Cursor | A worker on a different model family (needs `cursor-agent login`) |
 | `grok` | xAI | A fourth vendor to break a tie |
-| `agy` | Google | Full-access only — it cannot take `--read-only`, so never as a reviewer |
+| `agy` | Google | On-demand: Gemini-family tiebreaker (supports `--read-only` via plan mode) |
 
 Each agent runs whatever model its own CLI is configured for. Check availability with `yoyo agents`, health with `yoyo doctor --live`.
 

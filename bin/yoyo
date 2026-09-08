@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.25.1"
+VERSION = "0.26.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -180,9 +180,9 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     # arrives via --prompt-file
     # /dev/stdin; agy (Google Antigravity, the Gemini CLI successor) takes the
     # prompt as the value of -p — injected into argv via AGY_PROMPT_SENTINEL —
-    # and has no headless read-only mode.
+    # and has plan mode (--mode plan) for headless read-only review.
     "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "stream-json"], flavor="cursor"),
-    "agy": AgentSpec("agy", ["agy"], flavor="agy"),
+    "agy": AgentSpec("agy", ["agy"], flavor="agy", buffers_output=True),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
 }
 
@@ -779,6 +779,8 @@ def skill_search_roots() -> list[Path]:
             Path("~/.codex/skills").expanduser(),
             Path("~/.agents/skills").expanduser(),
             Path("~/.config/opencode/skills").expanduser(),
+            Path("~/.gemini/config/skills").expanduser(),
+            Path("~/.grok/skills").expanduser(),
             Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
         ]
     )
@@ -1013,15 +1015,13 @@ def command_for_agent(
         else:
             cmd.append("--force")
     elif spec.flavor == "agy":
-        if args.read_only:
-            raise YoyoError(
-                "agy has no headless read-only mode (its --sandbox only restricts the terminal, "
-                "not file writes), so --read-only cannot be enforced; use codex, claude, or pi "
-                "for read-only review"
-            )
         # agy reads the prompt as the value of -p (not stdin); execute_agent_call
         # swaps the sentinel for the real prompt and feeds empty stdin instead.
-        cmd = [spec.command[0], "-p", AGY_PROMPT_SENTINEL, "--add-dir", cwd, "--dangerously-skip-permissions"]
+        cmd = [spec.command[0], "-p", AGY_PROMPT_SENTINEL, "--add-dir", cwd]
+        if args.read_only:
+            cmd.extend(["--mode", "plan", "--dangerously-skip-permissions"])
+        else:
+            cmd.extend(["--dangerously-skip-permissions"])
     elif spec.flavor == "grok":
         if args.read_only:
             cmd.extend(["--permission-mode", "plan"])
@@ -4219,9 +4219,8 @@ def cmd_research(args: argparse.Namespace) -> int:
     ]
 
     # Fail loudly before spending tokens if any agent that will actually run
-    # cannot build its command (e.g. agy under --read-only has no headless
-    # read-only mode). Probe only the scheduled researcher agents, plus the
-    # synthesizer when synthesis will actually run — probing an unscheduled
+    # cannot build its command. Probe only the scheduled researcher agents,
+    # plus the synthesizer when synthesis will actually run — probing an unscheduled
     # pool agent would reject an otherwise-valid reduced-lens run.
     probe_targets = {name for _, _, _, _, name in jobs}
     if len(jobs) >= 2 and not args.no_synthesis:
@@ -4601,9 +4600,7 @@ def doctor_agent_names(agents: dict[str, AgentSpec], requested: list[str] | None
 
 
 def doctor_supports_read_only(spec: AgentSpec) -> bool:
-    # agy is intentionally absent: it has no headless read-only mode, so its
-    # read-only probe is skipped and reported as unsupported.
-    return spec.flavor in ("codex", "claude", "pi", "cursor", "grok") or bool(spec.read_only_args)
+    return spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok") or bool(spec.read_only_args)
 
 
 def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) -> argparse.Namespace:
@@ -4837,6 +4834,8 @@ def skill_target_roots() -> list[Path]:
         Path("~/.claude/skills").expanduser(),
         Path("~/.agents/skills").expanduser(),
         Path("~/.config/opencode/skills").expanduser(),
+        Path("~/.gemini/config/skills").expanduser(),
+        Path("~/.grok/skills").expanduser(),
     ]
 
 

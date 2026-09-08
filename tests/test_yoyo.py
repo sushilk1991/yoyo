@@ -57,7 +57,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.25.1")
+        self.assertEqual(stdout.strip(), "yoyo 0.26.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -758,14 +758,17 @@ class YoyoTests(CliTestCase):
         self.assertIn("--dangerously-skip-permissions", stdout)
         self.assertIn("mode=full-access delegation", stdout)
 
-    def test_ask_read_only_rejects_agy(self):
+    def test_ask_read_only_constrains_agy(self):
         code, stdout, stderr = self.run_cli(
             ["ask", "agy", "--dry-run", "--read-only", "Review it."],
         )
 
-        # agy has no headless read-only mode, so --read-only must fail loudly.
-        self.assertEqual(code, 2)
-        self.assertIn("no headless read-only mode", stderr)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("agy -p", stdout)
+        self.assertIn("--add-dir", stdout)
+        self.assertIn("--mode plan", stdout)
+        self.assertIn("--dangerously-skip-permissions", stdout)
+        self.assertIn("mode=read-only delegation", stdout)
 
     def test_ask_defaults_to_full_access_for_grok(self):
         code, stdout, stderr = self.run_cli(
@@ -1210,7 +1213,7 @@ class YoyoTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("yoyo", stdout)
             self.assertIn("yoyo-workflow", stdout)
-            for root in (".codex", ".claude", ".agents", ".config/opencode"):
+            for root in (".codex", ".claude", ".agents", ".config/opencode", ".gemini/config", ".grok"):
                 self.assertTrue((home / root / "skills" / "yoyo" / "SKILL.md").exists(), root)
                 self.assertTrue((home / root / "skills" / "yoyo-workflow" / "SKILL.md").exists(), root)
             # Pi's own skills dir is not an install target: pi reads
@@ -4407,6 +4410,7 @@ class BufferedAgentGuardTests(CliTestCase):
         agents = yoyo.DEFAULT_AGENTS
         self.assertTrue(agents["claude"].buffers_output)
         self.assertTrue(agents["pi"].buffers_output)
+        self.assertTrue(agents["agy"].buffers_output)
         self.assertFalse(agents["codex"].buffers_output)
         self.assertFalse(agents["grok"].buffers_output)
         self.assertFalse(agents["cursor"].buffers_output)
