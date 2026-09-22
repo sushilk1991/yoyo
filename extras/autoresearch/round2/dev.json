@@ -1,0 +1,915 @@
+{
+  "description": "Round one holdout is now development data; do not claim it remains held out",
+  "cases": [
+    {
+      "kind": "repeat",
+      "id": "retry_timeout",
+      "expected": "repeated",
+      "state": {
+        "previous": "Increased HTTP timeout from 10s to 20s. Test still fails with wrong response body.",
+        "latest": "Increased HTTP timeout to 40s. Same response mismatch. No new logs or inspection."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "rename_status",
+      "expected": "repeated",
+      "state": {
+        "previous": "Retried the same build command; missing SDK error remains.",
+        "latest": "Updated status to working on SDK issue, then retried the unchanged command. Same missing SDK error."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "same_patch",
+      "expected": "repeated",
+      "state": {
+        "previous": "Changed nil fallback to empty string. Regression test still reports incorrect empty-state rendering.",
+        "latest": "Reapplied the empty-string fallback. The same regression remains."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "same_test",
+      "expected": "repeated",
+      "state": {
+        "previous": "Ran auth.spec.ts; tenant isolation assertion fails. No code edits.",
+        "latest": "Ran auth.spec.ts again unchanged; same tenant isolation failure. No new evidence."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "repro_found",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Could not reproduce intermittent cancellation crash.",
+        "latest": "Added a deterministic scheduling probe; captured the double callback with a stack trace."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "hypothesis_rejected",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Suspected stale cache caused wrong tenant result.",
+        "latest": "Disabled cache in a controlled reproduction. Failure persists, ruling out that hypothesis."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "fixed_test",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Parser fails CRLF regression.",
+        "latest": "Fixed delimiter handling; CRLF and LF regression tests now pass."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "new_fix_same_error",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Changed request timeout; response mismatch remains.",
+        "latest": "Inspected serialization and corrected the enum mapping. Same assertion still fails, but the attempted fix differs."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "no_history",
+      "expected": "unclear",
+      "state": {
+        "previous": "",
+        "latest": "Still working."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "repeat",
+      "id": "vague_updates",
+      "expected": "unclear",
+      "state": {
+        "previous": "Making progress on the bug.",
+        "latest": "Continuing investigation."
+      },
+      "question": "What changed between the previous attempt and the latest attempt?",
+      "criteria": {
+        "repeated": "The same unsuccessful approach was repeated without new diagnostic evidence.",
+        "new_evidence": "The latest attempt adds a different approach, a useful diagnostic result, or verified progress.",
+        "unclear": "There is not enough information to compare the two attempts."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "auth_expired",
+      "expected": "account",
+      "state": "Provider returned: Your sign-in session expired. Authenticate again before making another request.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "quota",
+      "expected": "account",
+      "state": "Provider rejected the request: usage allowance exhausted for this account. No model run started.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "provider_permission",
+      "expected": "account",
+      "state": "This account is not permitted to use the selected model. Choose an available model or contact the account administrator.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "sdk_missing",
+      "expected": "environment",
+      "state": "xcodebuild could not locate the requested iOS SDK. No source compilation began.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "network",
+      "expected": "environment",
+      "state": "Request failed during DNS resolution: could not resolve provider.example. No HTTP response was received.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "binary_missing",
+      "expected": "environment",
+      "state": "Unable to start compiler: executable swiftc was not found on PATH.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "test_assertion",
+      "expected": "implementation",
+      "state": "parser.spec.ts: expected two CSV rows, received one. Reproduced on LF input after the parser change.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "compiler_type",
+      "expected": "implementation",
+      "state": "Sources/Auth.swift:42: cannot convert value of type String to expected argument type UUID.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "opaque_exit",
+      "expected": "unclear",
+      "state": "Worker exited with code 1. No stdout or stderr was captured.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "failure",
+      "id": "success_not_failure",
+      "expected": "unclear",
+      "state": "All requested checks passed. No blocker was reported.",
+      "question": "What kind of blocker is directly supported by this failure evidence?",
+      "criteria": {
+        "account": "Authentication, account access, provider quota, or permission to use the service.",
+        "environment": "Missing tools, unavailable services, networking, or local runtime configuration.",
+        "implementation": "A failing test, compiler error, or reproduced defect in the code being changed.",
+        "unclear": "The evidence does not establish the blocker type."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "same_nil",
+      "expected": "same",
+      "state": {
+        "first": "src/user.ts:42 dereferences user.name before checking whether user is null. Anonymous requests crash.",
+        "second": "src/user.ts:42 anonymous users trigger a null dereference at user.name; move the null guard before access."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "same_retry",
+      "expected": "same",
+      "state": {
+        "first": "payments/retry.py:81 retries after timeout can charge twice because no idempotency key is persisted.",
+        "second": "payments/retry.py:81 a retry can create a second charge; the idempotency token is not stored between attempts."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "same_shutdown",
+      "expected": "same",
+      "state": {
+        "first": "worker.go:120 shutdown returns before its goroutine flushes pending writes.",
+        "second": "worker.go:120 pending data is lost on exit because shutdown does not wait for the writer goroutine."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "same_sort",
+      "expected": "same",
+      "state": {
+        "first": "table.ts:19 sorts dates lexicographically instead of using timestamps.",
+        "second": "table.ts:19 string comparison gives incorrect chronological order for dates."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "different_files",
+      "expected": "different",
+      "state": {
+        "first": "src/profile.ts:42 user.name is accessed before a null guard.",
+        "second": "src/invoice.ts:42 customer.name is accessed before a null guard."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "different_cause",
+      "expected": "different",
+      "state": {
+        "first": "api.ts:50 logs the raw authorization token, exposing a secret.",
+        "second": "api.ts:50 retries POST requests without idempotency, creating duplicate records."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "contradiction",
+      "expected": "different",
+      "state": {
+        "first": "cache.ts:22 retains entries after expiry and must evict them earlier.",
+        "second": "cache.ts:22 evicts entries before their TTL expires and must retain them longer."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "different_range",
+      "expected": "different",
+      "state": {
+        "first": "auth.ts:10 missing authentication allows anonymous access.",
+        "second": "auth.ts:80 missing tenant filtering exposes other organizations records."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "vague",
+      "expected": "unclear",
+      "state": {
+        "first": "There is a cache problem.",
+        "second": "Caching looks wrong."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "kind": "duplicate",
+      "id": "no_location",
+      "expected": "unclear",
+      "state": {
+        "first": "A resource leaks on one error path.",
+        "second": "One error path leaks a resource."
+      },
+      "question": "Do these two review findings describe the same defect at the same code location?",
+      "criteria": {
+        "same": "They identify the same underlying defect and affected location, possibly using different wording.",
+        "different": "They identify different defects or different affected locations, or directly contradict each other.",
+        "unclear": "There is not enough location or causal information to decide."
+      }
+    },
+    {
+      "id": "r01",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Deleted build cache and ran the failing linker test. Undefined symbol remains.",
+        "latest": "Cleaned the same cache again and reran that test. Undefined symbol remains; no new evidence."
+      }
+    },
+    {
+      "id": "r02",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Added a sleep before saving. The lost update still occurs.",
+        "latest": "Changed the sleep from one second to two seconds. Same lost update; no inspection or new measurements."
+      }
+    },
+    {
+      "id": "r03",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Asked the provider to retry the request. The same 403 policy denial returned.",
+        "latest": "Retried the same request under the same account. Still 403 policy denial, with no changed permissions."
+      }
+    },
+    {
+      "id": "r04",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Reinstalled dependencies from the unchanged lockfile. The compiler still rejects the same type.",
+        "latest": "Reinstalled from that lockfile once more. The exact compiler diagnostic is unchanged. No code inspection."
+      }
+    },
+    {
+      "id": "r05",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Regenerated the snapshot without investigating the unexpected extra row. Test still fails.",
+        "latest": "Again regenerated the same snapshot to match the extra row; no cause investigated and the test still fails."
+      }
+    },
+    {
+      "id": "r06",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Disabled and re-enabled the same feature flag. Crash remains.",
+        "latest": "Toggled the same flag again. Same crash, no other change or diagnostic."
+      }
+    },
+    {
+      "id": "r07",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Raised max connection count. Deadlock test still hangs.",
+        "latest": "Raised max connection count again. Same hang, no lock trace or different approach."
+      }
+    },
+    {
+      "id": "r08",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "The import randomly skips records; no reproducible input yet.",
+        "latest": "Reduced the input to two records sharing a quoted newline. This now reproduces every run and identifies the parser branch."
+      }
+    },
+    {
+      "id": "r09",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Suspected a database lock; the request times out.",
+        "latest": "Captured a thread dump showing every stalled thread waiting on the same mutex in Cache.get."
+      }
+    },
+    {
+      "id": "r10",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "A UI click loses selection, cause unknown.",
+        "latest": "Recorded event order and proved focus loss occurs before the click handler. The bug remains."
+      }
+    },
+    {
+      "id": "r11",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Changed the index; query still slow.",
+        "latest": "Ran EXPLAIN ANALYZE and found a sort spill; reverted the unsupported index hypothesis."
+      }
+    },
+    {
+      "id": "r12",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "The schema validation rejects valid data. No fix.",
+        "latest": "Replaced integer-only validation with decimal validation, and the existing failing case plus boundary tests pass."
+      }
+    },
+    {
+      "id": "r13",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Only reran the crashing program with the old input.",
+        "latest": "Created a smaller input that crashes in the same way and captured its allocation trace."
+      }
+    },
+    {
+      "id": "r14",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Increased the retry interval; upload still fails.",
+        "latest": "Changed the checksum encoding after comparing request bytes to the documented format. Upload still fails, but this is a different approach."
+      }
+    },
+    {
+      "id": "r15",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Work is proceeding.",
+        "latest": "Another investigation step is in progress."
+      }
+    },
+    {
+      "id": "r16",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "",
+        "latest": "I have a possible answer."
+      }
+    },
+    {
+      "id": "r17",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Still attempting recovery.",
+        "latest": "Made improvements, with no details supplied."
+      }
+    },
+    {
+      "id": "r18",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Previous work log unavailable.",
+        "latest": "Ran a test but its result was not recorded."
+      }
+    },
+    {
+      "id": "r19",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "The last attempt is omitted from this excerpt.",
+        "latest": "Updated one file. No path, change description, or outcome provided."
+      }
+    },
+    {
+      "id": "r20",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Investigating.",
+        "latest": "Investigating."
+      }
+    },
+    {
+      "id": "f01",
+      "kind": "failure",
+      "expected": "account",
+      "state": "The CLI refused the operation: organization policy does not allow this model for your subscription."
+    },
+    {
+      "id": "f02",
+      "kind": "failure",
+      "expected": "account",
+      "state": "Provider HTTP 429: monthly account token allowance exhausted; resets tomorrow."
+    },
+    {
+      "id": "f03",
+      "kind": "failure",
+      "expected": "account",
+      "state": "Provider rejects the supplied API token as revoked. No request reached the coding model."
+    },
+    {
+      "id": "f04",
+      "kind": "failure",
+      "expected": "account",
+      "state": "Access denied by the provider: this workspace is not entitled to use the requested service."
+    },
+    {
+      "id": "f05",
+      "kind": "failure",
+      "expected": "account",
+      "state": "Sign-in required: credentials were removed from the local credential store. Run the CLI login command."
+    },
+    {
+      "id": "f06",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "Build cannot start because the configured compiler path /opt/tools/clang does not exist."
+    },
+    {
+      "id": "f07",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "Dependency download fails before compilation: TLS certificate issuer is not trusted by this machine."
+    },
+    {
+      "id": "f08",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "The integration database could not start: Docker daemon socket is unavailable."
+    },
+    {
+      "id": "f09",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "Cannot create the build output: the filesystem is full. No test or compiler diagnostic is available."
+    },
+    {
+      "id": "f10",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "The local browser runner cannot launch because the browser executable has not been installed."
+    },
+    {
+      "id": "f11",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "Regression test: expected an expired cache item to be removed, but get(key) returned the expired value."
+    },
+    {
+      "id": "f12",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "Compiler: exhaustive switch is missing case .cancelled in JobState handling, src/job.swift:81."
+    },
+    {
+      "id": "f13",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "The new image parser crashes on a valid empty chunk. Stack trace identifies an out-of-bounds access in parse_chunk."
+    },
+    {
+      "id": "f14",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "The reproduced bug sends two notifications for one event; the focused unit test asserts one and received two."
+    },
+    {
+      "id": "f15",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "Compiler reports unknown identifier requestId in the newly edited handler. The project otherwise compiled before this change."
+    },
+    {
+      "id": "f16",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "The task stopped. Exit status was 9, with no captured output."
+    },
+    {
+      "id": "f17",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "HTTP 403. The log does not identify the server, request, account, or response body."
+    },
+    {
+      "id": "f18",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "Every command completed successfully and all tests passed. No failure evidence was supplied."
+    },
+    {
+      "id": "f19",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "A screenshot was mentioned, but its contents and the error message are unavailable."
+    },
+    {
+      "id": "f20",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "It did not work. That is the entire report."
+    },
+    {
+      "id": "d01",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "cache.go:27 retains expired entries because expiration is compared with < instead of <=; an entry at the boundary survives.",
+        "second": "cache.go:27 expiry equal to now must remove the entry, but the strict comparison keeps it alive."
+      }
+    },
+    {
+      "id": "d02",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "app.swift:109 updates view state from a detached task off the main actor.",
+        "second": "app.swift:109 the detached callback mutates UI state without hopping back to the main actor."
+      }
+    },
+    {
+      "id": "d03",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "query.sql:14 omits tenant_id from the filter and returns another tenant records.",
+        "second": "query.sql:14 tenant scoping is missing from this SELECT, allowing cross-tenant reads."
+      }
+    },
+    {
+      "id": "d04",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "worker.py:72 acknowledges the job before persisting the result, so a crash loses the result permanently.",
+        "second": "worker.py:72 a crash between ack and save drops this job because the queue already considers it handled."
+      }
+    },
+    {
+      "id": "d05",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "download.rs:63 renames the temporary file before fsync, so success does not guarantee durable contents.",
+        "second": "download.rs:63 return success only after syncing data; the current rename can expose data lost on power failure."
+      }
+    },
+    {
+      "id": "d06",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "picker.ts:18 reuses array indices as keys, causing selection to attach to another item after reordering.",
+        "second": "picker.ts:18 index keys mismatch item identity on sort, and the selected row changes unexpectedly."
+      }
+    },
+    {
+      "id": "d07",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "stats.py:35 computes a mean by dividing by the number of batches instead of the number of samples.",
+        "second": "stats.py:35 batches have unequal sizes, but equal weighting biases the reported per-sample average."
+      }
+    },
+    {
+      "id": "d08",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "cache.go:27 removes entries too early because milliseconds are interpreted as seconds.",
+        "second": "cache.go:27 the eviction loop skips the final entry, leaving one expired item behind."
+      }
+    },
+    {
+      "id": "d09",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "src/android/store.kt:88 fails to clear an observer on shutdown.",
+        "second": "src/ios/store.swift:88 fails to clear an observer on shutdown."
+      }
+    },
+    {
+      "id": "d10",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "config.py:10 remove the new limit: it rejects supported large inputs.",
+        "second": "config.py:10 keep the limit and make it smaller: oversized inputs must be rejected earlier."
+      }
+    },
+    {
+      "id": "d11",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "login.ts:44 accepts unsigned session cookies.",
+        "second": "login.ts:44 prints the full session cookie to the debug log."
+      }
+    },
+    {
+      "id": "d12",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "render.py:12 the legend uses the wrong color for failed jobs.",
+        "second": "render.py:120 the chart drops failed jobs from its input dataset."
+      }
+    },
+    {
+      "id": "d13",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "writer.cpp:54 may free the buffer twice on cancellation.",
+        "second": "writer.cpp:54 never frees the buffer on cancellation and leaks memory."
+      }
+    },
+    {
+      "id": "d14",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "routes.ts:30 retries requests after a permanent validation error.",
+        "second": "routes.ts:30 stops retrying temporary network failures after the first attempt."
+      }
+    },
+    {
+      "id": "d15",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "A callback may be lost.",
+        "second": "One asynchronous completion appears to go missing."
+      }
+    },
+    {
+      "id": "d16",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "Something around main.py:7 is wrong.",
+        "second": "There is an issue at main.py:7, but no cause or behavior was described."
+      }
+    },
+    {
+      "id": "d17",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "Parser accepts bad input; location omitted.",
+        "second": "Validation seems too lenient; location omitted."
+      }
+    },
+    {
+      "id": "d18",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "",
+        "second": "runner.js:60 leaves a child process alive."
+      }
+    },
+    {
+      "id": "d19",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "ui.swift:12 has an issue.",
+        "second": "ui.swift:12 has a different issue; neither issue is explained."
+      }
+    },
+    {
+      "id": "d20",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "The operation could fail sometimes.",
+        "second": "Occasional failures were reported with no trace or location."
+      }
+    }
+  ]
+}

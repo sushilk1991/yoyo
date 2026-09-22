@@ -1,0 +1,25 @@
+{
+  "checks": [
+    {
+      "id": "retry_timeout",
+      "kind": "repeat",
+      "state": {
+        "previous": "Increased HTTP timeout from 10s to 20s. Test still fails with wrong response body.",
+        "latest": "Increased HTTP timeout to 40s. Same response mismatch. No new logs or inspection."
+      }
+    },
+    {
+      "id": "auth_expired",
+      "kind": "failure",
+      "state": "Provider returned: Your sign-in session expired. Authenticate again before making another request."
+    },
+    {
+      "id": "same_nil",
+      "kind": "duplicate",
+      "state": {
+        "first": "src/user.ts:42 dereferences user.name before checking whether user is null. Anonymous requests crash.",
+        "second": "src/user.ts:42 anonymous users trigger a null dereference at user.name; move the null guard before access."
+      }
+    }
+  ]
+}

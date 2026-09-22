@@ -47,6 +47,31 @@ What `--read-only` is on each, measured on agy 1.1.27 and grok 1.0.13 rather tha
 
 agy takes the prompt as the value of `-p`, that is in argv, so a prompt above the kernel's argument limit (1 MiB for the whole vector on macOS, 128 KiB per argument on Linux) fails before the call starts; yoyo reports the size and the fix (trim `--file` context, or use an agent that reads stdin). agy's print mode also has a clock of its own, `--print-timeout` (default 5m); yoyo forwards its `--timeout` plus a 60s margin so that when a call does run out of time it is yoyo's deadman that fires and the ledger records a timeout, instead of agy's `Error: timeout waiting for response` being filed as a crash. Both agents are one-shot under `yoyo ask` (`--session` is rejected). agy discovers skills in `~/.gemini/config/skills` and grok in `~/.grok/skills` (plus `~/.claude/skills`); `yoyo install-skill` writes both.
 
+## Models
+
+```bash
+yoyo models codex --cwd "$PWD" --json
+yoyo models claude --cwd "$PWD" --json
+```
+
+Reads the native CLI's account metadata and selectable model list, without sending a user turn. Codex uses its app-server `account/read` and paginated `model/list`; Claude uses the SDK initialization handshake and `auth status`. No API keys, email addresses, or organization identifiers appear in Yoyo's output. Probes close their processes and have a 20-second deadline (`--timeout` changes it); nothing stays resident.
+
+JSON contains `agent`, `source`, `checked_at`, `account`, and `models`. Each model includes its selectable `model` ID, name, native description, picker-default marker, and supported reasoning efforts when supplied. Claude also reports the resolved model ID. The picker-default marker is not a readback of your configured model. Account type distinguishes ChatGPT/Claude login from API-key access; remaining quota and extra-usage billing are not checked. Model availability can change after discovery.
+
+Discovery supports unmodified built-in Codex and Claude commands. If an agent is overridden in `agents.json` or `YOYO_AGENT_*`, it fails rather than dropping profile/wrapper arguments and querying a different account. Use that custom CLI directly. Other providers retain their own discovery commands.
+
+The calling agent selects a returned model with the existing `--model` flag. The bundled skill prefers an available subscription tier for bounded, objectively checkable tasks and keeps the configured default for complex work. There is no background router, hard-coded model allowlist, or automatic provider fallback. Existing explicit model choices still pass through unchanged.
+
+Protocol references, checked September 22, 2026: [Codex app server](https://learn.chatgpt.com/docs/app-server), [Claude model configuration](https://code.claude.com/docs/en/model-config), and [Claude SDK initialization](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).
+
+## Local advice
+
+`yoyo advise --file evidence.json` returns JSON suggestions for suspected repeated attempts, failure categories, and possible duplicate review findings. It accepts focused evidence from any CLI; it does not select a coding model or change delegation behavior. The optional Apple Silicon backend uses Decider 0.8B with 4-bit MLX weights. [Setup, schema, examples, and benchmark limits](../extras/README.md).
+
+Advice is an explicit, bounded call: at most 32 checks, 64 KiB of input, and 1,024 tokens per check. One child loads the model and exits afterward; concurrent calls return busy. `--timeout` accepts up to 30 seconds. Missing dependencies, invalid input, and inference failures return exit 2. Successful requests return exit 0 even if every check abstains; this is never a coding-task completion signal.
+
+The `choice` field is advisory; raw `candidate` and `scores` are not acceptance evidence. Low scores abstain, and repetition checks can only suggest `repeated` or `unclear`. Neither a model score nor a duplicate suggestion can stop a loop, mark DONE, discard findings, or override the caller's verification. Existing `ask`, `loop`, and `review` commands do not invoke this helper automatically.
+
 ## Ask
 
 `yoyo ask` is one-shot and full-access by default (so agent-to-agent calls don't stall on permission prompts). `--role` defaults to `opinion`; pass `review` or `worker` for those behaviors. Use `--read-only` for a bounded reviewer or untrusted input.
@@ -119,13 +144,25 @@ yoyo loop claude --cwd "$PWD" --max-iter 30 --background "Fix the failing tests,
 yoyo loop codex,claude --cwd "$PWD" "Refactor module by module."   # rotate vendors across iterations
 ```
 
-A comma-separated agent list rotates vendors iteration by iteration: each fresh context gets a different model's eyes on the same state file, so one vendor's blind spots don't compound. The loop ends on the first of: a `STOP` file beside the state file, an accepted `STATUS: DONE`, `--max-iter` (default 20), or `--max-fail` consecutive crashed iterations (default 3, the only exit-1 ending). `--skill`, `--read-only`, `--idle-timeout`, `--model`, and byte caps pass through; `--background` detaches the whole loop.
+A comma-separated agent list rotates vendors iteration by iteration. The loop ends on a `STOP` file beside the state file, accepted `STATUS: DONE`, `--max-iter` (default 20), or `--max-fail` consecutive crashed iterations (default 3). Crashes reaching `--max-fail` exit 1. `--skill`, `--read-only`, `--idle-timeout`, `--model`, and byte caps pass through; `--background` detaches the whole loop.
 
 `--spec PATH` pins a standing spec: re-read every iteration, never rewritten, holding the constraints the lossy state rewrite would otherwise drop.
 
 State-file guards: a `.task` sidecar makes reusing a state file recorded for a different task fail loudly; a leftover `STOP` file is cleared at startup; a `.lock` (flock) rejects a second concurrent loop.
 
 `STATUS: DONE` is whatever the worker writes. Read the diff before acting on it.
+
+### Completion checks and stalls
+
+```bash
+yoyo loop claude --cwd "$PWD" --model sonnet --verify 'python3 -m unittest discover -s tests' --max-stall 3 --background "Finish the scoped fix."
+```
+
+Choose the model from the current catalog first. `--verify COMMAND` runs `/bin/sh -c COMMAND` in `--cwd` only after a DONE claim and a satisfied queue. It uses the caller's permissions and the per-iteration `--timeout`; it is not confined by the worker's `--read-only` flag. Choose a repeatable acceptance check. A nonzero exit or timeout rejects DONE and puts bounded output into the state file. The next worker sees the failure. Logged DONE text cannot become a completion marker. After `--max-fail` failed completion checks, the loop stops with exit 1. With verification enabled, any ending other than verified DONE exits 1, including an exhausted iteration budget. JSON adds the last `verification` result and `verification_rejections` count.
+
+`--max-stall N` stops with `end_reason: state-unchanged` and exit 1 when N consecutive iterations leave both state and queue byte-for-byte unchanged. Worker changes reset the counter; Yoyo's feedback does not count. Missing, unreadable, or truncated continuity files cannot establish a stall. This reads only those files, does not scan the worktree, and does not judge semantic progress. It is off by default. Both flags survive `--background`; `--dry-run` executes neither the worker nor the check.
+
+Use failure evidence to choose the next action. Repeated code failures can justify a stronger subscribed model with the same state and task; login, quota, and environment failures need their own fix. No model is automatically promoted, and a passing command proves only what that command checks.
 
 ### Work queue (`--queue FILE`)
 

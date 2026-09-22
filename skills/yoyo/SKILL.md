@@ -53,13 +53,33 @@ Each agent runs whatever model its own CLI is configured for. Check availability
 
 **Pick a different vendor than the one that wrote the code.** A model is a soft judge of its own output, and Cursor running Grok is not independent of native Grok — for best-of-n they are one sample, not two.
 
-`--model` forwards to any agent, but the model IDs drift by account and CLI version, so ask the target CLI (`cursor-agent --list-models`) rather than trusting a remembered name. Four things a lookup will not tell you:
+`--model` forwards to any agent. Discover current choices with `yoyo models codex --json`, `yoyo models claude --json`, or `cursor-agent --list-models`. Use the same working directory as the task. These constraints still apply:
 
 - **Default-first quality rule.** For complex, ambiguous, multi-file, architectural, security, or release work, omit `--model` and take the target CLI's configured default. Reach for a smaller tier only on bounded tasks that have an objective check. Never trade correctness or completeness for lower cost or latency.
 - A `-fast` variant means **lower latency, not lower cost**.
 - Cursor's and agy's `--read-only` are their plan mode, not an OS sandbox; grok's is a tool allowlist with no shell, web, or MCP. Under agy read-only any shell command it has not allowlisted itself is denied, and a denied call ends the run with no answer, which yoyo reports as exit 1 — keep read-only agy asks to reads (a review of a diff in the prompt is fine), give it full access when the job needs a shell, and treat a one-line agy answer as no answer. Pair any Cursor write with a focused test and read the diff yourself.
 - agy's own 5-minute print timeout is overridden by yoyo automatically; there is nothing to work around. Its prompt travels in argv, so a call with megabytes of `--file` context fails loudly on agy — send big context to codex, claude, or pi.
 - One `ask` fan-out shares a single `--model` across its candidates. Use separate calls when the agents need different models.
+
+## Choose a subscribed model
+
+You already know the task and its context. Make the selection yourself; do not launch another model just to route it.
+
+1. Honor the user's agent/model choice. Otherwise prefer their existing subscription. Read `yoyo models <agent> --json` once per provider in this task, then reuse the result. Refresh after a login/configuration change or a model-access error. Codex reports `account.type: chatgpt`; Claude reports `claude.ai` with `provider: firstParty` for its native subscription login. An API-key login is a different billing path. Discovery does not check remaining quota or extra-usage billing.
+2. Match the work to a model in that returned list. Bounded extraction, a small documented edit, or a test with a known expected result can use an inexpensive tier such as Codex Luna. Ordinary implementation with clear scope and focused tests can use Terra or Claude Sonnet. These are examples, not an allowlist: use the native descriptions and returned IDs, never a remembered ID absent from the catalog.
+3. For uncertain requirements, security, releases, architectural changes, or broad debugging, retain the CLI's configured default unless the user chose another model. A short prompt is not evidence of a simple task. If discovery fails, keep the configured default and report that model availability was not checked.
+4. Execute with the existing `--model` flag and verify the requested outcome. A process exit of zero is not an acceptance test. On a repeated verified failure, carry the failure evidence and existing state to a stronger available model; do not restart exploration or repeat the same prompt. Auth, quota, and missing-tool failures require fixing access, not a stronger model.
+5. Keep one worker active for sequential work. Do not silently switch provider, start parallel candidates, add an API bill, or load a local model to save time. Cross-vendor review remains useful when independent judgment is the task.
+
+Model discovery exchanges CLI metadata only, closes its child processes, and never sends a user turn. The CLI has no automatic model router: the calling agent makes the contextual choice and the command records the selected model.
+
+## Optional local advice
+
+For users who installed the optional local backend, use `yoyo advise --file evidence.json` when comparing suspected repeated unsuccessful approaches, classifying unfamiliar failure evidence, or checking overlapping review findings. Batch focused checks into one call; do not run it for every prompt or obvious errors. The model loads only for that batch. If unavailable, busy, or timed out, continue the existing workflow.
+
+The input is `{"checks":[{"id":"unique-id","kind":"repeat|failure|duplicate","state":...}]}`. A repeat state has `previous` and `latest` strings containing approaches and observed results. A failure state is the error text. A duplicate state has `first` and `second` strings containing original findings with file/line and cause. Compare plausible pairs, retain both finding IDs and original review text, and treat `same` only as a suggested grouping. Limit input to 32 checks and 64 KiB; the helper abstains above 1,024 tokens per check.
+
+Use only the filtered `choice` as a suggestion, never the raw `candidate` as a decision. Scores are not verified certainty. Inspect the evidence before changing an approach, repairing access, or grouping findings. Repetition advice cannot certify progress. No advice can authorize completion, stop a loop, erase evidence, change retry budgets, or override an explicit model choice. Full setup and examples are in `extras/README.md` in the recorded Yoyo checkout.
 
 ## The primitives
 
@@ -130,6 +150,10 @@ Three files shape a good loop, and each earns its place:
 - `--spec FILE` — immutable constraints re-read every iteration, so the lossy state rewrite cannot drift the goal.
 
 DONE is what the worker says it is. Read the diff before you believe it.
+
+For work with an executable acceptance criterion, add `--verify 'COMMAND'`. Yoyo runs it in `--cwd` after DONE and after the queue passes. A failed check removes DONE and writes bounded failure evidence into the state file for the next iteration. `--max-fail` also bounds failed completion checks; with `--verify`, only verified completion exits zero. The check uses the caller's permissions and `--timeout`, so choose a focused test that is safe to repeat.
+
+Use `--max-stall 3` to stop after three iterations leave both state and queue unchanged. It is off by default and reads only those files. This detects missing continuity updates, not semantic progress: rewording the state can evade it, and research without a state update can trigger it. On `state-unchanged` or repeated failed checks, inspect the state and captured evidence before escalating or changing the approach.
 
 ## Verify, then trust
 

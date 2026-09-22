@@ -1,0 +1,365 @@
+{
+  "description": "45 new authored cases frozen before round-two selection",
+  "cases": [
+    {
+      "id": "round2-r01",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Changed a failing test to retry three times. It still reproduces the same defect.",
+        "latest": "Made that test retry five times instead. Same defect; no new investigation or evidence."
+      }
+    },
+    {
+      "id": "round2-r02",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Restarted the worker without changing its configuration. Queue stops again on the same item.",
+        "latest": "Restarted the unchanged worker again. Same item stalls it; no diagnostic captured."
+      }
+    },
+    {
+      "id": "round2-r03",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Formatted the manifest hoping to fix a missing dependency. Package resolution still fails.",
+        "latest": "Reformatted that same manifest again. Dependency content and failure are unchanged."
+      }
+    },
+    {
+      "id": "round2-r04",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Increased an upload size cap. Checksum validation still rejects the uploaded bytes.",
+        "latest": "Raised the same cap further; checksum error is identical. Nothing else was tested."
+      }
+    },
+    {
+      "id": "round2-r05",
+      "kind": "repeat",
+      "expected": "repeated",
+      "state": {
+        "previous": "Rebuilt the container using the same image and config. Connection refused persists.",
+        "latest": "Rebuilt the identical image again. Same connection refusal with no new logs."
+      }
+    },
+    {
+      "id": "round2-r06",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Race occurs sporadically; no ordering information was available.",
+        "latest": "Added sequence counters and captured cancellation overtaking completion. The race is still unfixed."
+      }
+    },
+    {
+      "id": "round2-r07",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Assumed the locale caused wrong amounts.",
+        "latest": "Tested identical inputs under two locales and got identical wrong amounts, ruling out that hypothesis."
+      }
+    },
+    {
+      "id": "round2-r08",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "The plugin crashes at startup, and only a generic exit code was known.",
+        "latest": "Obtained a symbolicated backtrace pointing to PluginRegistry.register. No patch yet."
+      }
+    },
+    {
+      "id": "round2-r09",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "A malformed filename breaks import.",
+        "latest": "Added normalization and reproduced the original failing input successfully; negative cases still reject unsupported paths."
+      }
+    },
+    {
+      "id": "round2-r10",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "state": {
+        "previous": "Changed the scheduler priority; requests still arrive out of order.",
+        "latest": "Replaced the callback queue with a sequence-number check. This different patch still has one failing order test."
+      }
+    },
+    {
+      "id": "round2-r11",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "The investigation has reached another stage.",
+        "latest": "More progress was made, but no action, observation or artifact is provided."
+      }
+    },
+    {
+      "id": "round2-r12",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Trying a fix.",
+        "latest": "Trying a fix."
+      }
+    },
+    {
+      "id": "round2-r13",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Earlier attempt details were not saved.",
+        "latest": "I changed the approach, but details and results are omitted."
+      }
+    },
+    {
+      "id": "round2-r14",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "Only a task title is available for the previous iteration.",
+        "latest": "Only a task title is available for the latest iteration."
+      }
+    },
+    {
+      "id": "round2-r15",
+      "kind": "repeat",
+      "expected": "unclear",
+      "state": {
+        "previous": "The previous code change and test output are unavailable.",
+        "latest": "The new code change and test output are also unavailable."
+      }
+    },
+    {
+      "id": "round2-f01",
+      "kind": "failure",
+      "expected": "account",
+      "state": "Your provider organization suspended access to the coding service. Contact the organization administrator."
+    },
+    {
+      "id": "round2-f02",
+      "kind": "failure",
+      "expected": "account",
+      "state": "The provider reports that the OAuth grant is invalid because the user revoked it. Sign in again."
+    },
+    {
+      "id": "round2-f03",
+      "kind": "failure",
+      "expected": "account",
+      "state": "The account hit its paid-plan request allowance. This provider will reject new requests until the reset time."
+    },
+    {
+      "id": "round2-f04",
+      "kind": "failure",
+      "expected": "account",
+      "state": "This model is available only to a different subscription tier. The logged-in account is not entitled to use it."
+    },
+    {
+      "id": "round2-f05",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "Build prerequisite failed: the Java runtime is absent from this machine."
+    },
+    {
+      "id": "round2-f06",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "The test service cannot bind its configured port because another local process already occupies it."
+    },
+    {
+      "id": "round2-f07",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "Dependency checkout failed: the machine has no network route to the Git host."
+    },
+    {
+      "id": "round2-f08",
+      "kind": "failure",
+      "expected": "environment",
+      "state": "The local database process is stopped, so the integration test cannot open a connection."
+    },
+    {
+      "id": "round2-f09",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "The compiler rejects the new call because it passes a String where the function requires an integer."
+    },
+    {
+      "id": "round2-f10",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "Focused regression reproduces a double charge in the changed payment handler; expected one ledger entry, received two."
+    },
+    {
+      "id": "round2-f11",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "The changed serializer drops the time-zone offset; a deterministic round-trip unit test fails."
+    },
+    {
+      "id": "round2-f12",
+      "kind": "failure",
+      "expected": "implementation",
+      "state": "The new allocator path dereferences an already freed buffer. Sanitizer report names the edited function and reproducing input."
+    },
+    {
+      "id": "round2-f13",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "Job failed, but no error, command, test output, or provider response was saved."
+    },
+    {
+      "id": "round2-f14",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "No failing behavior was observed: the command exited zero and verification passed."
+    },
+    {
+      "id": "round2-f15",
+      "kind": "failure",
+      "expected": "unclear",
+      "state": "The only captured line is: Something unexpected happened."
+    },
+    {
+      "id": "round2-d01",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "repo.py:31 commits the row before validating its foreign key, leaving invalid persisted data on rejection.",
+        "second": "repo.py:31 failed foreign-key validation happens after the commit, so rejected input is already stored."
+      }
+    },
+    {
+      "id": "round2-d02",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "socket.rs:88 drops the socket handle before draining pending writes, losing the final message.",
+        "second": "socket.rs:88 closing before the write queue finishes discards the last queued message."
+      }
+    },
+    {
+      "id": "round2-d03",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "search.ts:61 lets a stale response replace results for a newer query because it lacks a request-generation check.",
+        "second": "search.ts:61 earlier slow requests overwrite newer results; ignore responses whose generation is no longer current."
+      }
+    },
+    {
+      "id": "round2-d04",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "quota.go:22 decrements the remaining budget twice for each accepted call.",
+        "second": "quota.go:22 a request consumes two budget units because both branches decrement the counter."
+      }
+    },
+    {
+      "id": "round2-d05",
+      "kind": "duplicate",
+      "expected": "same",
+      "state": {
+        "first": "export.swift:54 retains the temporary export URL without deleting the file after cancellation.",
+        "second": "export.swift:54 cancelled exports leave their temporary file on disk because cleanup never runs."
+      }
+    },
+    {
+      "id": "round2-d06",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "repo.py:31 performs an unbounded table scan for each save.",
+        "second": "repo.py:31 inserts input using unescaped SQL string interpolation."
+      }
+    },
+    {
+      "id": "round2-d07",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "client_a.py:15 ignores cancellation while uploading.",
+        "second": "client_b.py:15 ignores cancellation while uploading."
+      }
+    },
+    {
+      "id": "round2-d08",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "date.ts:9 should sort timestamps ascending; the current descending sort is wrong.",
+        "second": "date.ts:9 should sort timestamps descending; the current ascending sort is wrong."
+      }
+    },
+    {
+      "id": "round2-d09",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "user.sql:8 omits the tenant filter.",
+        "second": "user.sql:80 omits the tenant filter in a different independent query."
+      }
+    },
+    {
+      "id": "round2-d10",
+      "kind": "duplicate",
+      "expected": "different",
+      "state": {
+        "first": "pool.cpp:42 must acquire the mutex before checking readiness.",
+        "second": "pool.cpp:42 must release the mutex before checking readiness."
+      }
+    },
+    {
+      "id": "round2-d11",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "There is a cancellation bug somewhere.",
+        "second": "Cancellation seems unreliable in an unspecified module."
+      }
+    },
+    {
+      "id": "round2-d12",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "handler.py:4 needs attention; no defect description is included.",
+        "second": "handler.py:4 seems questionable, with no behavior or cause given."
+      }
+    },
+    {
+      "id": "round2-d13",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "A limit is incorrect; the file and value are not supplied.",
+        "second": "Some bound appears incorrect; no file or value is supplied."
+      }
+    },
+    {
+      "id": "round2-d14",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "parser.rs:7 has an issue, details unavailable.",
+        "second": "The issue may be near parser.rs:7, but the cause is unknown."
+      }
+    },
+    {
+      "id": "round2-d15",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "state": {
+        "first": "Memory use looks wrong, location omitted.",
+        "second": "Memory consumption may have a problem, location omitted."
+      }
+    }
+  ]
+}

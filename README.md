@@ -82,7 +82,11 @@ yoyo imagegen "Hand-drawn architecture diagram, four boxes, bold arrows" --out a
 
 Custom agents are a JSON entry away. Check everything works with `yoyo doctor --live`.
 
-Model IDs drift by account and CLI version, so yoyo forwards `--model` rather than maintaining an allowlist — ask the target CLI (`cursor-agent --list-models`) for what exists. For complex or ambiguous work, omit `--model` and take the CLI's configured default.
+Use `yoyo models codex --json` or `yoyo models claude --json` to discover the native account type and current model choices without inference. The calling agent selects an available subscription model with `--model`: a smaller tier for bounded, checkable work; the configured default for complex or ambiguous work. No local model, routing call, or daemon is added. Other providers retain their native discovery commands, such as `cursor-agent --list-models`.
+
+For loops, `--verify 'COMMAND'` checks a DONE claim and feeds failures into the next iteration. `--max-stall 3` stops repeated iterations that leave the state and queue unchanged. Both are opt-in; existing commands retain their behavior.
+
+Optional Apple Silicon advice is available through `yoyo advise --file evidence.json`: suspected repeated attempts, failure categories, and possible duplicate findings. It loads a small MLX model only for that batch and returns suggestions without changing jobs or evidence. [Setup, input format, and measured limits](extras/README.md).
 
 ## The pieces
 
@@ -94,6 +98,8 @@ Model IDs drift by account and CLI version, so yoyo forwards `--model` rather th
 | `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with `--queue`, `--brief`, and `--spec` |
 | `yoyo wait` / `runs autopsy` | Poll a detached run; reconstruct one that died |
 | `yoyo runs audit` | Per-agent outcomes and p50/p90 over a window of the ledger |
+| `yoyo models codex\|claude` | Native account and model discovery, with no inference |
+| `yoyo advise --file evidence.json` | Optional local advisory checks; requires separate MLX setup |
 | `yoyo imagegen "..."` | Real raster images via GPT-image |
 | `--session` / `--background` | Durable and detached calls |
 | inbuilt `yoyo-fable-mode` skill | Evidence discipline injected into every delegation (`YOYO_DEFAULT_SKILLS=""` disables) |

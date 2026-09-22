@@ -1,0 +1,533 @@
+{
+  "description": "60 new authored cases frozen before round-three selection; not independent production labels",
+  "cases": [
+    {
+      "id": "round3-01",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "Same cache deletion and unchanged failure.",
+      "state": {
+        "previous": "Deleted the build cache and compiled. Linker still reports undefined symbol PaymentStore.flush.",
+        "latest": "Deleted that cache a second time and compiled the unchanged source. Identical linker error; no new inspection."
+      }
+    },
+    {
+      "id": "round3-02",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "Timeout changed without changing approach or evidence.",
+      "state": {
+        "previous": "Raised the request timeout to 90 seconds. API still returns the same invalid signature response.",
+        "latest": "Raised that timeout to 120 seconds and sent the same signed request. Same invalid signature response, no new trace."
+      }
+    },
+    {
+      "id": "round3-03",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "The same workaround failed again.",
+      "state": {
+        "previous": "Disabled the preview to work around a release build failure. Compiler error in Checkout.swift persisted.",
+        "latest": "Disabled the preview again without changing Checkout.swift. The exact compiler error persists; no new diagnosis."
+      }
+    },
+    {
+      "id": "round3-04",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "Only the number of identical retries changed.",
+      "state": {
+        "previous": "Ran the unchanged migration twice; both attempts failed the same unique-key check.",
+        "latest": "Ran the unchanged migration four more times. Same unique-key check fails; inputs and schema are unchanged."
+      }
+    },
+    {
+      "id": "round3-05",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "New wording reports the same failed action.",
+      "state": {
+        "previous": "Restarted the simulator; the same launch crash returned immediately.",
+        "latest": "Reported that the environment was refreshed: restarted that simulator again. Same launch crash and no new crash report."
+      }
+    },
+    {
+      "id": "round3-06",
+      "kind": "repeat",
+      "expected": "repeated",
+      "rationale": "The unsuccessful patch was reapplied without any change.",
+      "state": {
+        "previous": "Added a 500 ms sleep before saving. The stale-write reproduction still fails.",
+        "latest": "Reapplied the identical 500 ms sleep and reran the same reproduction. Still fails; no additional observation."
+      }
+    },
+    {
+      "id": "round3-07",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "A trace identifies a new cause despite no fix.",
+      "state": {
+        "previous": "The login view disappears after tapping Continue. No cause was known.",
+        "latest": "Captured a navigation trace showing two dismiss calls from separate observers. No fix yet; the disappearance remains."
+      }
+    },
+    {
+      "id": "round3-08",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "A controlled comparison rules out the old hypothesis.",
+      "state": {
+        "previous": "Suspected compression caused corrupted attachments.",
+        "latest": "Disabled compression for the identical fixture; corruption remained byte-for-byte, ruling out compression."
+      }
+    },
+    {
+      "id": "round3-09",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "A different patch was attempted and measured.",
+      "state": {
+        "previous": "Increasing the polling interval did not stop duplicate deliveries.",
+        "latest": "Added a delivery-ID uniqueness constraint instead. The duplicate test now passes, but another ordering test fails."
+      }
+    },
+    {
+      "id": "round3-10",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "Same command produced a new concrete diagnostic.",
+      "state": {
+        "previous": "Ran the uploader with standard logging; saw only exit status 1.",
+        "latest": "Reran the uploader with HTTP tracing and found a response rejecting an expired upload token."
+      }
+    },
+    {
+      "id": "round3-11",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "A verified result accompanies a changed implementation.",
+      "state": {
+        "previous": "The new date parser rejected leap-day input in the regression test.",
+        "latest": "Changed the leap-year check and reran the exact failing fixture. It passes; invalid February 30 is still rejected."
+      }
+    },
+    {
+      "id": "round3-12",
+      "kind": "repeat",
+      "expected": "new_evidence",
+      "rationale": "A bisect result narrows the cause.",
+      "state": {
+        "previous": "Release builds started hanging somewhere in the last twenty commits.",
+        "latest": "Bisected those commits and reproduced the first hang at the lock-order change. The hang is still present."
+      }
+    },
+    {
+      "id": "round3-13",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "Neither entry describes a concrete action or result.",
+      "state": {
+        "previous": "The task is in progress.",
+        "latest": "The task continues to move forward."
+      }
+    },
+    {
+      "id": "round3-14",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "The previous attempt is unavailable.",
+      "state": {
+        "previous": "No record of the previous attempt was retained.",
+        "latest": "Updated the session expiry check and ran its unit test successfully."
+      }
+    },
+    {
+      "id": "round3-15",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "A claimed improvement has no latest evidence.",
+      "state": {
+        "previous": "Reproduced a crash on opening the search tab.",
+        "latest": "I have improved the situation. No patch, action or test result is included."
+      }
+    },
+    {
+      "id": "round3-16",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "Identical vague messages do not establish an attempted approach.",
+      "state": {
+        "previous": "Still working.",
+        "latest": "Still working."
+      }
+    },
+    {
+      "id": "round3-17",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "Task descriptions are not attempt evidence.",
+      "state": {
+        "previous": "Ticket: investigate the notifications issue.",
+        "latest": "Ticket: investigate the notifications issue, updated priority."
+      }
+    },
+    {
+      "id": "round3-18",
+      "kind": "repeat",
+      "expected": "unclear",
+      "rationale": "Neither update names the approach or an observation.",
+      "state": {
+        "previous": "Tried something that may help.",
+        "latest": "Tried another thing. Details and outcomes were not recorded."
+      }
+    },
+    {
+      "id": "round3-19",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "Provider explicitly rejects an expired session.",
+      "state": "Remote coding service: session_expired. The stored login session is no longer valid; authenticate again."
+    },
+    {
+      "id": "round3-20",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "Entitlement is a remote account restriction.",
+      "state": "Provider response: this organization has not enabled access to model family X. The account administrator must grant access."
+    },
+    {
+      "id": "round3-21",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "The provider subscription allowance is exhausted.",
+      "state": "Request rejected by the provider: monthly plan allowance exhausted; requests resume at the listed billing-cycle reset."
+    },
+    {
+      "id": "round3-22",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "Remote authorization was revoked.",
+      "state": "The coding provider rejected the command because the user removed this CLI from authorized applications."
+    },
+    {
+      "id": "round3-23",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "The remote service identifies an inactive subscription.",
+      "state": "Model request failed. Provider says the subscription is inactive and must be renewed to use this service."
+    },
+    {
+      "id": "round3-24",
+      "kind": "failure",
+      "expected": "account",
+      "rationale": "The denied operation is provider account access, not a local file.",
+      "state": "403 from the remote model gateway: this user is not a member of the permitted organization. Local files are readable."
+    },
+    {
+      "id": "round3-25",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "The local tool cannot be located.",
+      "state": "Preflight: executable docker was not found in PATH. The test suite never started."
+    },
+    {
+      "id": "round3-26",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "The machine has insufficient disk space.",
+      "state": "Dependency extraction aborted with ENOSPC: no space left on the local volume. Source compilation did not start."
+    },
+    {
+      "id": "round3-27",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "The denied operation is on a local file.",
+      "state": "EACCES opening /tmp/build-cache/index: local directory permissions deny this user write access; provider login succeeded."
+    },
+    {
+      "id": "round3-28",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "DNS failure prevents reaching the service.",
+      "state": "Could not resolve the package registry hostname from this Mac. No connection or authentication response was received."
+    },
+    {
+      "id": "round3-29",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "An explicit missing setting blocks startup.",
+      "state": "Preflight aborted before tests: DATABASE_URL is unset in this shell. Configure the local test database connection."
+    },
+    {
+      "id": "round3-30",
+      "kind": "failure",
+      "expected": "environment",
+      "rationale": "A required local service is not running.",
+      "state": "Health check: local Redis daemon is stopped. The worker cannot start until this dependency is running."
+    },
+    {
+      "id": "round3-31",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "The edited code has a demonstrated compilation error.",
+      "state": "Compiler: edited ImageCache.swift:41 references undefined variable cacheKey. Reverting this source edit restores compilation."
+    },
+    {
+      "id": "round3-32",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "A deterministic test demonstrates an off-by-one defect.",
+      "state": "Regression test for the changed paginator: expected records 1 through 10; received 2 through 11. Reproduces on every run."
+    },
+    {
+      "id": "round3-33",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "A sanitizer identifies the changed code as the defect.",
+      "state": "AddressSanitizer reports heap-buffer-overflow at the newly edited copy loop. A five-byte fixture reproduces the out-of-bounds write."
+    },
+    {
+      "id": "round3-34",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "Authentication wording belongs to a failing implementation test.",
+      "state": "Unit test of the edited auth middleware fails: a valid signed token receives 401 because the new expiry comparison is reversed."
+    },
+    {
+      "id": "round3-35",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "A reproduction proves the cancellation defect in changed source.",
+      "state": "The edited uploader invokes its completion twice after cancellation. Focused reproduction records both calls from the new catch block."
+    },
+    {
+      "id": "round3-36",
+      "kind": "failure",
+      "expected": "implementation",
+      "rationale": "The failing invariant is caused by the changed serializer.",
+      "state": "Round-trip test fails in the changed encoder: an empty array becomes null. The fixture and failing assertion identify the new branch."
+    },
+    {
+      "id": "round3-37",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "A bare status does not establish cause.",
+      "state": "Process returned status 1. Standard error was discarded; the command and failing stage are unknown."
+    },
+    {
+      "id": "round3-38",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "The report states success, not a current failure.",
+      "state": "All requested checks passed and the process exited 0. No blocker is reported."
+    },
+    {
+      "id": "round3-39",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "A hypothesis without a provider response is insufficient.",
+      "state": "Maybe the subscription is exhausted, or maybe it is a code issue. No error response or diagnostic output was captured."
+    },
+    {
+      "id": "round3-40",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "The only visible error was recovered and current verification passed.",
+      "state": "An earlier attempt printed connection refused. The service was started afterward; the latest run passed every check with exit 0."
+    },
+    {
+      "id": "round3-41",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "Failure is speculation about a future run.",
+      "state": "The new parser may fail on some inputs, but no input, failing test or observed defect has been supplied."
+    },
+    {
+      "id": "round3-42",
+      "kind": "failure",
+      "expected": "unclear",
+      "rationale": "Generic cancellation does not identify a blocker category.",
+      "state": "The task was interrupted. The report gives no reason for the interruption and contains no diagnostic evidence."
+    },
+    {
+      "id": "round3-43",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same file, function and missing bounds check.",
+      "state": {
+        "first": "decode.rs:27 decodeHeader reads the next four bytes without checking remaining input length.",
+        "second": "decode.rs:27 decodeHeader can read past a short input because it never verifies four bytes remain."
+      }
+    },
+    {
+      "id": "round3-44",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same stale-response defect in the same handler.",
+      "state": {
+        "first": "results.ts:81 onResponse ignores the query version, so older responses overwrite the latest results.",
+        "second": "results.ts:81 onResponse needs to reject obsolete query versions; a late old response replaces current results."
+      }
+    },
+    {
+      "id": "round3-45",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same missing cleanup on the same error path.",
+      "state": {
+        "first": "archive.go:58 writeArchive returns on checksum failure without closing its opened file.",
+        "second": "archive.go:58 writeArchive leaks the file descriptor on a checksum error because that return bypasses close."
+      }
+    },
+    {
+      "id": "round3-46",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same incorrect arithmetic and affected line.",
+      "state": {
+        "first": "price.py:19 divides integer cents by 100 using integer division and drops the fractional amount.",
+        "second": "price.py:19 cents are truncated to whole currency units by the integer division operator."
+      }
+    },
+    {
+      "id": "round3-47",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same task-registration race at the same source location.",
+      "state": {
+        "first": "jobs.kt:72 starts the task before registering its cancellation handle, allowing cancellation to miss it.",
+        "second": "jobs.kt:72 cancellation can arrive between task start and handle registration; registration must happen first."
+      }
+    },
+    {
+      "id": "round3-48",
+      "kind": "duplicate",
+      "expected": "same",
+      "rationale": "Same missing account scope in the same query.",
+      "state": {
+        "first": "notes.sql:14 selects notes without restricting owner_id, exposing other accounts records.",
+        "second": "notes.sql:14 the notes lookup omits the owner_id predicate and can return another users notes."
+      }
+    },
+    {
+      "id": "round3-49",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "Same issue description, independent source locations.",
+      "state": {
+        "first": "audio_a.swift:23 leaves its recorder running on cancellation.",
+        "second": "audio_b.swift:23 leaves its independent recorder running on cancellation."
+      }
+    },
+    {
+      "id": "round3-50",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "Same line but different causal defects.",
+      "state": {
+        "first": "query.py:62 interpolates an unescaped name into SQL, permitting injection.",
+        "second": "query.py:62 executes one database query per row, producing excessive query volume."
+      }
+    },
+    {
+      "id": "round3-51",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "The two stated requirements directly contradict.",
+      "state": {
+        "first": "events.ts:8 must deliver the oldest timestamp first; newest-first order violates the contract.",
+        "second": "events.ts:8 must deliver the newest timestamp first; oldest-first order violates the contract."
+      }
+    },
+    {
+      "id": "round3-52",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "Independent reads use different lines and buffers.",
+      "state": {
+        "first": "parse.c:40 reads beyond the header buffer in parseHeader.",
+        "second": "parse.c:94 reads beyond the independent payload buffer in parsePayload."
+      }
+    },
+    {
+      "id": "round3-53",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "The causes differ despite matching memory-related words.",
+      "state": {
+        "first": "cache.rs:53 retains expired entries indefinitely, causing memory growth.",
+        "second": "cache.rs:53 returns a reference after freeing its entry, causing a use-after-free."
+      }
+    },
+    {
+      "id": "round3-54",
+      "kind": "duplicate",
+      "expected": "different",
+      "rationale": "The locking prescriptions are opposite claims.",
+      "state": {
+        "first": "state.cpp:33 must hold the lock while calling notify because notify reads protected state.",
+        "second": "state.cpp:33 must release the lock before calling notify because notify acquires that lock."
+      }
+    },
+    {
+      "id": "round3-55",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "Neither finding supplies a cause or source location.",
+      "state": {
+        "first": "The export feature sometimes acts strangely.",
+        "second": "Export behavior looks unreliable in some circumstances."
+      }
+    },
+    {
+      "id": "round3-56",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "A common location without a described defect is insufficient.",
+      "state": {
+        "first": "queue.go:17 needs review, but the issue was not recorded.",
+        "second": "queue.go:17 may be wrong; no failing behavior or cause is provided."
+      }
+    },
+    {
+      "id": "round3-57",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "The second report cannot be mapped to a defect or location.",
+      "state": {
+        "first": "files.py:82 fails to close the file on an exception in readConfig.",
+        "second": "There could be a resource problem somewhere, details unavailable."
+      }
+    },
+    {
+      "id": "round3-58",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "Matching defect language without identifiable locations is insufficient.",
+      "state": {
+        "first": "A missing null check causes a crash; the function and file are not known.",
+        "second": "A missing null check causes a crash; its function and file were not saved."
+      }
+    },
+    {
+      "id": "round3-59",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "Labels alone do not describe review findings.",
+      "state": {
+        "first": "High severity issue.",
+        "second": "High severity issue."
+      }
+    },
+    {
+      "id": "round3-60",
+      "kind": "duplicate",
+      "expected": "unclear",
+      "rationale": "A shared filename lacks both a specific defect and affected location.",
+      "state": {
+        "first": "Something in login.swift deserves attention, but no details were supplied.",
+        "second": "login.swift has a questionable part; the behavior and location are unspecified."
+      }
+    }
+  ]
+}
