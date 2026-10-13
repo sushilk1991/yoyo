@@ -1,6 +1,6 @@
 ---
 name: yoyo
-description: Delegates work to another vendor's coding agent through the yoyo CLI — Codex, Claude, Pi, Cursor, Antigravity (agy), Grok. Use for an independent second opinion, cross-vendor code review, best-of-n comparison, deep research, or a fresh-context loop over a long task.
+description: Delegates work to another vendor's coding agent through the yoyo CLI — Codex, Claude, Pi, Cursor, Antigravity (agy), Grok, Muse Code (muse). Use for an independent second opinion, cross-vendor code review, best-of-n comparison, deep research, or a fresh-context loop over a long task.
 ---
 
 # Yoyo
@@ -47,7 +47,8 @@ A call your harness cut off is **unavailable**, never *passed*. When you are uns
 | `pi` | Pi | Small, cheap, fast questions |
 | `cursor` | Cursor | A worker on a different model family (needs `cursor-agent login`) |
 | `grok` | xAI | A fourth vendor to break a tie; `--read-only` gives it read tools only, no shell, web, or MCP |
-| `agy` | Google | Gemini-family tiebreaker; `--read-only` is its plan mode with writes and unlisted shell commands auto-denied |
+| `agy` | Google | Antigravity CLI; reuses its native Google login; `--read-only` is its plan mode with writes and unlisted shell commands auto-denied |
+| `muse` | Meta | Muse Code; unattended sandboxed workers; `--read-only` exposes file reads/search only, excluding shell, writes, MCP, and subagents |
 
 Each agent runs whatever model its own CLI is configured for. Check availability with `yoyo agents`, health with `yoyo doctor --live`.
 
@@ -57,9 +58,45 @@ Each agent runs whatever model its own CLI is configured for. Check availability
 
 - **Default-first quality rule.** For complex, ambiguous, multi-file, architectural, security, or release work, omit `--model` and take the target CLI's configured default. Reach for a smaller tier only on bounded tasks that have an objective check. Never trade correctness or completeness for lower cost or latency.
 - A `-fast` variant means **lower latency, not lower cost**.
-- Cursor's and agy's `--read-only` are their plan mode, not an OS sandbox; grok's is a tool allowlist with no shell, web, or MCP. Under agy read-only any shell command it has not allowlisted itself is denied, and a denied call ends the run with no answer, which yoyo reports as exit 1 — keep read-only agy asks to reads (a review of a diff in the prompt is fine), give it full access when the job needs a shell, and treat a one-line agy answer as no answer. Pair any Cursor write with a focused test and read the diff yourself.
+- Cursor's `--read-only` is plan mode, not an OS sandbox. agy adds sandboxing. grok uses a tool allowlist with no shell, web, or MCP. Under agy read-only any shell command it has not allowlisted itself is denied, and a denied call ends the run with no answer, which yoyo reports as exit 1 — keep read-only agy asks to reads (a review of a diff in the prompt is fine), give it full access when the job needs a shell, and treat a one-line agy answer as no answer. Pair any Cursor write with a focused test and read the diff yourself.
 - agy's own 5-minute print timeout is overridden by yoyo automatically; there is nothing to work around. Its prompt travels in argv, so a call with megabytes of `--file` context fails loudly on agy — send big context to codex, claude, or pi.
 - One `ask` fan-out shares a single `--model` across its candidates. Use separate calls when the agents need different models.
+
+## Use from any caller
+
+Claude Code, Codex, Cursor, Antigravity, and Muse Code can all call the same yoyo commands through an allowed shell tool. The caller and target need not match. A read-only child does not grant its caller permission to launch processes.
+
+1. Put `yoyo` and the target CLI on PATH; sign in through the target's own CLI. yoyo reuses that login and does not configure credentials.
+2. Run `yoyo install-skill` after installing or updating yoyo, then restart the caller so it reloads skills. Cursor can discover the shared `~/.agents/skills` copy. Antigravity CLI gets `~/.gemini/antigravity-cli/skills`; its legacy `~/.gemini/config/skills` copy remains supported. Muse gets `$XDG_CONFIG_HOME/muse/skills` (default `~/.config/muse/skills`), including when foreign skill discovery is disabled.
+3. Launch in the background, poll briefly, and verify the answer. Reviewers use `--read-only`; scoped workers use `--role worker` and full access, the default.
+
+```bash
+# Google delegation reuses Antigravity CLI's login.
+run_id=$(yoyo ask agy --role review --read-only --cwd "$PWD" --background "Review this diff. Use reads only; cite file/line.")
+yoyo wait "$run_id" --timeout 25
+```
+
+```bash
+# Muse Code uses its existing native login; yoyo handles the regular prompt file.
+run_id=$(yoyo ask muse --role review --read-only --cwd "$PWD" --background "Read the auth files and report verified bugs. Cite file/line.")
+yoyo wait "$run_id" --timeout 25
+```
+
+Muse workers skip approval while keeping its default sandbox, which can block child agents or writes outside the workspace. Reviews use only native `read_file` and `search`; configured hooks remain outside the tool sandbox. Muse does not consume prompts from stdin, so yoyo stages a private regular file and removes it after the call. Use the background/poll recipe; `--session` is unsupported.
+
+A poll exit of 124 means keep waiting; other nonzero exits require inspecting `yoyo runs show "$run_id" --json`. Missing login, exhausted quota, denied tools, and unavailable models are failures, not completed reviews. `agy` rejects yoyo's `--session`; omit it.
+
+### Muse YOLO (explicit opt-in)
+
+When Muse's sandbox blocks an authorized worker, diagnose the denial first. Require explicit user approval and an already-isolated environment before adding `--agent-arg=--yolo` to a worker call without `--read-only`. A temporary directory alone is not isolation. `--yolo` disables approvals and the sandbox and trusts the workspace for this run; `--disable-approval` alone keeps the sandbox.
+
+```bash
+# Only after approval, inside an isolated environment with trusted code.
+run_id=$(yoyo ask muse --role worker --agent-arg=--yolo --cwd "$PWD" --background "Do the approved task and verify its artifacts.")
+yoyo wait "$run_id" --timeout 25
+```
+
+If Muse is the outer caller, start it with `muse --yolo` under the same approval/isolation requirements, or request native one-command human approval. A child's YOLO flag cannot remove an outer caller's sandbox. Keep reviews read-only and ordinary workers sandboxed. Never enable YOLO automatically after a failure or persist an Unrestricted profile. Verify child results and artifacts independently; a completed parent turn does not prove its child succeeded. See [Muse permissions](https://dev.meta.ai/docs/muse-code/permissions).
 
 ## Choose a subscribed model
 

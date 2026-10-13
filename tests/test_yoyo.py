@@ -58,7 +58,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.28.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.29.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -4168,6 +4168,524 @@ class TimeoutHelpGuardTests(CliTestCase):
         self.assertNotIn("use --timeout", self.flag_help("ask", "--idle-timeout").lower())
 
 
+class CliCompatibilityTests(CliTestCase):
+    """Exercise native launches and caller guidance without vendor inference."""
+
+    def _skill_env(self, tmp):
+        # One bundle and isolated home make missing copies independent of the host.
+        root = Path(tmp)
+        source = root / "checkout" / "skills"
+        skill = source / "yoyo" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("canonical caller guidance\n", encoding="utf-8")
+        (source.parent / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+
+        return {
+            "HOME": str(root / "home"),
+            "PI_CODING_AGENT_DIR": str(root / "home" / ".pi" / "agent"),
+            "YOYO_CONFIG": str(root / "missing.json"),
+            "YOYO_SKILL_SOURCE": str(source),
+            "YOYO_SKILL_PATH": None,
+        }
+
+    def test_google_target_set(self):
+        # Removing standalone Gemini must retain every other built-in vendor.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(["agents", "--json"], env=self._skill_env(tmp))
+
+        self.assertEqual(code, 0, stderr)
+        names = {row["name"] for row in json.loads(stdout)}
+        self.assertEqual(names, {"agy", "claude", "codex", "cursor", "grok", "muse", "pi"})
+
+    def test_gemini_not_builtin(self):
+        # Unsupported Google CLI requests must fail before launching a process.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, stderr = self.run_cli(["ask", "gemini", "--read-only", "--dry-run", "Review it."], env=self._skill_env(tmp))
+
+        self.assertEqual(code, 2)
+        self.assertIn("Unknown agent 'gemini'", stderr)
+        self.assertIn("agy", stderr)
+
+    def test_gemini_root_ignored(self):
+        # Standalone Gemini's home is outside the supported caller skill roots.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            skill = Path(env["HOME"]) / ".gemini/skills/standalone-only/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("unsupported-home marker", encoding="utf-8")
+            code, _, stderr = self.run_cli(["ask", "echo", "--skill", "standalone-only", "--dry-run", "Review it."], env={**env, "YOYO_AGENT_ECHO": "cat"})
+
+        self.assertEqual(code, 2)
+        self.assertIn("Skill not found", stderr)
+
+    def test_docs_google_target(self):
+        # Active recipes must teach agy without advertising the removed adapter.
+        for path in ("README.md", "docs/REFERENCE.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("| `agy` |", text)
+                self.assertNotIn("| `gemini` |", text)
+                self.assertNotIn("yoyo ask gemini", text)
+                self.assertNotIn("yoyo doctor --live --agent gemini", text)
+
+    def test_native_skill_roots(self):
+        # Native-only global skills must resolve by name for --skill injection.
+        for root in (".cursor/skills", ".gemini/antigravity-cli/skills"):
+            with self.subTest(root=root), tempfile.TemporaryDirectory() as tmp:
+                env = self._skill_env(tmp)
+                skill = Path(env["HOME"]) / root / "native-audit" / "SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text("native-only marker", encoding="utf-8")
+                code, stdout, stderr = self.run_cli(["ask", "echo", "--skill", "native-audit", "--json", "Inspect it."], env={**env, "YOYO_AGENT_ECHO": "cat"})
+
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("native-only marker", json.loads(stdout)["stdout"])
+
+    def test_shared_root_precedence(self):
+        # New roots must not replace a shared skill callers already selected.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            for root, text in ((".agents/skills", "shared choice"), (".cursor/skills", "native choice")):
+                skill = Path(env["HOME"]) / root / "choice" / "SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text(text, encoding="utf-8")
+            code, stdout, stderr = self.run_cli(["ask", "echo", "--skill", "choice", "--json", "Inspect it."], env={**env, "YOYO_AGENT_ECHO": "cat"})
+
+        self.assertEqual(code, 0, stderr)
+        answer = json.loads(stdout)["stdout"]
+        self.assertIn("shared choice", answer)
+        self.assertNotIn("native choice", answer)
+
+    def test_agy_skill_install(self):
+        # Install into the current documented CLI home while retaining legacy IDE copies.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            for root in (".gemini/antigravity-cli/skills", ".gemini/config/skills", ".agents/skills"):
+                target = Path(env["HOME"]) / root / "yoyo" / "SKILL.md"
+                self.assertTrue(target.is_file(), str(target))
+                self.assertEqual(target.read_text(encoding="utf-8"), "canonical caller guidance\n")
+            for root in (".cursor/skills", ".gemini/skills"):
+                self.assertFalse((Path(env["HOME"]) / root / "yoyo").exists())
+
+    def test_install_native_overrides(self):
+        # Repair existing native overrides without creating copies in fresh homes.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            target = Path(env["HOME"]) / ".cursor/skills/yoyo/SKILL.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("outdated guidance", encoding="utf-8")
+            code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "canonical caller guidance\n")
+
+    def test_bundle_alias_install(self):
+        # A native root aliasing the bundle must never delete the installer source.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            source = Path(env["YOYO_SKILL_SOURCE"])
+            native = Path(env["HOME"]) / ".cursor/skills"
+            native.parent.mkdir(parents=True)
+            native.symlink_to(source, target_is_directory=True)
+            code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(native.is_symlink())
+            self.assertEqual((source / "yoyo/SKILL.md").read_text(encoding="utf-8"), "canonical caller guidance\n")
+
+    def test_native_symlink_repair(self):
+        # Repair the link's location without changing its bundle or external target.
+        for location in ("bundle", "external"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as tmp:
+                env = self._skill_env(tmp)
+                linked = Path(env["YOYO_SKILL_SOURCE"]) / "yoyo"
+                expected = "canonical caller guidance\n"
+                if location == "external":
+                    linked = Path(tmp) / "external" / "yoyo"
+                    linked.mkdir(parents=True)
+                    expected = "keep external guidance\n"
+                    (linked / "SKILL.md").write_text(expected, encoding="utf-8")
+
+                target = Path(env["HOME"]) / ".cursor/skills/yoyo"
+                target.parent.mkdir(parents=True)
+                target.symlink_to(linked, target_is_directory=True)
+                code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "canonical caller guidance\n")
+                self.assertEqual((linked / "SKILL.md").read_text(encoding="utf-8"), expected)
+
+    def test_installed_skill_repair(self):
+        # Installed binary -> recorded checkout -> bundle, with no sibling skills.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            record = Path(tmp) / "source-record"
+            record.write_text(str(Path(env["YOYO_SKILL_SOURCE"]).parent), encoding="utf-8")
+            env.update({"YOYO_SKILL_SOURCE": None, "YOYO_SOURCE_ROOT": None, "YOYO_SOURCE_RECORD": str(record)})
+            with mock.patch.object(yoyo, "__file__", str(Path(tmp) / "prefix" / "bin" / "yoyo")):
+                code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            target = Path(env["HOME"]) / ".agents/skills/yoyo/SKILL.md"
+            self.assertEqual(target.read_text(encoding="utf-8"), "canonical caller guidance\n")
+
+    def test_bad_skill_source(self):
+        # An explicit missing bundle must fail rather than silently use the checkout.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            missing = str(Path(tmp) / "missing-bundle")
+            code, _, stderr = self.run_cli(["install-skill"], env={**env, "YOYO_SKILL_SOURCE": missing})
+
+        self.assertEqual(code, 2)
+        self.assertIn(missing, stderr)
+
+    def test_doctor_missing_skills(self):
+        # Binary presence cannot certify that a caller has any installed guidance.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("skill yoyo: MISSING", stdout)
+        self.assertIn("yoyo install-skill", stdout)
+
+    def test_doctor_shared_skills(self):
+        # One shared copy is valid native discovery, even when other homes are absent.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            target = Path(env["HOME"]) / ".agents/skills/yoyo/SKILL.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("canonical caller guidance\n", encoding="utf-8")
+            with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("in sync (1 homes)", stdout)
+        self.assertNotIn("MISSING", stdout)
+
+    def test_doctor_native_copies(self):
+        # A valid native-only home must count as installed caller guidance.
+        for root in (".cursor/skills", ".gemini/antigravity-cli/skills"):
+            with self.subTest(root=root), tempfile.TemporaryDirectory() as tmp:
+                env = self._skill_env(tmp)
+                target = Path(env["HOME"]) / root / "yoyo/SKILL.md"
+                target.parent.mkdir(parents=True)
+                target.write_text("canonical caller guidance\n", encoding="utf-8")
+                with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                    code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("in sync (1 homes)", stdout)
+
+    def test_doctor_optional_skill(self):
+        # A dependency-gated skill is not missing when install intentionally skips it.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._skill_env(tmp)
+            target = Path(env["HOME"]) / ".agents/skills/yoyo/SKILL.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("canonical caller guidance\n", encoding="utf-8")
+            optional = Path(env["YOYO_SKILL_SOURCE"]) / "yoyo-imagegen/SKILL.md"
+            optional.parent.mkdir()
+            optional.write_text("image guidance", encoding="utf-8")
+            with mock.patch.object(yoyo.shutil, "which", side_effect=lambda name: None if name == "codex" else "/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor"], env=env)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("skill yoyo-imagegen: skipped (requires codex on PATH)", stdout)
+        self.assertNotIn("skill yoyo-imagegen: MISSING", stdout)
+
+    def test_doctor_stdout_failure(self):
+        # Providers report quota errors on stdout; keep the useful bounded diagnosis.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            script = "import sys; sys.stdin.read(); print('Weekly quota reached'); sys.exit(1)"
+            config.write_text(json.dumps({"agents": {"quota": {"command": ["python3", "-c", script], "read_only_args": ["--safe"]}}}), encoding="utf-8")
+            code, stdout, stderr = self.run_cli(["doctor", "--live", "--agent", "quota", "--strict", "--json"], env={"YOYO_CONFIG": str(config)})
+
+        self.assertEqual(code, 1, stderr)
+        for row in json.loads(stdout):
+            self.assertIn("Weekly quota reached", row["stderr_snippet"])
+
+    def test_claude_read_only_mcp(self):
+        # Built-in tool restrictions alone leave configured MCP write tools available.
+        code, stdout, stderr = self.run_cli(["ask", "claude", "--read-only", "--dry-run", "--json", "Review it."])
+
+        self.assertEqual(code, 0, stderr)
+        command = json.loads(stdout)["command"]
+        self.assertIn("--disallowedTools", command)
+        self.assertEqual(command[command.index("--disallowedTools") + 1], "mcp__*")
+
+    def test_claude_worker_mcp(self):
+        # Full-access workers retain configured integrations.
+        code, stdout, stderr = self.run_cli(["ask", "claude", "--dry-run", "--json", "Do it."])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("--disallowedTools", json.loads(stdout)["command"])
+
+    def test_skill_google_recipes(self):
+        # Google callers need agy's native login and the safe polling recipe.
+        text = (ROOT / "skills/yoyo/SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("| `agy` |", text)
+        self.assertNotIn("| `gemini` |", text)
+        self.assertNotIn("yoyo ask gemini", text)
+        self.assertNotIn("Gemini CLI", text.split("---")[1])
+        self.assertIn("yoyo ask agy", text)
+        self.assertIn("yoyo wait", text)
+        self.assertIn("yoyo install-skill", text)
+
+
+class MuseTests(CliTestCase):
+    """Verify Muse's native boundary without vendor inference or user configuration."""
+
+    def _fake_muse(self, tmp, script=None):
+        # A real child process checks file transport, not an in-process command mock.
+        if script is None:
+            script = (
+                "import json,os,sys; from pathlib import Path; "
+                "args=sys.argv[1:]; path=Path(args[args.index('--prompt-file')+1]); "
+                "print(json.dumps({'argv':args,'prompt':path.read_text(encoding='utf-8'),"
+                "'stdin':sys.stdin.read(),'file':str(path),'regular':path.is_file(),"
+                "'cwd':os.getcwd()}, ensure_ascii=False))"
+            )
+
+        config = Path(tmp) / "agents.json"
+        config.write_text(json.dumps({"agents": {"muse": {"kind": "muse", "command": [sys.executable, "-c", script]}}}), encoding="utf-8")
+        return {"YOYO_CONFIG": str(config)}
+
+    def _home_env(self, tmp, config_home=None):
+        # Isolate native and shared installs while reusing the real bundled guidance.
+        home = Path(tmp) / "home"
+        return {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(config_home) if config_home is not None else None,
+            "PI_CODING_AGENT_DIR": str(home / ".pi/agent"),
+            "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
+            "YOYO_SKILL_SOURCE": str(ROOT / "skills"),
+            "YOYO_SKILL_PATH": None,
+        }
+
+    def test_muse_registered(self):
+        # A supported target must be discoverable without a custom adapter entry.
+        code, stdout, stderr = self.run_cli(["agents", "--json"])
+
+        self.assertEqual(code, 0, stderr)
+        rows = {row["name"]: row for row in json.loads(stdout)}
+        self.assertIn("muse", rows)
+        self.assertEqual(rows["muse"]["command"], ["muse", "exec"])
+
+    def test_muse_worker_flags(self):
+        # Workers run unattended but retain Muse's native filesystem sandbox.
+        code, stdout, stderr = self.run_cli(["ask", "muse", "--dry-run", "--json", "Do it."])
+
+        self.assertEqual(code, 0, stderr)
+        command = json.loads(stdout)["command"]
+        self.assertEqual(command[:2], ["muse", "exec"])
+        self.assertIn("--disable-approval", command)
+        self.assertIn("--trust-workspace", command)
+        self.assertIn("--no-session-log", command)
+        self.assertNotIn("--disable-sandbox", command)
+        self.assertNotIn("--yolo", command)
+
+    def test_muse_read_only_tools(self):
+        # Limit reviews to file reads/search, excluding shell, writes, MCP, and children.
+        code, stdout, stderr = self.run_cli(["ask", "muse", "--read-only", "--dry-run", "--json", "Review it."])
+
+        self.assertEqual(code, 0, stderr)
+        command = json.loads(stdout)["command"]
+        self.assertIn("--disable-write", command)
+        self.assertIn("--disable-shell", command)
+        self.assertIn('run.toolset=["read_file","search"]', command)
+        self.assertNotIn("--disable-sandbox", command)
+        self.assertNotIn("--yolo", command)
+
+    def test_muse_model_and_args(self):
+        # Preserve account model IDs and native options after the access-mode flags.
+        code, stdout, stderr = self.run_cli([
+            "ask", "muse", "--model", "account-model", "--agent-arg=--reasoning-effort",
+            "--agent-arg", "medium", "--dry-run", "--json", "Do it.",
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["command"][-4:], ["--model", "account-model", "--reasoning-effort", "medium"])
+
+    def test_muse_session_rejected(self):
+        # Native exec session IDs are not yet a yoyo named-session mapping.
+        code, _, stderr = self.run_cli(["ask", "muse", "--session", "audit", "--dry-run", "Do it."])
+
+        self.assertEqual(code, 2)
+        self.assertIn("agent muse does not support --session", stderr)
+
+    def test_muse_prompt_file(self):
+        # Unicode prompts above Linux's per-argument limit need a regular UTF-8 file.
+        prompt = "héllo\n" * 25000
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["ask", "muse", "--raw", "--json", "--cwd", tmp, prompt],
+                env=self._fake_muse(tmp),
+            )
+
+            self.assertEqual(code, 0, stderr)
+            result = json.loads(stdout)
+            answer = json.loads(result["stdout"])
+            self.assertEqual(answer["prompt"], prompt)
+            self.assertEqual(answer["stdin"], "")
+            self.assertTrue(answer["regular"])
+            self.assertEqual(Path(answer["cwd"]), Path(tmp).resolve())
+            self.assertNotIn(prompt, result["command"])
+            self.assertFalse(Path(answer["file"]).exists())
+
+    def test_muse_rendered_file(self):
+        # Role and piped context must reach the file, not only the positional task.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["ask", "muse", "--role", "review", "--json", "Review the marker."],
+                stdin="PIPE_CONTEXT_MARKER",
+                env=self._fake_muse(tmp),
+            )
+
+        self.assertEqual(code, 0, stderr)
+        answer = json.loads(json.loads(stdout)["stdout"])
+        self.assertIn("Review the marker.", answer["prompt"])
+        self.assertIn("PIPE_CONTEXT_MARKER", answer["prompt"])
+        self.assertIn("review", answer["prompt"].lower())
+
+    def test_muse_failure_cleanup(self):
+        # Failed native calls must not leave potentially sensitive prompt files behind.
+        script = "import sys; from pathlib import Path; p=Path(sys.argv[sys.argv.index('--prompt-file')+1]); print(p.read_text()); sys.exit(7)"
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(["ask", "muse", "--json", "Fail it."], env=self._fake_muse(tmp, script))
+
+        self.assertEqual(code, 7, stderr)
+        result = json.loads(stdout)
+        command = result["command"]
+        self.assertIn("Fail it.", result["stdout"])
+        self.assertFalse(Path(command[command.index("--prompt-file") + 1]).exists())
+
+    def test_muse_timeout_cleanup(self):
+        # Timeout cleanup must remove the same file used by the cancelled child.
+        script = "import sys,time; from pathlib import Path; Path(sys.argv[sys.argv.index('--prompt-file')+1]).read_text(); time.sleep(2)"
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["ask", "muse", "--timeout", "0.1", "--json", "Wait."],
+                env=self._fake_muse(tmp, script),
+            )
+
+        self.assertEqual(code, 124, stderr)
+        result = json.loads(stdout)
+        command = result["command"]
+        self.assertFalse(Path(command[command.index("--prompt-file") + 1]).exists())
+
+    def test_muse_signal_cleanup(self):
+        import signal
+
+        if os.name != "posix":
+            self.skipTest("POSIX signal lifecycle")
+
+        # Real yoyo -> sleeping fake Muse -> signal: private prompt data must disappear.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory() as tmp:
+                ready = Path(tmp) / "ready.txt"
+                script = (
+                    "import os,sys,time; from pathlib import Path; "
+                    "path=Path(sys.argv[sys.argv.index('--prompt-file')+1]); "
+                    "path.read_text(encoding='utf-8'); "
+                    "Path(os.environ['MUSE_READY_FILE']).write_text(str(path)); time.sleep(30)"
+                )
+                env = {
+                    **os.environ,
+                    **self._fake_muse(tmp, script),
+                    "TMPDIR": tmp,
+                    "MUSE_READY_FILE": str(ready),
+                    "YOYO_STATE_DIR": self._state_guard.name,
+                    "YOYO_NO_CALL_JOURNAL": "1",
+                    "YOYO_DEFAULT_SKILLS": "",
+                }
+                proc = subprocess.Popen(
+                    [sys.executable, str(YOYO_PATH), "ask", "muse", "--raw", "--quiet", "--no-stdin", "private prompt marker"],
+                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists(), "Muse did not receive its prompt file")
+                    prompt_file = Path(ready.read_text(encoding="utf-8"))
+                    self.assertTrue(prompt_file.is_file())
+
+                    proc.send_signal(signum)
+                    _, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, -signum, stderr)
+                    self.assertFalse(prompt_file.exists(), "Signal left private prompt data on disk")
+                    self.assertFalse(prompt_file.parent.exists(), "Signal left call scratch files on disk")
+                finally:
+                    # Reap a failed fixture too, so the regression cannot leave a sleeping agent.
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.communicate(timeout=5)
+
+    def test_muse_doctor_modes(self):
+        # Doctor must exercise both access modes through native file transport.
+        script = "import sys; from pathlib import Path; Path(sys.argv[sys.argv.index('--prompt-file')+1]).read_text(); print('OK')"
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self.run_cli(
+                ["doctor", "--live", "--agent", "muse", "--strict", "--json"],
+                env=self._fake_muse(tmp, script),
+            )
+
+        self.assertEqual(code, 0, stderr)
+        rows = json.loads(stdout)
+        self.assertEqual([row["mode"] for row in rows], ["read-only", "full-access"])
+        self.assertTrue(all(row["ok"] for row in rows))
+
+    def test_muse_native_skill_roots(self):
+        # Muse-native skills must resolve in both default and XDG config homes.
+        for location in ("default", "xdg"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as tmp:
+                config_home = Path(tmp) / "custom-config" if location == "xdg" else None
+                env = self._home_env(tmp, config_home)
+                root = config_home or Path(env["HOME"]) / ".config"
+                skill = root / "muse/skills/muse-only/SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text("MUSE_NATIVE_GUIDANCE", encoding="utf-8")
+                code, stdout, stderr = self.run_cli(
+                    ["ask", "echo", "--skill", "muse-only", "--json", "Inspect it."],
+                    env={**env, "YOYO_AGENT_ECHO": "cat"},
+                )
+
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("MUSE_NATIVE_GUIDANCE", json.loads(stdout)["stdout"])
+
+    def test_muse_skill_install(self):
+        # A native installed copy survives Muse's foreign-root discovery being disabled.
+        for location in ("default", "xdg"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as tmp:
+                config_home = Path(tmp) / "custom-config" if location == "xdg" else None
+                env = self._home_env(tmp, config_home)
+                code, _, stderr = self.run_cli(["install-skill"], env=env)
+
+                self.assertEqual(code, 0, stderr)
+                root = config_home or Path(env["HOME"]) / ".config"
+                target = root / "muse/skills/yoyo/SKILL.md"
+                self.assertTrue(target.exists())
+                self.assertEqual(target.read_bytes(), (ROOT / "skills/yoyo/SKILL.md").read_bytes())
+
+    def test_muse_documented(self):
+        # Installed callers need target discovery and a runnable native polling recipe.
+        for path in ("README.md", "docs/REFERENCE.md", "skills/yoyo/SKILL.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("| `muse` |", text)
+
+        skill = (ROOT / "skills/yoyo/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Muse", skill.split("---")[1])
+        self.assertIn("yoyo ask muse", skill)
+
+
 class SkillGuardTests(CliTestCase):
     """The SKILL.md files are yoyo's interface to calling agents.
 
@@ -4213,6 +4731,40 @@ class SkillGuardTests(CliTestCase):
         text = self.SKILL_PATH.read_text(encoding="utf-8")
         missing = [why for why, anchor in self.LOAD_BEARING_ANCHORS.items() if anchor not in text]
         self.assertEqual(missing, [], f"SKILL.md lost load-bearing content: {missing}")
+
+    def test_muse_yolo_guidance(self):
+        # Teach the opt-in and its limits together so a sandbox denial cannot grant authority.
+        heading = "### Muse YOLO (explicit opt-in)"
+        text = self.SKILL_PATH.read_text(encoding="utf-8")
+        self.assertIn(heading, text)
+        guidance = text.split(heading, 1)[1].split("\n## ", 1)[0]
+        anchors = (
+            "--agent-arg=--yolo",
+            "explicit user approval",
+            "already-isolated environment",
+            "without `--read-only`",
+            "disables approvals and the sandbox",
+            "muse --yolo",
+            "outer caller's sandbox",
+            "Never enable YOLO automatically",
+            "persist",
+            "Verify child results and artifacts",
+        )
+        for anchor in anchors:
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, guidance)
+
+        # Validate the documented worker flags without launching an unsandboxed agent.
+        code, stdout, stderr = self.run_cli([
+            "ask", "muse", "--role", "worker", "--agent-arg=--yolo",
+            "--cwd", str(ROOT), "--background", "--dry-run", "--json", "Do the approved task.",
+        ])
+
+        self.assertEqual(code, 0, stderr)
+        command = json.loads(stdout)["command"]
+        self.assertIn("--yolo", command)
+        self.assertNotIn("--disable-write", command)
+        self.assertNotIn("--disable-shell", command)
 
     def test_bundled_skill_descriptions_have_no_plain_scalar_colon_space(self):
         # Narrow regression guard (no YAML parser in the stdlib): harnesses

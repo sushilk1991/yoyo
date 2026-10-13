@@ -30,7 +30,9 @@ yoyo doesn't grade or constrain agent output — you (or your agent) stay the or
 git clone https://github.com/sushilk1991/yoyo.git && cd yoyo && ./install.sh
 ```
 
-Installs `~/.local/bin/yoyo` plus skills that teach Claude Code, Codex, Pi, OpenCode, Antigravity (AGY), and Grok how to use it. Requires Python 3.9+ and at least one supported agent CLI (`codex`, `claude`, `pi`, `cursor-agent`, `agy`, or `grok`) on PATH. Update later with `yoyo update`, which reinstalls the CLI and re-syncs those skills into every agent home; `yoyo doctor` reports any copy that drifted from the bundle or was left behind by a rename.
+Installs `~/.local/bin/yoyo` plus caller skills for Claude Code, Codex, Cursor, Antigravity, Pi, OpenCode, Grok, and Muse Code. Requires Python 3.9+ and at least one supported target CLI (`codex`, `claude`, `pi`, `cursor-agent`, `agy`, `grok`, or `muse`) on PATH, signed in through its native CLI. Antigravity (`agy`) is the only built-in Google target.
+
+Any caller with an allowed shell tool can launch a target using the background/wait recipe below. Restart the caller after installing skills. Update with `yoyo update`; repair caller skills with `yoyo install-skill`, including from the installed binary. `yoyo doctor` reports missing guidance, stale copies, and directories left behind by a rename.
 
 ## Run it in the background
 
@@ -77,8 +79,9 @@ yoyo imagegen "Hand-drawn architecture diagram, four boxes, bold arrows" --out a
 | `claude` | Anthropic | Default worker for scoped edits |
 | `pi` | Pi | Cheap, fast, small scoped tasks |
 | `cursor` | Cursor | On-demand worker on a different model family |
-| `agy` | Google | On-demand: Gemini-family tiebreaker; `--read-only` is its plan mode with writes auto-denied |
+| `agy` | Google | Antigravity CLI; reuses its native Google login; `--read-only` is its plan mode with writes auto-denied |
 | `grok` | xAI | On-demand: fourth vendor for adversarial cross-checks; `--read-only` is a read-tools-only allowlist |
+| `muse` | Meta | Muse Code; unattended sandboxed workers, file-read/search-only reviews |
 
 Custom agents are a JSON entry away. Check everything works with `yoyo doctor --live`.
 

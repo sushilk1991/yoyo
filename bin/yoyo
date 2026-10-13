@@ -8,6 +8,7 @@ import atexit
 import errno
 import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -24,10 +25,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
-VERSION = "0.28.0"
+VERSION = "0.29.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -188,6 +189,15 @@ AGY_PRINT_TIMEOUT_MARGIN_SECONDS = 60
 GROK_READ_ONLY_TOOLS = "read_file,grep,list_dir"
 GROK_READ_ONLY_DISALLOWED_TOOLS = "search_tool,use_tool,Agent"
 
+# Claude's built-in allowlist does not cover MCP; deny every configured MCP tool.
+_CLAUDE_READ_ONLY_TOOLS = "Read,Grep,Glob,LS"
+_CLAUDE_READ_ONLY_DENIED = "mcp__*"
+
+# Muse requires a regular prompt file; the per-call driver replaces this path.
+_MUSE_PROMPT_FILE = "\x00YOYO_MUSE_PROMPT_FILE\x00"
+
+# File reads/search are the only review tools; MCP and subagents are excluded.
+_MUSE_READ_ONLY_TOOLS = ("read_file", "search")
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
@@ -210,6 +220,8 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "cursor": AgentSpec("cursor", ["cursor-agent", "-p", "--output-format", "stream-json"], flavor="cursor"),
     "agy": AgentSpec("agy", ["agy"], flavor="agy", buffers_output=True),
     "grok": AgentSpec("grok", ["grok", "--prompt-file", "/dev/stdin", "--output-format", "plain"], flavor="grok"),
+    # Native text answers can stay quiet across tool/model steps after startup logs.
+    "muse": AgentSpec("muse", ["muse", "exec"], flavor="muse", buffers_output=True),
 }
 
 
@@ -259,6 +271,37 @@ def _kill_active_children(sig: int) -> None:
             pass
 
 
+# call -> registered scratch directory -> normal cleanup; signal -> explicit cleanup.
+_ACTIVE_CALL_TEMPS: set[Path] = set()
+_CALL_TEMPS_LOCK = threading.RLock()
+
+
+@contextmanager
+def _agent_temp_dir() -> Iterator[Path]:
+    # Keep scratch registered until normal teardown finishes, including early returns.
+    directory = tempfile.TemporaryDirectory(prefix="yoyo-")
+    path = Path(directory.name)
+    with _CALL_TEMPS_LOCK:
+        _ACTIVE_CALL_TEMPS.add(path)
+
+    try:
+        with directory:
+            yield path
+    finally:
+        with _CALL_TEMPS_LOCK:
+            _ACTIVE_CALL_TEMPS.discard(path)
+
+
+def _clear_call_temps() -> None:
+    # Self-signalling bypasses context teardown; erase scratch while retaining journals.
+    with _CALL_TEMPS_LOCK:
+        paths = list(_ACTIVE_CALL_TEMPS)
+        _ACTIVE_CALL_TEMPS.clear()
+
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
@@ -272,6 +315,7 @@ def _install_signal_handlers() -> None:
     def handler(signum: int, _frame: Any) -> None:
         _flush_active_journals(signum)
         _kill_active_children(signal.SIGKILL)
+        _clear_call_temps()
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -794,6 +838,22 @@ def bundled_skill_roots() -> list[Path]:
     return roots
 
 
+# Native-only homes supplement shared roots without replacing existing precedence.
+_AGY_SKILLS_DIR = "~/.gemini/antigravity-cli/skills"
+_NATIVE_SKILL_DIRS = ("~/.cursor/skills", _AGY_SKILLS_DIR)
+
+
+def _muse_skill_root() -> Path:
+    # Muse's own home remains usable when foreign personal skill roots are disabled.
+    config = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(config).expanduser() / "muse" / "skills"
+
+
+def _native_skill_roots() -> list[Path]:
+    """Expand native homes for both prompt injection and installed-copy checks."""
+    return [Path(root).expanduser() for root in _NATIVE_SKILL_DIRS] + [_muse_skill_root()]
+
+
 def skill_search_roots() -> list[Path]:
     roots: list[Path] = []
     raw = os.environ.get("YOYO_SKILL_PATH")
@@ -810,6 +870,7 @@ def skill_search_roots() -> list[Path]:
             Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser() / "skills",
         ]
     )
+    roots.extend(_native_skill_roots())
     roots.extend(bundled_skill_roots())
     ordered: list[Path] = []
     seen: set[Path] = set()
@@ -980,6 +1041,26 @@ def format_go_duration(seconds: float) -> str:
     return f"{value}s"
 
 
+def _muse_args(args: argparse.Namespace) -> list[str]:
+    # One-shot runs retain native authentication and avoid a second session ledger.
+    flags = ["--workspace", str(resolve_cwd(args.cwd)), "--prompt-file", _MUSE_PROMPT_FILE, "--no-session-log"]
+
+    # Restrict the advertised tools as well as workspace writes/shell; no MCP bypass.
+    if args.read_only:
+        toolset = json.dumps(_MUSE_READ_ONLY_TOOLS, separators=(",", ":"))
+        return flags + ["--disable-write", "--disable-shell", "-c", f"run.toolset={toolset}"]
+
+    # Unattended workers load project guidance but keep Muse's default sandbox.
+    return flags + ["--trust-workspace", "--disable-approval"]
+
+
+def _muse_prompt_cmd(cmd: list[str], prompt: str, tmpdir: Path) -> list[str]:
+    # Rendered prompt -> private regular file -> Muse; no argv-size or stdin ambiguity.
+    path = tmpdir / "muse-prompt.txt"
+    path.write_text(prompt, encoding="utf-8")
+    return [str(path) if part == _MUSE_PROMPT_FILE else part for part in cmd]
+
+
 def command_for_agent(
     spec: AgentSpec,
     args: argparse.Namespace,
@@ -1030,7 +1111,8 @@ def command_for_agent(
             else:
                 cmd.extend(["--session-id", str(session_backend_id)])
         if args.read_only:
-            cmd.extend(["--tools", "Read,Grep,Glob,LS"])
+            # Restrict built-ins and MCP separately; --tools leaves MCP untouched.
+            cmd.extend(["--tools", _CLAUDE_READ_ONLY_TOOLS, "--disallowedTools", _CLAUDE_READ_ONLY_DENIED])
         else:
             cmd.extend(["--permission-mode", "bypassPermissions"])
     elif spec.flavor == "pi":
@@ -1075,6 +1157,8 @@ def command_for_agent(
             cmd.extend(["--mode", "plan", "--sandbox"])
         else:
             cmd.append("--dangerously-skip-permissions")
+    elif spec.flavor == "muse":
+        cmd.extend(_muse_args(args))
     elif spec.flavor == "grok":
         if args.read_only:
             # Measured on grok 1.0.13: `--permission-mode plan` blocks writes
@@ -1103,7 +1187,7 @@ def command_for_agent(
         else:
             cmd.extend(spec.full_access_args or [])
 
-    if spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok") and args.model:
+    if spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok", "muse") and args.model:
         cmd.extend(["--model", args.model])
     cmd.extend(args.agent_arg or [])
     if spec.flavor == "codex":
@@ -2375,8 +2459,7 @@ def execute_agent_call(
     cwd = resolve_cwd(args.cwd)
     prepare_session(args, agents[agent_name])
     codex_output_file: str | None = None
-    with tempfile.TemporaryDirectory(prefix="yoyo-") as tmp:
-        tmpdir = Path(tmp)
+    with _agent_temp_dir() as tmpdir:
         if agents[agent_name].flavor == "codex" and not args.dry_run:
             codex_output_file = str(tmpdir / "codex-last-message.txt")
 
@@ -2386,6 +2469,11 @@ def execute_agent_call(
             # agy carries the prompt as the -p value, not on stdin.
             cmd = [prompt if part == AGY_PROMPT_SENTINEL else part for part in cmd]
             feed = ""
+        if agents[agent_name].flavor == "muse":
+            # The enclosing temporary directory also cleans up failures and timeouts.
+            cmd = _muse_prompt_cmd(cmd, prompt, tmpdir)
+            feed = ""
+
         if args.dry_run:
             result = {"agent": agent_name, "command": cmd, "prompt": prompt, "trace_id": args.trace_id, "exit_code": 0}
             session = result_session(args)
@@ -2448,8 +2536,8 @@ def execute_agent_call(
                     "more than the OS allows in argv; trim --file attachments or the piped context, "
                     "or use an agent that reads the prompt from stdin (codex, claude, pi, grok)"
                 ) from exc
-            # Any other flavor reads the prompt from stdin, so an oversized
-            # argv here came from the command itself (--agent-arg, a config).
+            # Other flavors keep prompts out of argv, using stdin or a file;
+            # an oversized argv came from the command itself (--agent-arg, a config).
             finish_journal(126, error="command line exceeds the OS argv limit")
             raise YoyoError(
                 f"could not start {agent_name}: the command line is longer than the OS allows in argv "
@@ -5057,7 +5145,7 @@ def doctor_agent_names(agents: dict[str, AgentSpec], requested: list[str] | None
 
 
 def doctor_supports_read_only(spec: AgentSpec) -> bool:
-    return spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok") or bool(spec.read_only_args)
+    return spec.flavor in ("codex", "claude", "pi", "cursor", "agy", "grok", "muse") or bool(spec.read_only_args)
 
 
 def doctor_probe_args(agent: str, cwd: Path, timeout: float, read_only: bool) -> argparse.Namespace:
@@ -5107,6 +5195,8 @@ def doctor_skipped_result(name: str) -> dict[str, Any]:
     }
 
 
+# Keep provider diagnostics bounded even when quota failures arrive on stdout.
+_DOCTOR_ERROR_CHARS = 500
 DOCTOR_PROBE_FILE = "yoyo-doctor-probe.txt"
 DOCTOR_READ_ONLY_PROBE_PROMPT = (
     f"If you are able to, create a file named {DOCTOR_PROBE_FILE} containing OK in the current directory. "
@@ -5145,7 +5235,8 @@ def doctor_run_probe(
     if wrote:
         snippet = f"read-only not enforced: the agent created {DOCTOR_PROBE_FILE} in the probe directory"
     else:
-        snippet = "" if ok else stderr[-500:]
+        diagnosis = stderr.strip() or stdout.strip()
+        snippet = "" if ok else diagnosis[-_DOCTOR_ERROR_CHARS:]
     row = {
         "agent": name,
         "mode": mode,
@@ -5242,6 +5333,9 @@ YOYO_SKILL_PREFIX = "yoyo"
 # it is a delegate-only harness and has no business in the caller's skill list.
 INBUILT_SKILL_NAME = "yoyo-fable-mode"
 
+# Installer and doctor share dependency gates so intentionally skipped skills stay valid.
+_SKILL_REQUIREMENTS = {"yoyo-imagegen": "codex"}
+
 
 def is_yoyo_skill_name(name: str) -> bool:
     """Whether a skill directory belongs to yoyo's own namespace.
@@ -5325,8 +5419,27 @@ def skill_target_roots() -> list[Path]:
         Path("~/.agents/skills").expanduser(),
         Path("~/.config/opencode/skills").expanduser(),
         Path("~/.gemini/config/skills").expanduser(),
+        Path(_AGY_SKILLS_DIR).expanduser(),
         Path("~/.grok/skills").expanduser(),
+        _muse_skill_root(),
     ]
+
+
+def _skill_sync_roots() -> list[Path]:
+    # Watch native overrides as well as installed bundles; either can guide a caller.
+    return list(dict.fromkeys(skill_target_roots() + _native_skill_roots()))
+
+
+def _skill_install_roots(name: str) -> list[Path]:
+    # Shared copies cover new callers; existing native overrides also need repair.
+    roots = skill_target_roots()
+
+    for root in _native_skill_roots():
+        if root in roots or not (root / name).is_dir():
+            continue
+        roots.append(root)
+
+    return roots
 
 
 def agent_skill_homes() -> list[Path]:
@@ -5334,7 +5447,7 @@ def agent_skill_homes() -> list[Path]:
     plus pi's own skills dir, where older releases installed and where a
     leftover copy still collides with the shared one. When pi's dir aliases
     an install target there is no second home to watch."""
-    targets = skill_target_roots()
+    targets = _skill_sync_roots()
     pi_dir = pi_agent_skills_dir()
     return targets if pi_dir_aliases_install_target(pi_dir) else targets + [pi_dir]
 
@@ -5409,7 +5522,7 @@ def doctor_check_skill_sync() -> int:
             continue
         stale: list[Path] = []
         installed = 0
-        for root in skill_target_roots():
+        for root in _skill_sync_roots():
             target = root / skill_dir.name / "SKILL.md"
             if not target.exists():
                 continue
@@ -5429,6 +5542,16 @@ def doctor_check_skill_sync() -> int:
                 f"skill {skill_dir.name}: LEGACY at {legacy} "
                 f"(pi loads ~/.agents/skills; a copy here collides with it) ({hint})"
             )
+        # A shared or native copy suffices; zero copies leave callers without guidance.
+        if not installed and not has_legacy:
+            required = _SKILL_REQUIREMENTS.get(skill_dir.name)
+            if required and not shutil.which(required):
+                print(f"skill {skill_dir.name}: skipped (requires {required} on PATH)")
+                continue
+            drifted += 1
+            print(f"skill {skill_dir.name}: MISSING from agent homes (run: yoyo install-skill)")
+            continue
+
         if stale:
             drifted += len(stale)
             for target in stale:
@@ -5439,13 +5562,11 @@ def doctor_check_skill_sync() -> int:
 
 
 def install_skill(args: argparse.Namespace) -> int:
-    source_env = os.environ.get("YOYO_SKILL_SOURCE")
-    if source_env:
-        source = Path(source_env).expanduser()
-    else:
-        source = Path(__file__).resolve().parents[1] / "skills"
-    if not source.exists():
-        raise YoyoError(f"Bundled skill not found: {source}")
+    # Installed CLI -> recorded checkout -> bundle, matching doctor's source lookup.
+    source = bundled_skills_source()
+    if source is None:
+        expected = os.environ.get("YOYO_SKILL_SOURCE") or str(Path(__file__).resolve().parents[1] / "skills")
+        raise YoyoError(f"Bundled skill not found: {expected}; run ./install.sh from the checkout or set YOYO_SKILL_SOURCE")
 
     if (source / "SKILL.md").exists():
         skill_sources = [source]
@@ -5457,7 +5578,6 @@ def install_skill(args: argparse.Namespace) -> int:
 
     # Some bundled skills only make sense when the agent that powers them is
     # actually installed.
-    skill_requirements = {"yoyo-imagegen": "codex"}
     kept: list[Path] = []
     for skill_source in skill_sources:
         if skill_source.name == INBUILT_SKILL_NAME:
@@ -5466,19 +5586,26 @@ def install_skill(args: argparse.Namespace) -> int:
             # caller's own skill list.
             print(f"skipped skill: {skill_source.name} (inbuilt; resolved from the yoyo bundle)")
             continue
-        required = skill_requirements.get(skill_source.name)
+        required = _SKILL_REQUIREMENTS.get(skill_source.name)
         if required and not shutil.which(required):
             print(f"skipped skill: {skill_source.name} (requires {required} on PATH)")
             continue
         kept.append(skill_source)
     skill_sources = kept
 
-    target_roots = skill_target_roots()
     for skill_source in skill_sources:
-        for target_root in target_roots:
+        for target_root in _skill_install_roots(skill_source.name):
             target = target_root / skill_source.name
+            # A linked native root or skill may already be the source; keep it intact.
+            if target.resolve() == skill_source.resolve():
+                print(f"installed skill: {target} (already points to bundle)")
+                continue
+
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
+            # Replace a link itself; never delete or modify its external target.
+            if target.is_symlink():
+                target.unlink()
+            elif target.exists():
                 shutil.rmtree(target)
             shutil.copytree(skill_source, target, dirs_exist_ok=True)
             print(f"installed skill: {target}")
