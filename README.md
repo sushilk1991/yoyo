@@ -70,7 +70,7 @@ yoyo loop claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --backgrou
 # Shared thread: invite several vendors into one conversation you own. Each ask is
 # one turn; the member gets the fenced history; nothing an agent writes starts a turn.
 yoyo thread create design --agents codex,claude --cwd "$PWD"
-yoyo thread watch design --pane      # follow it live in a tmux or Herdr pane
+yoyo thread watch design --pane      # follow it live in a tmux, Herdr, or Herdr desktop pane
 yoyo ask codex  --thread design "Propose the migration."
 yoyo ask claude --thread design "Find the strongest flaw in codex's plan."
 yoyo thread invite design grok && yoyo ask grok --thread design "Break the tie."

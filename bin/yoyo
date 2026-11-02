@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import errno
 import fcntl
 import hashlib
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-VERSION = "0.31.1"
+VERSION = "0.32.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -6177,6 +6178,21 @@ def herdr_notify(title: str, body: str) -> None:
         pass
 
 
+def program_status_report(state: str, *, app: str, title: str = "", msg: str = "") -> str:
+    """One OSC 7501 Program Status report: ESC ] 7501 ; key=value:... ESC \\.
+
+    title and msg travel base64-encoded, so their text cannot break the
+    framing. Herdr desktop (herdr-core) reads these: `working` marks the
+    terminal busy; `done` means a result the person has not seen yet, which
+    the app announces with a sound and a toast when they are not looking.
+    """
+    pairs = [f"state={state}", f"app={app}"]
+    for key, text in (("title", title), ("msg", msg)):
+        if text:
+            pairs.append(f"{key}={base64.b64encode(_clip(text).encode('utf-8')).decode('ascii')}")
+    return "\x1b]7501;" + ":".join(pairs) + "\x1b\\"
+
+
 class _ThreadWatchPrinter:
     """Render watch events as a readable transcript, one-line events, or JSONL."""
 
@@ -6190,6 +6206,19 @@ class _ThreadWatchPrinter:
         # an imported export. JSON already escapes C0 controls; this strips
         # the C1 and bidi characters it leaves alone.
         print(terminal_safe(text), flush=True)
+
+    def _program_status(self, state: str, msg: str) -> None:
+        # Only a person's view inside Herdr desktop gets the report: events
+        # and JSON lines go to a program, and a pipe or file is not the pane.
+        if not (self.notify and self.mode == "view" and os.environ.get("HC_TERMINAL_ID")):
+            return
+        try:
+            if not sys.stdout.isatty():
+                return
+            sys.stdout.write(program_status_report(state, app="yoyo", title=f"yoyo thread {self.name}", msg=msg))
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
 
     def _event(self, event: str, text: str, **fields: Any) -> None:
         if self.mode == "json":
@@ -6238,7 +6267,9 @@ class _ThreadWatchPrinter:
         self._out(terminal_safe(str(turn.get("question") or "").strip() or "(prompt given on stdin or in files)"))
         if status == "running" and turn.get("buffers_output") and turn.get("flavor") != "codex":
             self._out(f"  ({agent} sends its answer when it finishes)")
-        if status != "running":
+        if status == "running":
+            self._program_status("working", f"turn {tid}: {agent} working")
+        else:
             self.turn_finished(turn, status, live=live)
 
     def activity(self, lines: list[str]) -> None:
@@ -6264,6 +6295,8 @@ class _ThreadWatchPrinter:
                         turn=tid, agent=agent, status=status, duration_s=turn.get("duration_s"))
         if live and self.notify:
             herdr_notify(f"yoyo thread {self.name}", f"turn {tid}: {agent} {status}")
+            # A failed turn is still news the person has not seen: `done`, with the status in the message.
+            self._program_status("done", f"turn {tid}: {agent} {status}")
 
 
 def thread_watch(args: argparse.Namespace) -> int:
@@ -6341,11 +6374,15 @@ def thread_watch(args: argparse.Namespace) -> int:
         time.sleep(poll)
 
 
-def thread_watch_command(args: argparse.Namespace, name: str, *, notify: bool) -> list[str]:
-    """The command a new pane runs: this same yoyo, the same state dir."""
+def thread_watch_command(args: argparse.Namespace, name: str, *, notify: bool, absolute: bool = False) -> list[str]:
+    """The command a new pane runs: this same yoyo, the same state dir.
+
+    absolute: every program by full path, for a pane that runs argv directly
+    instead of through the person's login shell and PATH.
+    """
     script = Path(__file__).resolve()
     installed = shutil.which("yoyo")
-    if installed and Path(installed).resolve() == script:
+    if not absolute and installed and Path(installed).resolve() == script:
         command = ["yoyo"]
     else:
         command = [sys.executable, str(script)]
@@ -6358,7 +6395,8 @@ def thread_watch_command(args: argparse.Namespace, name: str, *, notify: bool) -
         command.append("--notify")
     if os.environ.get("YOYO_STATE_DIR"):
         # A pane starts from the multiplexer's environment, not ours.
-        command = ["env", f"YOYO_STATE_DIR={state_dir().resolve()}", *command]
+        env = (shutil.which("env") or "/usr/bin/env") if absolute else "env"
+        command = [env, f"YOYO_STATE_DIR={state_dir().resolve()}", *command]
     return command
 
 
@@ -6421,12 +6459,41 @@ def _herdr_pane_size(herdr: str, pane_id: str) -> tuple[int, int] | None:
         return None
 
 
+def _desktop_pane_of(app: str, terminal: str) -> str | None:
+    """The Herdr desktop pane showing herdr-core terminal `terminal`, if any.
+
+    `HC_TERMINAL_ID` names a terminal, not a pane; `herdr-app ls` maps one to
+    the other. A background `hc` terminal has no pane.
+    """
+    try:
+        for space in json.loads(_pane_probe([app, "ls"]))["spaces"]:
+            for tab in space.get("tabs") or []:
+                for term in tab.get("terminals") or []:
+                    if term.get("terminal") == terminal and term.get("pane"):
+                        return str(term["pane"])
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return None
+
+
+def _hc_terminal_size(terminal: str) -> tuple[int, int] | None:
+    hc = shutil.which("hc")
+    if not hc:
+        return None
+    try:
+        info = json.loads(_pane_probe([hc, "get", terminal, "--json"]))
+        return int(info["cols"]), int(info["rows"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
-    """Open `thread watch` beside the caller: tmux if inside it, else Herdr."""
+    """Open `thread watch` beside the caller: tmux, Herdr, or Herdr desktop."""
     name = args.thread_name
     cwd = str(load_thread_manifest(tdir).get("cwd") or os.getcwd())
     manual = shlex.join(thread_watch_command(args, name, notify=False))
-    # The innermost multiplexer is the one the person is looking at.
+    # The innermost multiplexer is the one the person is looking at. Herdr
+    # desktop is a window, so it is always the outermost and checked last.
     if os.environ.get("TMUX") and shutil.which("tmux"):
         side = "-h" if _split_direction(_tmux_pane_size()) == "right" else "-v"
         out = _pane_step(["tmux", "split-window", side, "-d", "-P", "-F", "#{pane_id}", "-c", cwd, manual],
@@ -6450,7 +6517,26 @@ def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
         _pane_label([herdr, "pane", "rename", pane, f"thread {name}"])
         print(f"opened Herdr pane {pane} following thread {name}")
         return 0
-    eprint("yoyo: no tmux or Herdr pane to open from (TMUX and HERDR_PANE_ID are unset). Run this in another terminal:")
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    app = shutil.which("herdr-app")
+    if terminal and app:
+        caller = _desktop_pane_of(app, terminal)
+        if not caller:
+            eprint(f"yoyo: Herdr desktop shows no pane for terminal {terminal} (a background terminal, or the window is closed). Run this in another terminal:")
+            print(manual)
+            return 1
+        # The app starts argv directly, with herdr-core's environment rather than the
+        # person's login shell, so the command names every program by full path.
+        request = {"direction": _split_direction(_hc_terminal_size(terminal)), "pane": caller,
+                   "argv": thread_watch_command(args, name, notify=True, absolute=True)}
+        out = _pane_step([app, "do", "pane.split", json.dumps(request)], "open a Herdr desktop pane", manual)
+        try:
+            pane = str(json.loads(out)["pane"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise YoyoError(f"could not read the new Herdr desktop pane from: {_first_line(out, 200)}. Run this in another terminal instead: {manual}") from exc
+        print(f"opened Herdr desktop pane {pane} following thread {name}")
+        return 0
+    eprint("yoyo: not inside tmux, Herdr, or Herdr desktop, so there is no pane to open beside. Run this in another terminal:")
     print(manual)
     return 1
 

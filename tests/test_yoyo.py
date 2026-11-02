@@ -1,4 +1,5 @@
 import argparse
+import base64
 import importlib.util
 import importlib.machinery
 import errno
@@ -30,6 +31,11 @@ spec.loader.exec_module(yoyo)
 
 
 NESTING_ENV_KEYS = ("YOYO_DEPTH", "YOYO_MAX_DEPTH", "YOYO_PARENT_TRACE_ID", "YOYO_PARENT_RUN_ID")
+# A suite run inside tmux, Herdr, or Herdr desktop must never reach the
+# person's real panes: `thread watch --pane` acts on these.
+MULTIPLEXER_ENV_KEYS = ("TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH",
+                        "HERDR_SESSION", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET",
+                        "HC_SCOPE")
 
 
 class CliTestCase(unittest.TestCase):
@@ -44,7 +50,7 @@ class CliTestCase(unittest.TestCase):
         env_guard = mock.patch.dict(os.environ)
         env_guard.start()
         self.addCleanup(env_guard.stop)
-        for key in NESTING_ENV_KEYS:
+        for key in NESTING_ENV_KEYS + MULTIPLEXER_ENV_KEYS:
             os.environ.pop(key, None)
 
     def run_cli(self, argv, *, stdin="", env=None):
@@ -73,7 +79,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.31.1")
+        self.assertEqual(stdout.strip(), "yoyo 0.32.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -6990,11 +6996,109 @@ class ThreadTests(CliTestCase):
                 self.assertIn("thread watch t --notify", run[3])
                 self.assertEqual(rename, ["pane", "rename", "p9", "thread t"])
 
+    def desktop_tools(self):
+        # herdr-app shows terminal t9 in pane pB and t4 in pane pA; hc gives t4 the size in FAKE_PANE_SIZE.
+        _, app_log = self.fake_tool("herdr-app", (
+            "if sys.argv[1] == 'ls':\n"
+            "    print(json.dumps({'spaces': [{'id': 's1', 'machine': None, 'tabs': [{'id': 'b1', 'terminals': [\n"
+            "        {'terminal': 't9', 'pane': 'pB'}, {'terminal': 't4', 'pane': 'pA'}]}]}], 'recent': []}))\n"
+            "if sys.argv[1] == 'do': print(json.dumps({'pane': 'pN', 'terminal': 't11'}))\n"))
+        _, hc_log = self.fake_tool("hc", (
+            "import os\n"
+            "size = os.environ.get('FAKE_PANE_SIZE')\n"
+            "if sys.argv[1:3] != ['get', 't4'] or not size: sys.exit(3)\n"
+            "w, h = map(int, size.split())\n"
+            "print(json.dumps({'address': 't4', 'cols': w, 'rows': h}))\n"))
+        return app_log, hc_log, f"{self.root / 'fakebin'}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def test_watch_pane_opens_a_herdr_desktop_split(self):
+        self.create()
+        app_log, hc_log, path = self.desktop_tools()
+        for size, direction in (("132 45", "right"), ("132 70", "down"), ("100 30", "down"), ("", "right")):
+            with self.subTest(size=size):
+                app_log.unlink(missing_ok=True)
+                hc_log.unlink(missing_ok=True)
+                code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], PATH=path, TMUX=None,
+                                                HERDR_PANE_ID=None, HC_TERMINAL_ID="t4", FAKE_PANE_SIZE=size)
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("opened Herdr desktop pane pN following thread t", stdout)
+                ls, do = [json.loads(line) for line in app_log.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(ls, ["ls"])
+                self.assertEqual([json.loads(line) for line in hc_log.read_text(encoding="utf-8").splitlines()],
+                                 [["get", "t4", "--json"]])
+                self.assertEqual(do[:2], ["do", "pane.split"])
+                request = json.loads(do[2])
+                self.assertEqual((request["direction"], request["pane"]), (direction, "pA"))
+                # The app runs argv without a shell or the person's PATH: every program by full path.
+                argv = request["argv"]
+                self.assertTrue(os.path.isabs(argv[0]) and argv[0].endswith("env"), argv)
+                self.assertEqual(argv[1], f"YOYO_STATE_DIR={(self.root / 'state').resolve()}")
+                self.assertEqual(argv[2:4], [sys.executable, str(YOYO_PATH.resolve())])
+                self.assertEqual(argv[4:], ["thread", "watch", "t", "--notify"])
+
+    def test_watch_pane_in_a_desktop_terminal_with_no_pane_prints_the_command(self):
+        self.create()
+        app_log, _, path = self.desktop_tools()
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], PATH=path, TMUX=None,
+                                        HERDR_PANE_ID=None, HC_TERMINAL_ID="t7")
+        self.assertEqual(code, 1)
+        self.assertIn("Herdr desktop shows no pane for terminal t7", stderr)
+        self.assertIn("thread watch t", stdout)
+        self.assertEqual([json.loads(line) for line in app_log.read_text(encoding="utf-8").splitlines()], [["ls"]])
+
+    def test_watch_pane_prefers_herdr_started_inside_herdr_desktop(self):
+        # A Herdr session launched from a desktop terminal passes HC_TERMINAL_ID to its panes;
+        # the Herdr pane is the inner one, where the person is looking.
+        self.create()
+        app_log, _, path = self.desktop_tools()
+        herdr, _ = self.fake_tool(
+            "herdr", "print(json.dumps({'result': {'pane': {'pane_id': 'p9'}}})) if sys.argv[1:3] == ['pane', 'split'] else None\n")
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], PATH=path, TMUX=None, HERDR_PANE_ID="p1",
+                                        HERDR_BIN_PATH=str(herdr), HC_TERMINAL_ID="t4")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("opened Herdr pane p9 following thread t", stdout)
+        self.assertFalse(app_log.exists())
+
+    def test_watch_reports_program_status_inside_herdr_desktop(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        def b64(text):
+            return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+        def report(state, msg):
+            return f"\x1b]7501;state={state}:app=yoyo:title={b64('yoyo thread t')}:msg={b64(msg)}\x1b\\"
+
+        self.assertEqual(yoyo.program_status_report("done", app="yoyo", title="yoyo thread t", msg="turn 3: codex answered"),
+                         report("done", "turn 3: codex answered"))
+        running = {"id": 3, "kind": "ask", "agent": "codex", "caller": "c", "question": "Which fix?", "status": "running"}
+        answered = {**running, "status": "answered", "answer": "Fix A.", "duration_s": 12}
+        for label, env, options, stream in (
+            ("desktop view", {"HC_TERMINAL_ID": "t4"}, {}, Tty),
+            ("outside desktop", {}, {}, Tty),
+            ("events for a program", {"HC_TERMINAL_ID": "t4"}, {"events": True}, Tty),
+            ("piped", {"HC_TERMINAL_ID": "t4"}, {}, io.StringIO),
+            ("without --notify", {"HC_TERMINAL_ID": "t4"}, {"notify": False}, Tty),
+        ):
+            with self.subTest(label), mock.patch.dict(os.environ, env), mock.patch("sys.stdout", stream()) as out:
+                printer = yoyo._ThreadWatchPrinter("t", **{"events": False, "as_json": False, "notify": True, **options})
+                printer.turn_seen(running, "running", live=True)
+                printer.turn_finished(answered, "answered", live=True)
+                text = out.getvalue()
+                if label == "desktop view":
+                    working, done = report("working", "turn 3: codex working"), report("done", "turn 3: codex answered")
+                    self.assertIn(working, text)
+                    self.assertIn(done, text)
+                    self.assertLess(text.index(working), text.index(done))
+                else:
+                    self.assertNotIn("7501", text)
+
     def test_watch_pane_without_a_multiplexer_prints_the_command(self):
         self.create()
         code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX=None, HERDR_PANE_ID=None)
         self.assertEqual(code, 1)
-        self.assertIn("no tmux or Herdr pane", stderr)
+        self.assertIn("not inside tmux, Herdr, or Herdr desktop", stderr)
         self.assertIn("thread watch t", stdout)
 
     def test_watch_flag_misuse_fails_loudly(self):
