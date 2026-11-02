@@ -79,7 +79,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.32.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.33.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -5065,11 +5065,12 @@ class AutopsyTests(CliTestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("completed successfully", stdout)
 
-    def test_autopsy_explains_hard_killed_claude_call(self):
-        # The exact scenario that caused repeated misdiagnosis: a caller's
-        # exec-tool timeout SIGKILLs yoyo mid-claude-call; claude had written
-        # nothing to stdout (it buffers); the caller concludes "timed out,
-        # no output". The autopsy must say what actually happened.
+    def test_autopsy_explains_hard_killed_buffering_call(self):
+        # The exact scenario that caused repeated misdiagnosis (with claude,
+        # before yoyo moved it to stream-json): a caller's exec-tool timeout
+        # SIGKILLs yoyo mid-call; a buffering agent (pi) has written nothing
+        # to stdout; the caller concludes "timed out, no output". The autopsy
+        # must say what actually happened.
         with tempfile.TemporaryDirectory() as tmp:
             self._make_run(
                 tmp,
@@ -5077,7 +5078,7 @@ class AutopsyTests(CliTestCase):
                 {
                     "run_id": "20260711T120000-deadbeef",
                     "mode": "call",
-                    "agent": "claude",
+                    "agent": "pi",
                     "pid": 99999999,
                     "started_at": "2026-07-11T12:00:00Z",
                 },
@@ -5290,13 +5291,12 @@ class BufferedAgentGuardTests(CliTestCase):
     """--idle-timeout is not a hang guard for agents that buffer their output."""
 
     def test_buffering_agents_are_marked(self):
-        # Measured first-byte behavior: claude emits a little stderr then goes
-        # silent for the whole run, and pi emits nothing until it exits. codex,
-        # grok and cursor stream, so their silence really is a stall. cursor
-        # only qualifies on stream-json — its text mode buffers to exit, which
-        # is why the spec no longer asks for text.
+        # Measured first-byte behavior: pi emits nothing until it exits. codex,
+        # grok, cursor and claude stream, so their silence really is a stall.
+        # cursor and claude only qualify on stream-json — their text modes
+        # buffer to exit, which is why yoyo never asks them for text.
         agents = yoyo.DEFAULT_AGENTS
-        self.assertTrue(agents["claude"].buffers_output)
+        self.assertFalse(agents["claude"].buffers_output)
         self.assertTrue(agents["pi"].buffers_output)
         self.assertTrue(agents["agy"].buffers_output)
         self.assertFalse(agents["codex"].buffers_output)
@@ -5305,9 +5305,9 @@ class BufferedAgentGuardTests(CliTestCase):
         self.assertIn("stream-json", agents["cursor"].command)
 
     def test_warning_names_the_agent_and_the_flag_that_works(self):
-        warning = yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], 180.0)
+        warning = yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["pi"], 180.0)
         self.assertIsNotNone(warning)
-        self.assertIn("claude", warning)
+        self.assertIn("pi", warning)
         self.assertIn("180", warning)
         self.assertIn("--timeout", warning)
 
@@ -5315,7 +5315,7 @@ class BufferedAgentGuardTests(CliTestCase):
         self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["codex"], 180.0))
 
     def test_no_idle_timeout_means_no_warning(self):
-        self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["claude"], None))
+        self.assertIsNone(yoyo.idle_timeout_warning(yoyo.DEFAULT_AGENTS["pi"], None))
 
 
 class CursorStreamDecodeTests(CliTestCase):
@@ -5379,11 +5379,167 @@ class CursorStreamDecodeTests(CliTestCase):
         self.assertEqual(note, "")
 
     def test_other_flavors_are_untouched(self):
-        for name in ("codex", "claude", "pi", "grok"):
+        for name in ("codex", "pi", "grok", "agy", "muse"):
             raw = '{"type":"result","result":"not cursor"}\n'
             answer, note = yoyo.decode_agent_stdout(yoyo.DEFAULT_AGENTS[name], raw)
             self.assertEqual(answer, raw, name)
             self.assertEqual(note, "", name)
+
+
+class ClaudeStreamDecodeTests(CliTestCase):
+    """claude runs on stream-json; its answer is the result event, read from the whole capture."""
+
+    @staticmethod
+    def _line(event: dict) -> str:
+        return json.dumps(event) + "\n"
+
+    def _assistant(self, *blocks) -> str:
+        return self._line({"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}})
+
+    def _stream(self, *events: str) -> str:
+        # The shape measured on claude 2.1.316: hook and init events first,
+        # then one event per message or tool call, then the result.
+        return (self._line({"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"})
+                + self._line({"type": "system", "subtype": "init", "model": "claude-opus-5-5"})
+                + "".join(events))
+
+    def decode(self, raw):
+        return yoyo.decode_agent_stdout(yoyo.DEFAULT_AGENTS["claude"], raw)
+
+    def test_claude_is_asked_for_stream_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_CONFIG": str(Path(tmp) / "missing.json")}
+            code, stdout, stderr = self.run_cli(["ask", "claude", "--dry-run", "--json", "hello"], env=env)
+        self.assertEqual(code, 0, stderr)
+        command = json.loads(stdout)["command"]
+        at = command.index("--output-format")
+        self.assertEqual(command[at:at + 3], ["--output-format", "stream-json", "--verbose"])
+
+    def test_result_event_is_the_answer(self):
+        raw = self._stream(
+            self._assistant({"type": "tool_use", "name": "Glob", "input": {"pattern": "*.py"}}),
+            self._line({"type": "user", "message": {"content": [{"type": "tool_result", "content": "a.py\nb.py"}]}}),
+            self._assistant({"type": "text", "text": "Two files."}),
+            self._line({"type": "result", "subtype": "success", "is_error": False, "result": "Two files."}),
+        )
+        self.assertEqual(self.decode(raw), ("Two files.", ""))
+
+    def test_an_error_result_keeps_the_message_text_mode_printed(self):
+        # Measured: a bad --model exits 1 in both modes, and the result event
+        # carries the sentence text mode wrote to stdout.
+        message = "There's an issue with the selected model (nope). It may not exist or you may not have access to it."
+        raw = self._stream(self._assistant({"type": "text", "text": message}),
+                           self._line({"type": "result", "subtype": "success", "is_error": True, "result": message}))
+        self.assertEqual(self.decode(raw), (message, ""))
+
+    def test_a_killed_run_keeps_the_messages_it_wrote(self):
+        raw = self._stream(
+            self._assistant({"type": "text", "text": "Checking the parser."}),
+            self._assistant({"type": "tool_use", "name": "Read", "input": {"file_path": "/r/a.py"}}),
+            self._assistant({"type": "thinking", "thinking": ""}, {"type": "text", "text": "Found it: a.py:3."}),
+        )
+        answer, note = self.decode(raw)
+        self.assertEqual(answer, "Checking the parser.\n\nFound it: a.py:3.")
+        self.assertIn("claude stream ended without a result event", note)
+        self.assertIn("2 assistant messages", note)
+
+    def test_plain_text_passes_through_even_with_a_json_line(self):
+        # `--agent-arg --output-format text` puts claude back on text; a JSON
+        # object in that answer is not a stream event.
+        raw = 'The config should be:\n{"retries": 3}\n'
+        self.assertEqual(self.decode(raw), (raw, ""))
+
+    def test_the_output_cap_applies_to_the_answer_not_the_stream(self):
+        # A Read result carries the whole file, so a long run outgrows
+        # --max-output-bytes while the answer, in the last event, stays small.
+        raw = self._stream(
+            self._assistant({"type": "tool_use", "name": "Read", "input": {"file_path": "/r/big"}}),
+            self._line({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x" * 5000}]}}),
+            self._line({"type": "result", "subtype": "success", "result": "short answer"}),
+        )
+        path = Path(self._state_guard.name) / "stdout.txt"
+        path.write_text(raw, encoding="utf-8")
+        claude = yoyo.DEFAULT_AGENTS["claude"]
+        self.assertEqual(yoyo.read_agent_stdout(claude, path, 1000), ("short answer", False, ""))
+        text, truncated, _ = yoyo.read_agent_stdout(claude, path, 5)
+        self.assertTrue(truncated)
+        self.assertTrue(text.startswith("short\n...[truncated after 5 bytes]"), text)
+
+    def test_plain_text_is_not_a_stream_even_when_a_later_line_looks_like_an_event(self):
+        # A text-mode answer quoting a JSON Schema has a string "type"; only a
+        # capture whose first line is an event is a stream.
+        raw = 'The schema is:\n{"type":"object","properties":{}}\n'
+        self.assertEqual(self.decode(raw), (raw, ""))
+        self.assertEqual(self.decode("\n\n" + self._line({"type": "result", "result": "ok"})), ("ok", ""))
+
+    def test_a_deeply_nested_event_is_skipped_not_fatal(self):
+        nested = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"X","input":{"a":' + "[" * 5000 + "]" * 5000 + "}}]}}\n"
+        raw = self._stream(nested, self._line({"type": "result", "result": "still answered"}))
+        self.assertEqual(self.decode(raw), ("still answered", ""))
+        self.assertEqual(yoyo._ClaudeActivity("claude").feed(nested), [])
+
+    def test_reading_the_capture_holds_neither_a_huge_line_nor_every_message(self):
+        path = Path(self._state_guard.name) / "stdout.txt"
+        claude = yoyo.DEFAULT_AGENTS["claude"]
+        huge = self._line({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x" * 4096}]}})
+        with mock.patch.object(yoyo, "STREAM_EVENT_MAX_BYTES", 1024):
+            path.write_text(self._stream(huge, self._line({"type": "result", "result": "fine"})), encoding="utf-8")
+            self.assertEqual(yoyo.read_agent_stdout(claude, path, 100), ("fine", False, ""))
+            path.write_text(self._stream(self._assistant({"type": "text", "text": "kept"}), huge), encoding="utf-8")
+            answer, _, note = yoyo.read_agent_stdout(claude, path, 100)
+            self.assertEqual(answer, "kept")
+            self.assertIn("1 events too long to read were skipped", note)
+
+            seen = []
+            real = yoyo.decode_stream_events
+
+            def spy(lines, *args, **kwargs):
+                lines = list(lines)
+                seen.append(max((len(line) for line in lines if line is not None), default=0))
+                return real(iter(lines), *args, **kwargs)
+
+            with mock.patch.object(yoyo, "decode_stream_events", spy):
+                yoyo.read_agent_stdout(claude, path, 100)
+            self.assertLessEqual(seen[0], 1024, "an over-cap line reached the decoder whole")
+
+        # A killed run's fallback keeps text only up to the cap, but counts every message.
+        many = self._stream(*(self._assistant({"type": "text", "text": "m" * 40}) for _ in range(1000)))
+        answer, note, _ = yoyo.decode_stream_events(many.splitlines(), "claude", "\n\n", "assistant messages", keep=100)
+        self.assertLess(len(answer), 300)
+        self.assertIn("stitched from 1000 assistant messages", note)
+
+    def test_a_call_returns_the_decoded_answer_and_keeps_its_messages_on_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "fake_claude.py"
+            script.write_text(
+                "import json, os, sys, time\n"
+                "sys.stdin.read()\n"
+                "def emit(event): print(json.dumps(event), flush=True)\n"
+                "emit({'type': 'system', 'subtype': 'init'})\n"
+                "emit({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Halfway there.'}]}})\n"
+                "if os.environ.get('FAKE_CLAUDE_HANG'): time.sleep(60)\n"
+                "emit({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'All done.'})\n",
+                encoding="utf-8",
+            )
+            config = Path(tmp) / "agents.json"
+            config.write_text(json.dumps({"agents": {"fakeclaude": {"command": [sys.executable, str(script)], "kind": "claude"}}}),
+                              encoding="utf-8")
+            env = {"YOYO_STATE_DIR": str(Path(tmp) / "state"), "YOYO_CONFIG": str(config)}
+
+            code, stdout, stderr = self.run_cli(["ask", "fakeclaude", "--json", "hello"], env=env)
+            self.assertEqual(code, 0, stderr)
+            result = json.loads(stdout)
+            self.assertEqual(result["stdout"], "All done.")
+            self.assertIn("stream-json", result["command"])
+            answers = [path.read_text(encoding="utf-8") for path in (Path(tmp) / "state" / "runs").glob("*/answer.txt")]
+            self.assertEqual(answers, ["All done."])
+
+            code, stdout, stderr = self.run_cli(["ask", "fakeclaude", "--json", "--timeout", "2", "hello"],
+                                                env={**env, "FAKE_CLAUDE_HANG": "1"})
+            self.assertEqual(code, 124)
+            result = json.loads(stdout)
+            self.assertEqual(result["stdout"], "Halfway there.")
+            self.assertIn("fakeclaude stream ended without a result event", result["stderr"])
 
 
 class CitationResolutionTests(CliTestCase):
@@ -5978,10 +6134,10 @@ class ReviewFixTests(CliTestCase):
         # The child inherits --idle-timeout, but its stderr goes to log.txt,
         # where the caller reads the warning only after the run is over.
         with tempfile.TemporaryDirectory() as tmp:
-            env = {"YOYO_STATE_DIR": tmp, "YOYO_AGENT_CLAUDE": "cat"}
+            env = {"YOYO_STATE_DIR": tmp, "YOYO_AGENT_PI": "cat"}
 
             code, stdout, stderr = self.run_cli(
-                ["ask", "claude", "--background", "--idle-timeout", "60", "--json", "hello"],
+                ["ask", "pi", "--background", "--idle-timeout", "60", "--json", "hello"],
                 env=env,
             )
 
@@ -6047,18 +6203,21 @@ class ReviewFixTests(CliTestCase):
         self.assertEqual(yoyo.co_cited_sites(results), [])
 
     def test_configured_agent_keeps_its_buffering_behavior(self):
-        # Overriding claude's command in agents.json must not quietly drop the
-        # measured fact that claude buffers.
+        # Overriding a built-in's command in agents.json must not quietly drop
+        # the measured fact of whether it buffers: pi does, claude (on
+        # stream-json) does not.
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "agents.json"
             config.write_text(json.dumps({"agents": {
                 "claude": {"command": ["my-claude-wrapper", "-p"], "kind": "claude"},
+                "pi": {"command": ["my-pi-wrapper", "-p"], "kind": "pi"},
                 "mine": {"command": ["mine"]},
                 "slow": {"command": ["slow"], "buffers_output": True},
             }}), encoding="utf-8")
             with mock.patch.dict(os.environ, {"YOYO_CONFIG": str(config)}):
                 agents = yoyo.load_agents()
-            self.assertTrue(agents["claude"].buffers_output)
+            self.assertFalse(agents["claude"].buffers_output)
+            self.assertTrue(agents["pi"].buffers_output)
             self.assertFalse(agents["mine"].buffers_output)
             self.assertTrue(agents["slow"].buffers_output)
 
@@ -6865,6 +7024,95 @@ class ThreadTests(CliTestCase):
             self.assertEqual(activity.pump(1.0, 1), [])
             activity.update({"run_id": run_dir.name})
             self.assertEqual(activity.pump(2.0, 2), ["$ ls"])
+
+    def test_claude_activity_condenses_its_stream(self):
+        def line(event):
+            return json.dumps(event)
+
+        def assistant(*blocks, parent=None):
+            event = {"type": "assistant", "message": {"content": list(blocks)}}
+            if parent:
+                event["parent_tool_use_id"] = parent
+            return line(event)
+
+        def tool(name, **arguments):
+            return {"type": "tool_use", "name": name, "input": arguments}
+
+        def tool_result(content, error=True):
+            return line({"type": "user", "message": {"content": [{"type": "tool_result", "is_error": error, "content": content}]}})
+
+        stream = [
+            line({"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"}),
+            line({"type": "system", "subtype": "init", "cwd": "/repo"}),
+            assistant(tool("Glob", pattern="tests/*.py")),
+            assistant(tool("Read", file_path="/repo/bin/yoyo", limit=5)),
+            tool_result("<tool_use_error>File does not exist.</tool_use_error>"),
+            assistant(tool("Bash", command="rg -n wait_run bin/yoyo\necho done", description="Find it")),
+            tool_result([{"type": "text", "text": "Exit code 1\nboom"}]),
+            tool_result("fine", error=False),
+            assistant(tool("Bash", command="echo \x1b]52;c;cHduZWQ=\x07hi")),
+            assistant(tool("Grep", pattern="def wait_run", path="/repo/bin")),
+            assistant(tool("Grep", pattern="TODO", path="/repo")),
+            assistant(tool("Task", description="Check the tests", prompt="Look at tests/")),
+            assistant(tool("Read", file_path="/repo/tests/test_yoyo.py"), parent="toolu_1"),
+            assistant(tool("mcp__docs__lookup", query="wait exit codes")),
+            assistant({"type": "thinking", "thinking": ""}, {"type": "text", "text": "## Verdict\n**Real bug** at bin/yoyo:4975."}),
+            line({"type": "result", "subtype": "success", "result": "**Real bug** at bin/yoyo:4975."}),
+            "not json",
+        ]
+        activity = yoyo._ClaudeActivity("claude", "/repo")
+        self.assertEqual([out for raw in stream for out in activity.feed(raw)], [
+            "glob tests/*.py",
+            "read bin/yoyo",
+            "  (error: File does not exist.)",
+            "$ rg -n wait_run bin/yoyo",
+            "  (error: Exit code 1)",
+            "$ echo hi",
+            "grep def wait_run in bin",
+            "grep TODO in .",
+            "agent: Check the tests",
+            "  read tests/test_yoyo.py",
+            "mcp__docs__lookup wait exit codes",
+            "claude: **Real bug** at bin/yoyo:4975.",
+        ])
+
+    def test_turn_activity_follows_claude_stdout_and_never_holds_a_huge_line(self):
+        state = self.root / "state"
+        run_dir = state / "runs" / "20000101T000000-0000c1a0"
+        run_dir.mkdir(parents=True)
+        stdout = run_dir / "stdout.txt"
+
+        def tool_use(name, path):
+            return json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": name, "input": {"file_path": path}}]}}) + "\n"
+
+        stdout.write_text(tool_use("Read", "/w/a.py") + '{"type": "user", "message": {"content": [{"type": "tool_result", "content": "',
+                          encoding="utf-8")
+        with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": str(state)}), mock.patch.object(yoyo, "THREAD_WATCH_MAX_LINE_BYTES", 200):
+            activity = yoyo._TurnActivity({"agent": "claude", "flavor": "claude", "run_id": run_dir.name}, now=0.0, cwd="/w")
+            self.assertEqual(activity.pump(1.0, 1), ["read a.py"])
+            with stdout.open("a", encoding="utf-8") as handle:
+                handle.write("y" * 500)  # a whole file in one tool result, far past the cap
+            self.assertEqual(activity.pump(2.0, 2), [])
+            self.assertLessEqual(len(activity.partial), 200)
+            with stdout.open("a", encoding="utf-8") as handle:
+                handle.write('"}]}}\n' + tool_use("Edit", "/w/b.py"))
+            self.assertEqual(activity.pump(3.0, 3), ["edit b.py"])
+            # The same over-cap event, completed within a single read, is skipped too.
+            with stdout.open("a", encoding="utf-8") as handle:
+                handle.write(tool_use("Write", "/w/" + "z" * 300) + tool_use("Read", "/w/c.py"))
+            self.assertEqual(activity.pump(4.0, 4), ["read c.py"])
+
+    def test_watch_says_only_which_agents_answer_at_the_end(self):
+        # claude used to buffer; a turn an older yoyo recorded still says so.
+        out = io.StringIO()
+        printer = yoyo._ThreadWatchPrinter("t", events=False, as_json=False, notify=False)
+        with mock.patch("sys.stdout", out):
+            for agent in ("claude", "pi"):
+                printer.turn_seen({"id": 2, "kind": "ask", "agent": agent, "flavor": agent, "buffers_output": True,
+                                   "question": "q", "status": "running"}, "running")
+        self.assertNotIn("claude sends its answer when it finishes", out.getvalue())
+        self.assertIn("pi sends its answer when it finishes", out.getvalue())
 
     def test_pane_command_resolves_a_relative_state_dir(self):
         # The pane starts in the thread's cwd, so a relative path would move.

@@ -28,10 +28,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
-VERSION = "0.32.0"
+VERSION = "0.33.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -162,11 +162,13 @@ class AgentSpec:
     flavor: str | None = None
     read_only_args: list[str] | None = None
     full_access_args: list[str] | None = None
-    # Measured, not guessed: claude emits a little stderr then goes silent for
-    # the whole run, and pi emits nothing at all until it exits. Their silence
-    # is work, not a stall, which changes what --idle-timeout means. cursor
-    # buffers only in text mode; on stream-json it flushes every chunk (0 bytes
-    # for ~15s of thinking, then steady growth), so it is not marked here.
+    # Measured, not guessed: pi emits nothing at all until it exits. Its
+    # silence is work, not a stall, which changes what --idle-timeout means.
+    # cursor and claude buffer only in text mode, so yoyo runs both on
+    # stream-json and neither is marked: cursor flushes every chunk (0 bytes
+    # for ~15s of thinking, then steady growth); claude 2.1.316 writes its
+    # first event within a second and then one per message or tool call,
+    # silent only while a single model step runs.
     buffers_output: bool = False
 
 
@@ -204,7 +206,7 @@ _MUSE_READ_ONLY_TOOLS = ("read_file", "search")
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", ["codex", "exec"], flavor="codex"),
-    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude", buffers_output=True),
+    "claude": AgentSpec("claude", ["claude", "-p", "--no-session-persistence"], flavor="claude"),
     "pi": AgentSpec("pi", ["pi", "-p", "--no-session", "--mode", "text"], flavor="pi", buffers_output=True),
     # On-demand agents: one-shot only (no --session), useful for cross-vendor
     # opinions. cursor-agent reads the prompt from piped stdin in print mode and
@@ -569,11 +571,110 @@ def read_limited_text(path: Path, limit: int) -> tuple[str, bool]:
     return text, truncated
 
 
-# cursor-agent's stream-json event types, in the order a healthy run emits them.
-# Only two carry the answer; the rest are progress or transport chatter.
+# stream-json event types, in the order a healthy run emits them. Only two
+# carry the answer; the rest are progress or (cursor's) transport chatter.
 CURSOR_RESULT_EVENT = "result"
 CURSOR_ASSISTANT_EVENT = "assistant"
 CURSOR_TRANSPORT_EVENTS = ("connection", "retry")
+
+# Flavors yoyo runs on stream-json, one JSON event per line, and decodes back
+# to prose: (how assistant text is joined, what one piece is called). cursor
+# streams pieces of one message; claude writes each message whole.
+STREAM_JSON_FLAVORS: dict[str, tuple[str, str]] = {
+    "cursor": ("", "partial chunks"),
+    "claude": ("\n\n", "assistant messages"),
+}
+
+
+def _stream_event(line: str) -> dict[str, Any] | None:
+    """One stream-json event, or None. Every event names its type."""
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        event = json.loads(line)
+    except (ValueError, RecursionError):
+        # RecursionError: a small but deeply nested line (tool input is
+        # arbitrary JSON) exhausts the parser's stack rather than failing it.
+        return None
+    return event if isinstance(event, dict) and isinstance(event.get("type"), str) else None
+
+
+def decode_stream_events(lines: Iterable[str | None], name: str, joiner: str = "", piece: str = "partial chunks",
+                         keep: int | None = None) -> tuple[str, str, bool]:
+    """Reduce stream-json lines to (answer, note, saw_json).
+
+    Prefer the result event, the way codex's --output-last-message is preferred
+    over its transcript. With no result event (a killed or dropped run), stitch
+    the assistant text back together and say so in the note, so a partial
+    answer is never mistaken for a whole one. An error result (claude's
+    `is_error`) carries the same message text mode prints, so it is the answer
+    too, and the exit code says it failed.
+
+    A stream starts with an event on its first line, so the first non-blank
+    line decides: anything else is plain text (an `--agent-arg` back to text
+    mode, a crash before the first event), even if a JSON object follows it.
+    A None line is one too long to read, skipped unread. `keep` bounds the
+    assistant text held for the fallback; the caller caps the answer anyway.
+    """
+    final = ""
+    chunks: list[str] = []
+    kept = pieces = 0
+    dropped = 0
+    oversized = 0
+    saw_json = False
+
+    for line in lines:
+        if line is None:
+            oversized += 1
+            continue
+        if not saw_json and not line.strip():
+            continue
+        event = _stream_event(line)
+        if event is None:
+            if not saw_json:
+                return "", "", False
+            continue
+
+        saw_json = True
+        kind = event["type"]
+
+        if kind in CURSOR_TRANSPORT_EVENTS:
+            dropped += 1
+            continue
+
+        if kind == CURSOR_RESULT_EVENT:
+            text = event.get("result")
+            if isinstance(text, str) and text.strip():
+                final = text
+            continue
+
+        if kind == CURSOR_ASSISTANT_EVENT:
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str) and block.get("type", "text") == "text":
+                    pieces += 1
+                    if keep is None or kept <= keep:
+                        chunks.append(block["text"])
+                        kept += len(block["text"])
+
+    if not saw_json:
+        return "", "", False
+    if final:
+        return final, "", True
+
+    skipped = f"; {oversized} events too long to read were skipped" if oversized else ""
+    stitched = joiner.join(chunks).strip()
+    if not stitched:
+        return "", f"{name} produced no answer text before the stream ended{skipped}", True
+
+    note = f"{name} stream ended without a result event; answer stitched from {pieces} {piece}"
+    if dropped:
+        note += f" after {dropped} transport reconnect events"
+    return stitched, note + skipped, True
 
 
 def decode_cursor_stream(raw: str) -> tuple[str, str]:
@@ -588,76 +689,70 @@ def decode_cursor_stream(raw: str) -> tuple[str, str]:
         {"type":"result","subtype":"success","result":"..."}       <- final answer
         {"type":"assistant","message":{"content":[{"text":...}]}}  <- partial fallback
         {"type":"connection"|"retry",...}                          <- transport chatter
-
-    Prefer the result event, the way codex's --output-last-message is preferred
-    over its transcript. With no result event, stitch the assistant chunks back
-    together and say so in the note, so a partial answer is never mistaken for
-    a whole one.
     """
-    final = ""
-    chunks: list[str] = []
-    dropped = 0
-    saw_json = False
-
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-
-        saw_json = True
-        kind = event.get("type")
-
-        if kind in CURSOR_TRANSPORT_EVENTS:
-            dropped += 1
-            continue
-
-        if kind == CURSOR_RESULT_EVENT:
-            text = event.get("result")
-            if isinstance(text, str) and text.strip():
-                final = text
-            continue
-
-        if kind == CURSOR_ASSISTANT_EVENT:
-            content = event.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    chunks.append(block["text"])
-
+    answer, note, saw_json = decode_stream_events(raw.splitlines(), "cursor")
     # Not stream-json at all (a --agent-arg override, or a crash before the
     # first event). Hand the capture back untouched rather than blanking it.
-    if not saw_json:
-        return raw, ""
-
-    if final:
-        return final, ""
-
-    stitched = "".join(chunks).strip()
-    if not stitched:
-        return "", "cursor produced no answer text before the stream ended"
-
-    note = f"cursor stream ended without a result event; answer stitched from {len(chunks)} partial chunks"
-    if dropped:
-        note += f" after {dropped} transport reconnect events"
-    return stitched, note
+    return (answer, note) if saw_json else (raw, "")
 
 
 def decode_agent_stdout(spec: AgentSpec, raw: str) -> tuple[str, str]:
     """Turn one agent's raw stdout capture into (answer, note).
 
-    Every flavor but cursor already writes plain text, so this is a no-op for
-    them. cursor speaks stream-json, which has to be reduced back to prose.
+    cursor and claude speak stream-json, which is reduced back to prose; every
+    other flavor already writes plain text, so this is a no-op for them.
     """
-    if spec.flavor != "cursor":
+    if spec.flavor not in STREAM_JSON_FLAVORS:
         return raw, ""
-    return decode_cursor_stream(raw)
+    joiner, piece = STREAM_JSON_FLAVORS[spec.flavor]
+    answer, note, saw_json = decode_stream_events(raw.splitlines(), spec.name, joiner, piece)
+    return (answer, note) if saw_json else (raw, "")
+
+
+STREAM_EVENT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _bounded_lines(handle: Any, cap: int) -> Iterator[str | None]:
+    """Each line of a binary file, decoded; None for a line over cap bytes,
+    which is read past in pieces and never held whole."""
+    while True:
+        line = handle.readline(cap + 1)
+        if not line:
+            return
+        if len(line) > cap and not line.endswith(b"\n"):
+            while line and not line.endswith(b"\n"):
+                line = handle.readline(1024 * 1024)
+            yield None
+            continue
+        yield line.decode("utf-8", errors="replace")
+
+
+def read_agent_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, bool, str]:
+    """An agent's answer from its stdout capture: (text, truncated, note).
+
+    --max-output-bytes caps the answer, not the stream. A stream-json capture
+    carries every tool result (a whole file per Read), so a long run outgrows
+    the cap while the answer, in the last event, stays small; capping the
+    stream first would cut the answer off. So the stream is scanned whole,
+    line by line, and only the decoded answer is capped.
+    """
+    if spec.flavor not in STREAM_JSON_FLAVORS:
+        text, truncated = read_limited_text(path, limit)
+        return text, truncated, ""
+    joiner, piece = STREAM_JSON_FLAVORS[spec.flavor]
+    # Memory stays bounded by the cap, not the capture: a line over it (only
+    # bulk tool output gets there) is skipped unread. The result event holds
+    # the answer JSON-escaped, so the cap leaves room for a full one.
+    cap = max(STREAM_EVENT_MAX_BYTES, 4 * limit)
+    with path.open("rb") as handle:
+        answer, note, saw_json = decode_stream_events(_bounded_lines(handle, cap), spec.name, joiner, piece, keep=limit)
+    if not saw_json:
+        text, truncated = read_limited_text(path, limit)
+        return text, truncated, ""
+    data = answer.encode("utf-8")
+    if len(data) <= limit:
+        return answer, False, note
+    return data[:limit].decode("utf-8", errors="replace") + f"\n...[truncated after {limit} bytes]\n", True, note
 
 
 def read_limited_stdin(limit: int) -> tuple[str, bool, int]:
@@ -1179,6 +1274,12 @@ def command_for_agent(
         if codex_output_file:
             cmd.extend(["--output-last-message", codex_output_file])
     elif spec.flavor == "claude":
+        # stream-json, as for cursor: every message and tool call lands in the
+        # call's stdout capture as it happens (thread watch shows it, and a
+        # killed run keeps what it wrote), and read_agent_stdout decodes the
+        # answer from the final result event. Print mode requires --verbose
+        # for stream-json.
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
         if session_info:
             cmd = [part for part in cmd if part != "--no-session-persistence"]
             if session_mode == "resume":
@@ -2589,14 +2690,12 @@ def _timeout_result(
     codex_output_file: str | None = None,
 ) -> dict[str, Any]:
     elapsed = time.monotonic() - started
-    stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+    # A killed cursor or claude run has no result event by definition, so
+    # whatever it streamed before the kill is all the answer there is. Recover it.
+    stdout, stdout_truncated, stream_note = read_agent_stdout(spec, stdout_path, args.max_output_bytes)
     stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
-
-    # A killed cursor run has no result event by definition, so whatever it
-    # streamed before the kill is all the answer there is. Recover it.
-    stdout, cursor_note = decode_agent_stdout(spec, stdout)
-    if cursor_note:
-        stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
+    if stream_note:
+        stderr = f"{stderr}\n{stream_note}" if stderr else stream_note
 
     # codex writes its answer to --output-last-message, not stdout, and it may
     # land moments before the kill. The run still failed, but throwing away
@@ -2784,7 +2883,7 @@ def execute_agent_call(
             args._call_run_id = journal_dir.name if journal_dir is not None else None
             attach_session_result(args, agents[agent_name], result)
             return result
-        stdout, stdout_truncated = read_limited_text(stdout_path, args.max_output_bytes)
+        stdout, stdout_truncated, stream_note = read_agent_stdout(agents[agent_name], stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
         exit_code = proc.returncode
         silent_note = agy_silent_exit_note(
@@ -2796,9 +2895,8 @@ def execute_agent_call(
             finish_journal(exit_code, error="exited 0 with no answer", silent_exit=True)
         else:
             finish_journal(exit_code)
-        stdout, cursor_note = decode_agent_stdout(agents[agent_name], stdout)
-        if cursor_note:
-            stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
+        if stream_note:
+            stderr = f"{stderr}\n{stream_note}" if stderr else stream_note
         if codex_output_file:
             path = Path(codex_output_file)
             if path.exists():
@@ -6015,6 +6113,7 @@ DEFAULT_THREAD_WATCH_POLL = 1.0
 THREAD_WATCH_HEARTBEAT_S = 30.0
 THREAD_WATCH_LINE_CHARS = 200
 THREAD_WATCH_READ_BYTES = 256 * 1024
+THREAD_WATCH_MAX_LINE_BYTES = 1024 * 1024  # a longer log line is bulk tool output; skipped, never buffered
 THREAD_PANE_MIN_COLS = 60  # each side of a right split keeps at least this many columns
 _TERMINAL_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
 _TERMINAL_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -6105,15 +6204,111 @@ class _CodexActivity:
         return []
 
 
+# claude tool -> (label, the input field that says what the call touches).
+_CLAUDE_TOOL_LABELS: dict[str, tuple[str, str]] = {
+    "Bash": ("$", "command"), "Read": ("read", "file_path"), "Write": ("write", "file_path"),
+    "Edit": ("edit", "file_path"), "MultiEdit": ("edit", "file_path"), "NotebookEdit": ("edit", "notebook_path"),
+    "Grep": ("grep", "pattern"), "Glob": ("glob", "pattern"), "LS": ("ls", "path"),
+    "WebFetch": ("fetch", "url"), "WebSearch": ("search", "query"),
+    "Task": ("agent:", "description"), "Agent": ("agent:", "description"),
+}
+_CLAUDE_PATH_FIELDS = ("file_path", "notebook_path", "path")
+_CLAUDE_TOOL_ERROR_TAG_RE = re.compile(r"</?tool_use_error>")
+
+
+def _first_text_line(content: Any) -> str:
+    if isinstance(content, list):
+        content = "\n".join(str(b.get("text")) for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not _BARE_HEADING_RE.fullmatch(line):
+            return line
+    return ""
+
+
+class _ClaudeActivity:
+    """Condense claude's stream-json into one line per tool call or message.
+
+    Tool calls come from assistant `tool_use` blocks, failures from
+    `tool_result` blocks marked `is_error`, and messages from text blocks. A
+    subagent's events (those with a `parent_tool_use_id`) are indented under
+    the call that started it. Everything else yields nothing: hook and init
+    events, thinking blocks (empty in print mode), and the result event, whose
+    answer the watch prints in full when the turn ends.
+    """
+
+    def __init__(self, agent: str, cwd: str | None = None) -> None:
+        self.agent = agent
+        self.cwd = cwd.rstrip("/") + "/" if isinstance(cwd, str) and cwd.strip("/") else None
+
+    def _path(self, value: str) -> str:
+        if self.cwd and (value.rstrip("/") + "/").startswith(self.cwd):
+            return value[len(self.cwd):] or "."
+        return value
+
+    def _tool(self, block: dict[str, Any]) -> str:
+        name = str(block.get("name") or "tool")
+        args = block.get("input") if isinstance(block.get("input"), dict) else {}
+        label, key = _CLAUDE_TOOL_LABELS.get(name, (name, ""))
+        value = args.get(key) if key else next((v for v in args.values() if isinstance(v, str) and v.strip()), None)
+        if not isinstance(value, str) or not value.strip():
+            return _clip(label)
+        what = value.strip().splitlines()[0]
+        if key in _CLAUDE_PATH_FIELDS:
+            what = self._path(what)
+        if name == "Grep" and isinstance(args.get("path"), str):
+            what += " in " + self._path(args["path"])
+        return _clip(f"{label} {what}")
+
+    def feed(self, line: str) -> list[str]:
+        event = _stream_event(line)
+        if event is None or event["type"] not in ("assistant", "user"):
+            return []
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return []
+        indent = "  " if event.get("parent_tool_use_id") else ""
+        lines: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if event["type"] == "assistant" and kind == "tool_use":
+                lines.append(indent + self._tool(block))
+            elif event["type"] == "assistant" and kind == "text":
+                first = _first_text_line(block.get("text"))
+                if first:
+                    lines.append(f"{indent}{self.agent}: {_clip(first)}")
+            elif event["type"] == "user" and kind == "tool_result" and block.get("is_error"):
+                detail = _CLAUDE_TOOL_ERROR_TAG_RE.sub("", _first_text_line(block.get("content"))).strip()
+                lines.append(f"{indent}  (error: {_clip(detail)})" if detail else f"{indent}  (error)")
+        return lines
+
+
+# Where each flavor writes the log the watch condenses: codex narrates on
+# stderr; claude's stdout is its stream-json.
+_LIVE_ACTIVITY_SOURCES = {"codex": "stderr.txt", "claude": "stdout.txt"}
+
+
 class _TurnActivity:
     """Follow one running turn: condensed live log lines, else a heartbeat."""
 
-    def __init__(self, turn: dict[str, Any], now: float) -> None:
+    def __init__(self, turn: dict[str, Any], now: float, cwd: str | None = None) -> None:
         self.agent = str(turn.get("agent") or "agent")
-        self.condenser = _CodexActivity() if turn.get("flavor") == "codex" else None
+        flavor = turn.get("flavor")
+        self.source = _LIVE_ACTIVITY_SOURCES.get(str(flavor))
+        self.condenser: _CodexActivity | _ClaudeActivity | None = None
+        if flavor == "codex":
+            self.condenser = _CodexActivity()
+        elif flavor == "claude":
+            self.condenser = _ClaudeActivity(self.agent, cwd)
         self.journal: Path | None = None
         self.offset = 0
         self.partial = b""
+        self.skipping = False
         self.last_line = now
         self.update(turn)
 
@@ -6126,10 +6321,10 @@ class _TurnActivity:
                 pass
 
     def _new_lines(self) -> list[str]:
-        if self.condenser is None or self.journal is None:
+        if self.condenser is None or self.journal is None or self.source is None:
             return []
         try:
-            with (self.journal / "stderr.txt").open("rb") as handle:
+            with (self.journal / self.source).open("rb") as handle:
                 handle.seek(self.offset)
                 chunk = handle.read(THREAD_WATCH_READ_BYTES)
         except OSError:
@@ -6137,9 +6332,20 @@ class _TurnActivity:
         self.offset += len(chunk)
         data = self.partial + chunk
         *complete, self.partial = data.split(b"\n")
+        if self.skipping and complete:
+            # The first complete piece is the tail of the line being skipped.
+            complete = complete[1:]
+            self.skipping = False
+        if len(self.partial) > THREAD_WATCH_MAX_LINE_BYTES:
+            # Only bulk tool output (a whole file) runs this long; never hold it.
+            self.partial = b""
+            self.skipping = True
         lines: list[str] = []
         for raw in complete:
-            lines += self.condenser.feed(raw.decode("utf-8", errors="replace"))
+            # The same limit for a line completed within one read, so whether
+            # an event shows never depends on where the reads fell.
+            if len(raw) <= THREAD_WATCH_MAX_LINE_BYTES:
+                lines += self.condenser.feed(raw.decode("utf-8", errors="replace"))
         return lines
 
     def captured_bytes(self) -> int:
@@ -6265,7 +6471,7 @@ class _ThreadWatchPrinter:
         self._out(f"\n── turn {tid} · {thread_caller_name(turn)} asked {agent} ──")
         self._out("Question:")
         self._out(terminal_safe(str(turn.get("question") or "").strip() or "(prompt given on stdin or in files)"))
-        if status == "running" and turn.get("buffers_output") and turn.get("flavor") != "codex":
+        if status == "running" and turn.get("buffers_output") and turn.get("flavor") not in _LIVE_ACTIVITY_SOURCES:
             self._out(f"  ({agent} sends its answer when it finishes)")
         if status == "running":
             self._program_status("working", f"turn {tid}: {agent} working")
@@ -6357,7 +6563,7 @@ def thread_watch(args: argparse.Namespace) -> int:
                 printer.turn_seen(turn, status, live=not replaying)
                 shown[tid] = status
                 if status == "running":
-                    live[tid] = _TurnActivity(turn, now)
+                    live[tid] = _TurnActivity(turn, now, manifest.get("cwd"))
             elif before == "running" and status != "running":
                 activity = live.pop(tid, None)
                 if activity is not None:
