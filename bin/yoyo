@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-VERSION = "0.33.0"
+VERSION = "0.33.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -6713,7 +6713,7 @@ def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
     if os.environ.get("HERDR_PANE_ID") and herdr:
         command = shlex.join(thread_watch_command(args, name, notify=True))
         direction = _split_direction(_herdr_pane_size(herdr, os.environ["HERDR_PANE_ID"]))
-        out = _pane_step([herdr, "pane", "split", "--current", "--direction", direction, "--cwd", cwd],
+        out = _pane_step([herdr, "pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"],
                          "open a Herdr pane", manual)
         try:
             pane = str(json.loads(out)["result"]["pane"]["pane_id"])
@@ -7924,9 +7924,9 @@ def build_parser() -> argparse.ArgumentParser:
     thread.add_argument("--format", choices=["md", "json", "brief"], default="md", help="export: md transcript, json for --from-file, or brief: the packed handoff to paste into another tool")
     thread.add_argument("--out", help="export: write to this file instead of stdout")
     thread.add_argument("--history-bytes", type=int, default=None, help="export --format brief: UTF-8 budget for the packed history")
-    thread.add_argument("--pane", action="store_true", help="watch: open the live view in a new tmux or Herdr pane beside this one")
+    thread.add_argument("--pane", action="store_true", help="watch: open the live view in a new tmux, Herdr, or Herdr desktop pane beside this one")
     thread.add_argument("--events", action="store_true", help="watch: one line per turn event (started, finished, note), for a caller to follow; --json makes them JSON lines")
-    thread.add_argument("--notify", action="store_true", help="watch: show a Herdr notification when a turn finishes (inside Herdr only)")
+    thread.add_argument("--notify", action="store_true", help="watch: when a turn finishes, show a Herdr notification, or mark the pane done in Herdr desktop")
     thread.add_argument("--from", dest="watch_from", type=int, default=1, help="watch: start at this turn number (default 1, the whole thread)")
     thread.add_argument("--poll", type=float, default=None, help=f"watch: seconds between checks (default {DEFAULT_THREAD_WATCH_POLL:g})")
     thread.add_argument("--timeout", dest="watch_timeout", type=float, default=None, help="watch: stop watching after this many seconds (default: until the thread is removed or Ctrl-C)")

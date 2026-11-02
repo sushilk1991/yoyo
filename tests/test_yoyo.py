@@ -79,7 +79,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.33.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.33.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -7239,7 +7239,7 @@ class ThreadTests(CliTestCase):
                 layout, split, run, rename = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
                 self.assertEqual(layout, ["pane", "layout", "--current"])
                 self.assertEqual(split, ["pane", "split", "--current", "--direction", direction,
-                                         "--cwd", str(self.work.resolve())])
+                                         "--cwd", str(self.work.resolve()), "--no-focus"])
                 self.assertEqual(run[:3], ["pane", "run", "p9"])
                 self.assertIn("thread watch t --notify", run[3])
                 self.assertEqual(rename, ["pane", "rename", "p9", "thread t"])
@@ -7348,6 +7348,13 @@ class ThreadTests(CliTestCase):
         self.assertEqual(code, 1)
         self.assertIn("not inside tmux, Herdr, or Herdr desktop", stderr)
         self.assertIn("thread watch t", stdout)
+
+    def test_watch_help_names_every_place_a_pane_opens(self):
+        code, stdout, stderr = self.cli(["thread", "--help"])
+        self.assertEqual(code, 0, stderr)
+        help_text = " ".join(stdout.split())
+        self.assertIn("new tmux, Herdr, or Herdr desktop pane", help_text)
+        self.assertIn("mark the pane done in Herdr desktop", help_text)
 
     def test_watch_flag_misuse_fails_loudly(self):
         self.create()
