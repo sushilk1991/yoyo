@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-VERSION = "0.31.0"
+VERSION = "0.31.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -6014,6 +6014,7 @@ DEFAULT_THREAD_WATCH_POLL = 1.0
 THREAD_WATCH_HEARTBEAT_S = 30.0
 THREAD_WATCH_LINE_CHARS = 200
 THREAD_WATCH_READ_BYTES = 256 * 1024
+THREAD_PANE_MIN_COLS = 60  # each side of a right split keeps at least this many columns
 _TERMINAL_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
 _TERMINAL_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _TERMINAL_ESC_RE = re.compile(r"\x1b[@-Z\\-_]")
@@ -6380,6 +6381,46 @@ def _pane_label(argv: list[str]) -> None:
         pass
 
 
+def _pane_probe(argv: list[str]) -> str:
+    # Best effort: a failed probe only loses the layout hint.
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _split_direction(size: tuple[int, int] | None) -> str:
+    """Right beside a wide pane, down below a narrow or tall one.
+
+    A terminal cell is about twice as tall as it is wide, so a pane looks wide
+    when it has at least twice as many columns as rows. Splitting right must
+    also leave each side THREAD_PANE_MIN_COLS columns. An unknown size splits
+    right, as before the size was read.
+    """
+    if not size or size[0] <= 0 or size[1] <= 0:
+        return "right"
+    cols, rows = size
+    return "right" if cols >= 2 * rows and cols >= 2 * THREAD_PANE_MIN_COLS else "down"
+
+
+def _tmux_pane_size() -> tuple[int, int] | None:
+    out = _pane_probe(["tmux", "display-message", "-p", "#{pane_width} #{pane_height}"]).split()
+    try:
+        return int(out[0]), int(out[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _herdr_pane_size(herdr: str, pane_id: str) -> tuple[int, int] | None:
+    try:
+        panes = json.loads(_pane_probe([herdr, "pane", "layout", "--current"]))["result"]["layout"]["panes"]
+        rect = next(p["rect"] for p in panes if p.get("pane_id") == pane_id)
+        return int(rect["width"]), int(rect["height"])
+    except (ValueError, KeyError, TypeError, AttributeError, StopIteration):
+        return None
+
+
 def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
     """Open `thread watch` beside the caller: tmux if inside it, else Herdr."""
     name = args.thread_name
@@ -6387,7 +6428,8 @@ def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
     manual = shlex.join(thread_watch_command(args, name, notify=False))
     # The innermost multiplexer is the one the person is looking at.
     if os.environ.get("TMUX") and shutil.which("tmux"):
-        out = _pane_step(["tmux", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "-c", cwd, manual],
+        side = "-h" if _split_direction(_tmux_pane_size()) == "right" else "-v"
+        out = _pane_step(["tmux", "split-window", side, "-d", "-P", "-F", "#{pane_id}", "-c", cwd, manual],
                          "open a tmux pane", manual)
         pane = out.strip()
         if pane:
@@ -6397,7 +6439,8 @@ def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
     herdr = _herdr_bin()
     if os.environ.get("HERDR_PANE_ID") and herdr:
         command = shlex.join(thread_watch_command(args, name, notify=True))
-        out = _pane_step([herdr, "pane", "split", "--current", "--direction", "right", "--cwd", cwd],
+        direction = _split_direction(_herdr_pane_size(herdr, os.environ["HERDR_PANE_ID"]))
+        out = _pane_step([herdr, "pane", "split", "--current", "--direction", direction, "--cwd", cwd],
                          "open a Herdr pane", manual)
         try:
             pane = str(json.loads(out)["result"]["pane"]["pane_id"])

@@ -73,7 +73,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.31.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.31.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -6922,33 +6922,73 @@ class ThreadTests(CliTestCase):
         self.assertEqual(activity.pump(131.0, 95), ["… claude working 1m35s"])
         self.assertEqual(activity.pump(140.0, 104), [])
 
+    def test_split_direction_goes_down_for_narrow_or_tall_panes(self):
+        for size, direction in {
+            (120, 60): "right",   # exactly twice as many columns as rows, and 60 columns a side
+            (240, 50): "right",
+            (119, 40): "down",    # wide-looking, but a side would get under 60 columns
+            (130, 66): "down",    # tall: under twice as many columns as rows
+            (80, 24): "down",
+            None: "right",        # size unknown: the old behavior
+            (0, 0): "right",
+        }.items():
+            with self.subTest(size=size):
+                self.assertEqual(yoyo._split_direction(size), direction)
+
     def test_watch_pane_opens_a_tmux_split_inside_tmux(self):
         self.create()
-        _, log = self.fake_tool("tmux", "print('%7') if sys.argv[1] == 'split-window' else None\n")
+        _, log = self.fake_tool("tmux", (
+            "import os\n"
+            "if sys.argv[1] == 'display-message': print(os.environ.get('FAKE_PANE_SIZE', ''))\n"
+            "if sys.argv[1] == 'split-window': print('%7')\n"))
         path = f"{self.root / 'fakebin'}{os.pathsep}{os.environ.get('PATH', '')}"
-        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX="/tmp/tmux-1/default,1,0", PATH=path,
-                                        HERDR_PANE_ID=None)
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("opened tmux pane %7 following thread t", stdout)
-        split, title = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(split[:7], ["split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "-c"])
-        self.assertIn("thread watch t", split[-1])
-        self.assertIn(f"YOYO_STATE_DIR={(self.root / 'state').resolve()}", split[-1])
-        self.assertEqual(title, ["select-pane", "-t", "%7", "-T", "thread t"])
+        for size, side in (("200 50", "-h"), ("100 30", "-v"), ("", "-h")):
+            with self.subTest(size=size):
+                log.unlink(missing_ok=True)
+                code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX="/tmp/tmux-1/default,1,0",
+                                                PATH=path, HERDR_PANE_ID=None, FAKE_PANE_SIZE=size)
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("opened tmux pane %7 following thread t", stdout)
+                probe, split, title = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(probe, ["display-message", "-p", "#{pane_width} #{pane_height}"])
+                self.assertEqual(split[:7], ["split-window", side, "-d", "-P", "-F", "#{pane_id}", "-c"])
+                self.assertIn("thread watch t", split[-1])
+                self.assertIn(f"YOYO_STATE_DIR={(self.root / 'state').resolve()}", split[-1])
+                self.assertEqual(title, ["select-pane", "-t", "%7", "-T", "thread t"])
 
     def test_watch_pane_opens_a_herdr_split_inside_herdr(self):
         self.create()
-        herdr, log = self.fake_tool(
-            "herdr", "print(json.dumps({'result': {'pane': {'pane_id': 'p9'}}})) if sys.argv[1:3] == ['pane', 'split'] else None\n")
-        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX=None, HERDR_PANE_ID="p1",
-                                        HERDR_BIN_PATH=str(herdr))
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("opened Herdr pane p9 following thread t", stdout)
-        split, run, rename = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(split, ["pane", "split", "--current", "--direction", "right", "--cwd", str(self.work.resolve())])
-        self.assertEqual(run[:3], ["pane", "run", "p9"])
-        self.assertIn("thread watch t --notify", run[3])
-        self.assertEqual(rename, ["pane", "rename", "p9", "thread t"])
+        # The layout lists every pane in the tab; p0 is a narrow neighbour, p1 is the caller.
+        herdr, log = self.fake_tool("herdr", (
+            "import os\n"
+            "if sys.argv[1:3] == ['pane', 'layout']:\n"
+            "    size = os.environ.get('FAKE_PANE_SIZE')\n"
+            "    if not size: sys.exit(2)\n"
+            "    w, h = map(int, size.split())\n"
+            "    print(json.dumps({'result': {'layout': {'panes': [\n"
+            "        {'pane_id': 'p0', 'rect': {'width': 50, 'height': 40}},\n"
+            "        {'pane_id': 'p1', 'rect': {'width': w, 'height': h}}]}}}))\n"
+            "if sys.argv[1:3] == ['pane', 'split']: print(json.dumps({'result': {'pane': {'pane_id': 'p9'}}}))\n"))
+        for caller, size, direction in (
+            ("p1", "120 40", "right"),  # a fresh headless Herdr pane
+            ("p1", "100 40", "down"),   # narrow
+            ("p1", "140 80", "down"),   # tall
+            ("p1", "", "right"),        # `pane layout` failed
+            ("p5", "100 40", "right"),  # the caller is not in the layout: unknown, not p0's shape
+        ):
+            with self.subTest(caller=caller, size=size):
+                log.unlink(missing_ok=True)
+                code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX=None, HERDR_PANE_ID=caller,
+                                                HERDR_BIN_PATH=str(herdr), FAKE_PANE_SIZE=size)
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("opened Herdr pane p9 following thread t", stdout)
+                layout, split, run, rename = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(layout, ["pane", "layout", "--current"])
+                self.assertEqual(split, ["pane", "split", "--current", "--direction", direction,
+                                         "--cwd", str(self.work.resolve())])
+                self.assertEqual(run[:3], ["pane", "run", "p9"])
+                self.assertIn("thread watch t --notify", run[3])
+                self.assertEqual(rename, ["pane", "rename", "p9", "thread t"])
 
     def test_watch_pane_without_a_multiplexer_prints_the_command(self):
         self.create()
