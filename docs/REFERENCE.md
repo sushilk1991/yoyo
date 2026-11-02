@@ -237,12 +237,12 @@ run_id=$(yoyo research --background "Should we adopt X?")
 run_id=$(yoyo review --background)
 run_id=$(yoyo review --cwd "$PWD" --background)
 yoyo runs list
-yoyo wait "$run_id"            # blocks until done, exits with the run's exit code
+yoyo wait "$run_id"            # blocks until done, exits with the run's exit code (a finished 124 exits 1)
 yoyo runs show "$run_id" --json
 yoyo runs prune --days 7
 ```
 
-`yoyo wait` exit codes: 124 = still running (wait again); 0 = success (result on stdout); anything else = failed or died. The 124 path reports proof of life — the poll expired, not the run — with how long the run has been going and the freshest progress on disk: the last heartbeat line from `log.txt`, else the captured byte counts. Under `--json` those arrive as `run_status`, `elapsed_s`, `last_progress`, `stdout_bytes`, `stderr_bytes` alongside the unchanged `run_id` and `status`. Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`). A run reports `running` only while its recorded pid still belongs to the process that started it: the ledger stores the pid's start time alongside it, because a pid on its own is reused, and a run killed hard enough to skip writing its result would otherwise read as `running` forever — polled by `wait` and skipped by `prune`. The check needs both halves, so a record written before this release, or one on a host where `ps` cannot answer, falls back to the pid alone and stays as permissive as it was. Argument validation still happens in the foreground, so a bad agent name fails loudly before detaching.
+`yoyo wait` exit codes: 124 = still running (wait again); 0 = success (result on stdout); anything else = failed or died. 124 is reserved for a live poll: a finished run that recorded 124 (yoyo's `--timeout` or `--idle-timeout`, or the agent's own exit) makes `wait` exit 1, while the printed result and `result.json` keep the recorded 124, so a caller that polls while the exit is 124 never spins on a finished run. The 124 path reports proof of life — the poll expired, not the run — with how long the run has been going and the freshest progress on disk: the last heartbeat line from `log.txt`, else the captured byte counts. Under `--json` those arrive as `run_status`, `elapsed_s`, `last_progress`, `stdout_bytes`, `stderr_bytes` alongside the unchanged `run_id` and `status`. Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`). A run reports `running` only while its recorded pid still belongs to the process that started it: the ledger stores the pid's start time alongside it, because a pid on its own is reused, and a run killed hard enough to skip writing its result would otherwise read as `running` forever — polled by `wait` and skipped by `prune`. The check needs both halves, so a record written before this release, or one on a host where `ps` cannot answer, falls back to the pid alone and stays as permissive as it was. Argument validation still happens in the foreground, so a bad agent name fails loudly before detaching.
 
 ## The call journal and autopsy
 
@@ -309,6 +309,21 @@ yoyo thread rm design
 - **Permissions.** A thread turn is **read-only by default**, because its prompt carries other agents' unverified output. `--write` grants full access for that one turn; nothing inherits it. `--thread` rejects `--agent-arg` (a raw backend flag could override the turn's permission mode), `--session`, `--raw`, comma fan-outs, and `--judge`.
 - **One speaker at a time.** A turn holds the thread's lock for its whole run. A second turn started meanwhile fails at once, naming the turn, agent, and pid it is waiting on — it does not queue, because it would answer a history it never saw. Each turn runs in the thread's cwd; a conflicting `--cwd` is refused.
 - **Records.** `$YOYO_STATE_DIR/threads/NAME/` (directory 0700, files 0600, written atomically) holds `manifest.json` and one `turns/NNNNNN.json` per turn: question, answer, agent, requested model, permission mode, status, exit code, duration, the call's run id, and `context` — which turns were delivered `full`, `truncated`, `excerpted`, or `omitted`, and the delivered byte count. Status is `answered`, `failed`, `timed_out`, `interrupted`, or `running`. A turn whose yoyo process is killed is stamped `interrupted` by the signal handler, or by the next turn if the process died too hard to stamp it; an uncertain turn is never re-run. A turn that is not `answered` exits nonzero, including an agent that exits 0 with an empty answer, which is recorded `failed` and exits 1. `--background` works: `yoyo wait` returns the answer and the turn is recorded by the detached child.
+
+### Following a thread live
+
+```bash
+yoyo thread watch design                  # the thread so far, then each turn as it happens; Ctrl-C stops watching
+yoyo thread watch design --pane           # the same view in a new pane beside you (tmux or Herdr)
+yoyo thread watch design --events         # one line per event, for a caller to follow
+yoyo thread watch design --json --from 5  # the events as JSON lines, starting at turn 5
+```
+
+`watch` only reads: it takes no lock and never writes a turn, so it can run beside any turn. The default view prints each turn in full, then follows: a turn's question when it starts, its answer and status when it ends, notes as they are recorded, and membership changes. While a turn runs, a codex turn shows one line per command and message, condensed from its live log; agents that send their answer only at the end (claude, pi) show a heartbeat every 30 seconds. A running turn records its call's run id when the call starts, so the watcher finds that log. Agent text is printed without terminal escape sequences, other control characters, or bidi overrides; `thread show` strips them too.
+
+`--events` prints one line per event (`design #3 claude answered (3m10s): <first line>`), and `--json` turns them into JSON lines with `thread`, `event` (`brief`, `note`, `started`, `finished`, `members`, `removed`), `turn`, `agent`, `status`, `duration_s`, and `text`. Turns that already finished replay as `finished` events; `--from N` skips earlier turns. The watch ends when the thread is removed (exit 0), after `--timeout SECONDS`, or on Ctrl-C; `--poll` sets the check interval (default 1s).
+
+`--pane` opens the view beside the caller and returns. Inside tmux (`TMUX` set) it runs `tmux split-window -h -d` in the thread's cwd and titles the pane. Inside Herdr (`HERDR_PANE_ID` set) it runs `herdr pane split --current --direction right`, starts the watch in the new pane with `--notify`, and renames the pane; `--notify` shows a Herdr notification when a turn finishes. The innermost multiplexer wins when both are set. Otherwise `--pane` exits 1 and prints the command to run in another terminal. A custom `YOYO_STATE_DIR` is passed to the pane explicitly, because a pane starts from the multiplexer's environment.
 
 ### Handing a thread to another tool
 

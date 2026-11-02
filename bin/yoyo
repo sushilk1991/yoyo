@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-VERSION = "0.30.1"
+VERSION = "0.31.0"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -2688,6 +2688,12 @@ def execute_agent_call(
 
         started = time.monotonic()
         journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(agent_name, cmd, args, cwd, prompt)
+        on_journal = getattr(args, "_on_call_journal", None)
+        if journal_dir is not None and on_journal is not None:
+            try:
+                on_journal(journal_dir)
+            except (YoyoError, OSError):
+                pass  # a watcher hint must never fail the call
         # Captures live in the journal dir when one exists, so the evidence
         # (bytes written so far) survives even if the caller kills yoyo.
         capture_dir = journal_dir if journal_dir is not None else tmpdir
@@ -4962,7 +4968,11 @@ def wait_run(args: argparse.Namespace) -> int:
         run_dir = run_dir_for(args.run_id)
         status = run_status(run_dir)
         if status == "done":
-            return show_run(args.run_id, args.json, exit_with_result=True)
+            code = show_run(args.run_id, args.json, exit_with_result=True)
+            # 124 is this command's "poll expired, still running". A finished
+            # run that recorded 124 (a yoyo clock or the agent's own exit) is
+            # terminal; result.json and the printed envelope keep the real 124.
+            return 1 if code == TIMEOUT_EXIT_CODE else code
         if status in ("dead", "unknown"):
             if args.json:
                 meta = run_meta(run_dir)
@@ -5580,6 +5590,9 @@ def run_thread_turn(args: argparse.Namespace, agents: dict[str, AgentSpec]) -> i
             "pid_started": pid_start_time(os.getpid()),
             "created_at": iso_utc(utc_now()),
             "context": context,
+            # For `thread watch`: how to read this agent's live log.
+            "flavor": getattr(agents.get(args.agent), "flavor", None),
+            "buffers_output": bool(getattr(agents.get(args.agent), "buffers_output", False)),
         }
         if args.dry_run:
             turn["id"] = max((int(t["id"]) for t in turns), default=0) + 1
@@ -5597,6 +5610,12 @@ def run_thread_turn(args: argparse.Namespace, agents: dict[str, AgentSpec]) -> i
             emit_dry_run_result(result, args.json)
             return 0
 
+        def record_journal(journal_dir: Path) -> None:
+            # A watcher finds the running turn's live log through this run id.
+            turn["run_id"] = journal_dir.name
+            write_thread_turn(tdir, turn)
+
+        args._on_call_journal = record_journal
         # Registered for the signal handler until the outcome is on disk, so
         # a kill at any point leaves either the result or `interrupted`.
         _register_thread_turn(tdir, turn)
@@ -5613,6 +5632,12 @@ def run_thread_turn(args: argparse.Namespace, agents: dict[str, AgentSpec]) -> i
             raise
 
         status = classify_thread_result(result)
+        if status == "failed" and int(result.get("exit_code", 1)) == 0:
+            # The envelope carries the exit code `wait` returns for a background
+            # turn, so an empty answer must not read as success there either.
+            result["exit_code"] = 1
+            if not str(result.get("stderr") or "").strip():
+                result["stderr"] = "the agent exited 0 with no answer"
         turn.update({
             "status": status,
             "answer": str(result.get("stdout") or ""),
@@ -5632,9 +5657,7 @@ def run_thread_turn(args: argparse.Namespace, agents: dict[str, AgentSpec]) -> i
     emit_result(result, args.json)
     if not args.json:
         eprint(f"thread {name}: turn {turn['id']} {status} ({args.agent})")
-    code = int(result.get("exit_code", 1))
-    # An empty answer is recorded as failed; exit 0 would tell the caller it answered.
-    return 1 if status != "answered" and code == 0 else code
+    return int(result.get("exit_code", 1))
 
 
 def thread_members_arg(raw: str | None, extra: list[str] | None = None) -> list[str]:
@@ -5862,19 +5885,19 @@ def thread_show(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"manifest": manifest, "turns": [thread_public_turn(t) for t in turns]}, ensure_ascii=False))
         return 0
-    print(f"thread {name}  cwd={manifest.get('cwd')}  members={','.join(manifest['members']) or '-'}  turns={len(turns)}")
+    print(terminal_safe(f"thread {name}  cwd={manifest.get('cwd')}  members={','.join(manifest['members']) or '-'}  turns={len(turns)}"))
     for turn in turns:
         print()
-        print(f"--- {thread_turn_label(turn)} ---")
+        print(terminal_safe(f"--- {thread_turn_label(turn)} ---"))
         body = thread_turn_body(turn).split("\n", 1)
-        print(body[1] if len(body) > 1 else "")
+        print(terminal_safe(body[1]) if len(body) > 1 else "")
         if turn.get("kind") == "ask" and turn.get("run_id"):
             run_line = f"(run {turn['run_id']}"
             if turn.get("duration_s") is not None:
                 run_line += f", {turn['duration_s']}s"
             print(run_line + ")")
         if turn.get("error") and thread_turn_view_status(turn) != "answered":
-            print(f"(error: {_first_line(turn['error'], 300)})")
+            print(f"(error: {terminal_safe(_first_line(turn['error'], 300))})")
     return 0
 
 
@@ -5981,6 +6004,414 @@ def thread_export(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Thread watch: a live, read-only view of a thread for the person ---
+#
+# A thread is a record on disk, and each running turn's call journal grows as
+# the agent works, so a person can follow along without any agent's help.
+# The watcher only reads; it never takes a lock or writes a turn.
+
+DEFAULT_THREAD_WATCH_POLL = 1.0
+THREAD_WATCH_HEARTBEAT_S = 30.0
+THREAD_WATCH_LINE_CHARS = 200
+THREAD_WATCH_READ_BYTES = 256 * 1024
+_TERMINAL_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
+_TERMINAL_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TERMINAL_ESC_RE = re.compile(r"\x1b[@-Z\\-_]")
+_TERMINAL_CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]")
+CODEX_LOG_HEADERS = frozenset({"user", "codex", "exec", "thinking", "tokens used"})
+_CODEX_SHELL_RE = re.compile(r"""^\S*sh -lc (["'])(.*)\1(?: in \S.*)?$""")
+_CODEX_EXITED_RE = re.compile(r"^\s*exited (\d+) in ")
+_BARE_HEADING_RE = re.compile(r"#+\s*[\w ]{0,30}")
+
+
+def terminal_safe(text: str) -> str:
+    """Agent text bound for a person's terminal, minus what the terminal would act on.
+
+    Answers are untrusted: an escape sequence in one could retitle the window,
+    clear the screen, or hide text. Newlines and tabs survive; other control
+    characters and bidi overrides do not.
+    """
+    text = _TERMINAL_OSC_RE.sub("", str(text))
+    text = _TERMINAL_CSI_RE.sub("", text)
+    text = _TERMINAL_ESC_RE.sub("", text)
+    return _TERMINAL_CONTROL_RE.sub("", text.replace("\r\n", "\n"))
+
+
+def _clip(text: str, limit: int = THREAD_WATCH_LINE_CHARS) -> str:
+    text = terminal_safe(text).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _watch_duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        return ""
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def _watch_excerpt(text: Any) -> str:
+    """The first line worth reading: skips blank lines and bare markdown headings."""
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or _BARE_HEADING_RE.fullmatch(line):
+            continue
+        return _clip(line)
+    return _clip(_first_line(str(text or "")))
+
+
+def _turn_elapsed(turn: dict[str, Any]) -> float | None:
+    if turn.get("duration_s") is not None:
+        return turn["duration_s"]
+    started = parse_iso_utc(turn.get("created_at"))
+    return (utc_now() - started).total_seconds() if started else None
+
+
+class _CodexActivity:
+    """Condense `codex exec`'s human log into one line per command or message.
+
+    The log is plain text with section headers (`exec`, `codex`, ...); an
+    unfamiliar format just yields nothing, and the heartbeat still shows life.
+    """
+
+    def __init__(self) -> None:
+        self.section: str | None = None
+        self.expect_first = False
+
+    def feed(self, line: str) -> list[str]:
+        stripped = line.strip()
+        if stripped in CODEX_LOG_HEADERS:
+            self.section = stripped
+            self.expect_first = stripped in ("codex", "exec", "thinking")
+            return []
+        if line.startswith("hook: ") or self.section in (None, "user", "tokens used"):
+            return []
+        if self.section == "exec":
+            if self.expect_first and stripped:
+                self.expect_first = False
+                match = _CODEX_SHELL_RE.match(stripped)
+                command = stripped
+                if match:
+                    command = match.group(2).replace('\\"', '"') if match.group(1) == '"' else match.group(2)
+                return ["$ " + _clip(command)]
+            exited = _CODEX_EXITED_RE.match(line)
+            return [f"  (exited {exited.group(1)})"] if exited and exited.group(1) != "0" else []
+        if self.expect_first and stripped and not _BARE_HEADING_RE.fullmatch(stripped):
+            self.expect_first = False
+            return [f"{self.section}: {_clip(stripped)}"]
+        return []
+
+
+class _TurnActivity:
+    """Follow one running turn: condensed live log lines, else a heartbeat."""
+
+    def __init__(self, turn: dict[str, Any], now: float) -> None:
+        self.agent = str(turn.get("agent") or "agent")
+        self.condenser = _CodexActivity() if turn.get("flavor") == "codex" else None
+        self.journal: Path | None = None
+        self.offset = 0
+        self.partial = b""
+        self.last_line = now
+        self.update(turn)
+
+    def update(self, turn: dict[str, Any]) -> None:
+        run_id = turn.get("run_id")
+        if self.journal is None and isinstance(run_id, str):
+            try:
+                self.journal = run_dir_for(run_id)
+            except YoyoError:
+                pass
+
+    def _new_lines(self) -> list[str]:
+        if self.condenser is None or self.journal is None:
+            return []
+        try:
+            with (self.journal / "stderr.txt").open("rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read(THREAD_WATCH_READ_BYTES)
+        except OSError:
+            return []
+        self.offset += len(chunk)
+        data = self.partial + chunk
+        *complete, self.partial = data.split(b"\n")
+        lines: list[str] = []
+        for raw in complete:
+            lines += self.condenser.feed(raw.decode("utf-8", errors="replace"))
+        return lines
+
+    def captured_bytes(self) -> int:
+        if self.journal is None:
+            return 0
+        return sum(_safe_size(self.journal / name) or 0 for name in ("stdout.txt", "stderr.txt"))
+
+    def pump(self, now: float, elapsed: float | None) -> list[str]:
+        lines = self._new_lines()
+        if lines:
+            self.last_line = now
+            return lines
+        if now - self.last_line >= THREAD_WATCH_HEARTBEAT_S:
+            self.last_line = now
+            size = self.captured_bytes()
+            captured = f", {size // 1024} KB captured" if size >= 1024 else ""
+            when = f" {_watch_duration(elapsed)}" if elapsed is not None else ""
+            return [f"… {self.agent} working{when}{captured}"]
+        return []
+
+
+def _herdr_bin() -> str | None:
+    return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+
+
+def herdr_notify(title: str, body: str) -> None:
+    """Best-effort Herdr toast; a display hint must never stop the watch."""
+    herdr = _herdr_bin()
+    if not (os.environ.get("HERDR_PANE_ID") and herdr):
+        return
+    try:
+        subprocess.run([herdr, "notification", "show", title, "--body", body],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+class _ThreadWatchPrinter:
+    """Render watch events as a readable transcript, one-line events, or JSONL."""
+
+    def __init__(self, name: str, *, events: bool, as_json: bool, notify: bool) -> None:
+        self.name = name
+        self.mode = "json" if as_json else ("events" if events else "view")
+        self.notify = notify
+
+    def _out(self, text: str = "") -> None:
+        # Every line, not just answers: agent and caller names can come from
+        # an imported export. JSON already escapes C0 controls; this strips
+        # the C1 and bidi characters it leaves alone.
+        print(terminal_safe(text), flush=True)
+
+    def _event(self, event: str, text: str, **fields: Any) -> None:
+        if self.mode == "json":
+            self._out(json.dumps({"thread": self.name, "event": event, **fields, "text": text}, ensure_ascii=False))
+        else:
+            self._out(text)
+
+    def header(self, manifest: dict[str, Any]) -> None:
+        if self.mode == "view":
+            members = ", ".join(manifest.get("members") or []) or "none yet"
+            self._out(f"── thread {self.name} · members: {members} · cwd {terminal_safe(manifest.get('cwd') or '')} ──")
+            self._out("(following live; Ctrl-C stops watching, not the thread)")
+
+    def members(self, members: list[str]) -> None:
+        listed = ", ".join(members) or "none"
+        if self.mode == "view":
+            self._out(f"\n── members now: {listed} ──")
+        else:
+            self._event("members", f"{self.name} members: {listed}", members=members)
+
+    def removed(self) -> None:
+        if self.mode == "view":
+            self._out(f"\n── thread {self.name} was removed ──")
+        else:
+            self._event("removed", f"{self.name} removed")
+
+    def turn_seen(self, turn: dict[str, Any], status: str, *, live: bool = False) -> None:
+        tid, kind, agent = turn["id"], turn.get("kind"), turn.get("agent")
+        if kind != "ask":
+            label = "brief" if kind == "seed" else "note"
+            if self.mode == "view":
+                self._out(f"\n── {thread_turn_label(turn)} ──")
+                self._out(terminal_safe(str(turn.get("text") or "").strip()))
+            else:
+                self._event(label, f"{self.name} #{tid} {label}: {_watch_excerpt(turn.get('text'))}", turn=tid)
+            return
+        if self.mode != "view":
+            if status == "running":
+                self._event("started", f"{self.name} #{tid} {agent} started: {_watch_excerpt(turn.get('question'))}",
+                            turn=tid, agent=agent)
+            else:
+                self.turn_finished(turn, status, live=live)
+            return
+        self._out(f"\n── turn {tid} · {thread_caller_name(turn)} asked {agent} ──")
+        self._out("Question:")
+        self._out(terminal_safe(str(turn.get("question") or "").strip() or "(prompt given on stdin or in files)"))
+        if status == "running" and turn.get("buffers_output") and turn.get("flavor") != "codex":
+            self._out(f"  ({agent} sends its answer when it finishes)")
+        if status != "running":
+            self.turn_finished(turn, status, live=live)
+
+    def activity(self, lines: list[str]) -> None:
+        if self.mode == "view":
+            for line in lines:
+                self._out("  " + line)
+
+    def turn_finished(self, turn: dict[str, Any], status: str, *, live: bool) -> None:
+        tid, agent = turn["id"], turn.get("agent")
+        took = _watch_duration(_turn_elapsed(turn))
+        timing = f" ({took})" if took else ""
+        answer = str(turn.get("answer") or "").strip()
+        error = _first_line(str(turn.get("error") or ""), THREAD_WATCH_LINE_CHARS)
+        if self.mode == "view":
+            self._out(f"── turn {tid} · {agent} {status}{timing} ──")
+            if answer:
+                self._out(terminal_safe(answer))
+            if status != "answered" and error:
+                self._out(f"(error: {terminal_safe(error)})")
+        else:
+            detail = _watch_excerpt(answer) if status == "answered" else _clip(error or status)
+            self._event("finished", f"{self.name} #{tid} {agent} {status}{timing}: {detail}",
+                        turn=tid, agent=agent, status=status, duration_s=turn.get("duration_s"))
+        if live and self.notify:
+            herdr_notify(f"yoyo thread {self.name}", f"turn {tid}: {agent} {status}")
+
+
+def thread_watch(args: argparse.Namespace) -> int:
+    name = args.thread_name
+    if not name or args.thread_args:
+        raise YoyoError("usage: yoyo thread watch NAME [--pane] [--events] [--from N]")
+    tdir = existing_thread_dir(name)
+    poll = DEFAULT_THREAD_WATCH_POLL if args.poll is None else args.poll
+    if poll <= 0:
+        raise YoyoError("--poll must be greater than 0")
+    if args.watch_timeout is not None and args.watch_timeout <= 0:
+        raise YoyoError("--timeout must be greater than 0")
+    if args.watch_from < 1:
+        raise YoyoError("--from must be a turn number, 1 or more")
+    if args.pane:
+        if args.events or args.json or args.watch_timeout is not None:
+            raise YoyoError("--pane opens the live view for a person; --events, --json and --timeout are for running watch yourself")
+        return open_thread_watch_pane(args, tdir)
+
+    printer = _ThreadWatchPrinter(name, events=args.events, as_json=args.json, notify=args.notify)
+    inode = tdir.stat().st_ino
+    manifest = load_thread_manifest(tdir)
+    members = list(manifest.get("members") or [])
+    printer.header(manifest)
+    shown: dict[int, str] = {}
+    live: dict[int, _TurnActivity] = {}
+    deadline = None if args.watch_timeout is None else time.monotonic() + args.watch_timeout
+    replaying = True
+    while True:
+        try:
+            gone = tdir.stat().st_ino != inode or not (tdir / "manifest.json").is_file()
+        except OSError:
+            gone = True
+        if gone:
+            printer.removed()
+            return 0
+        try:
+            current = list(load_thread_manifest(tdir).get("members") or [])
+        except YoyoError:
+            current = members
+        if current != members:
+            members = current
+            printer.members(members)
+        now = time.monotonic()
+        for turn in load_thread_turns(tdir):
+            tid = int(turn["id"])
+            if tid < args.watch_from:
+                continue
+            status = thread_turn_view_status(turn)
+            if status == "interrupted" and turn.get("status") == "running":
+                # The snapshot may predate the final write: a turn records its
+                # result before its process exits, so read it once more.
+                fresh = load_json_file(thread_turn_path(tdir, tid))
+                if isinstance(fresh, dict) and fresh.get("id") == tid and fresh.get("status") != "running":
+                    turn, status = fresh, thread_turn_view_status(fresh)
+            before = shown.get(tid)
+            if before is None:
+                printer.turn_seen(turn, status, live=not replaying)
+                shown[tid] = status
+                if status == "running":
+                    live[tid] = _TurnActivity(turn, now)
+            elif before == "running" and status != "running":
+                activity = live.pop(tid, None)
+                if activity is not None:
+                    activity.update(turn)
+                    printer.activity(activity.pump(now, None))
+                printer.turn_finished(turn, status, live=True)
+                shown[tid] = status
+            if status == "running" and tid in live:
+                live[tid].update(turn)
+                printer.activity(live[tid].pump(now, _turn_elapsed(turn)))
+        replaying = False
+        if deadline is not None and time.monotonic() >= deadline:
+            return 0
+        time.sleep(poll)
+
+
+def thread_watch_command(args: argparse.Namespace, name: str, *, notify: bool) -> list[str]:
+    """The command a new pane runs: this same yoyo, the same state dir."""
+    script = Path(__file__).resolve()
+    installed = shutil.which("yoyo")
+    if installed and Path(installed).resolve() == script:
+        command = ["yoyo"]
+    else:
+        command = [sys.executable, str(script)]
+    command += ["thread", "watch", name]
+    if args.watch_from != 1:
+        command += ["--from", str(args.watch_from)]
+    if args.poll is not None:
+        command += ["--poll", str(args.poll)]
+    if notify:
+        command.append("--notify")
+    if os.environ.get("YOYO_STATE_DIR"):
+        # A pane starts from the multiplexer's environment, not ours.
+        command = ["env", f"YOYO_STATE_DIR={state_dir().resolve()}", *command]
+    return command
+
+
+def _pane_step(argv: list[str], what: str, manual: str) -> str:
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise YoyoError(f"could not {what}: {exc}. Run this in another terminal instead: {manual}") from exc
+    if proc.returncode != 0:
+        detail = _first_line(proc.stderr or proc.stdout, 300) or f"exit {proc.returncode}"
+        raise YoyoError(f"could not {what}: {detail}. Run this in another terminal instead: {manual}")
+    return proc.stdout
+
+
+def _pane_label(argv: list[str]) -> None:
+    # A pane title is cosmetic; the pane is already open and watching.
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def open_thread_watch_pane(args: argparse.Namespace, tdir: Path) -> int:
+    """Open `thread watch` beside the caller: tmux if inside it, else Herdr."""
+    name = args.thread_name
+    cwd = str(load_thread_manifest(tdir).get("cwd") or os.getcwd())
+    manual = shlex.join(thread_watch_command(args, name, notify=False))
+    # The innermost multiplexer is the one the person is looking at.
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        out = _pane_step(["tmux", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "-c", cwd, manual],
+                         "open a tmux pane", manual)
+        pane = out.strip()
+        if pane:
+            _pane_label(["tmux", "select-pane", "-t", pane, "-T", f"thread {name}"])
+        print(f"opened tmux pane {pane or '(new)'} following thread {name}")
+        return 0
+    herdr = _herdr_bin()
+    if os.environ.get("HERDR_PANE_ID") and herdr:
+        command = shlex.join(thread_watch_command(args, name, notify=True))
+        out = _pane_step([herdr, "pane", "split", "--current", "--direction", "right", "--cwd", cwd],
+                         "open a Herdr pane", manual)
+        try:
+            pane = str(json.loads(out)["result"]["pane"]["pane_id"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise YoyoError(f"could not read the new Herdr pane id from: {_first_line(out, 200)}. Run this in another terminal instead: {manual}") from exc
+        _pane_step([herdr, "pane", "run", pane, command], "start the watch in the Herdr pane", manual)
+        _pane_label([herdr, "pane", "rename", pane, f"thread {name}"])
+        print(f"opened Herdr pane {pane} following thread {name}")
+        return 0
+    eprint("yoyo: no tmux or Herdr pane to open from (TMUX and HERDR_PANE_ID are unset). Run this in another terminal:")
+    print(manual)
+    return 1
+
+
 def cmd_thread(args: argparse.Namespace) -> int:
     action = args.thread_action
     creation_only = {"agents": "--agents", "seed": "--seed", "from_file": "--from-file"}
@@ -5992,12 +6423,20 @@ def cmd_thread(args: argparse.Namespace) -> int:
         raise YoyoError("--format and --out are only for thread export")
     if args.history_bytes is not None and not (action == "export" and args.format == "brief"):
         raise YoyoError("--history-bytes on thread applies to export --format brief; pass it to ask --thread for a turn")
+    watch_only = {"pane": "--pane", "events": "--events", "notify": "--notify", "poll": "--poll", "watch_timeout": "--timeout"}
+    if action != "watch":
+        used = [flag for key, flag in watch_only.items() if getattr(args, key, None) not in (None, False)]
+        if args.watch_from != 1:
+            used.append("--from")
+        if used:
+            raise YoyoError(f"{', '.join(used)} only appl{'ies' if len(used) == 1 else 'y'} to thread watch")
     handlers = {
         "create": thread_create,
         "invite": thread_invite,
         "uninvite": lambda a: thread_invite(a, remove=True),
         "note": thread_note,
         "show": thread_show,
+        "watch": thread_watch,
         "list": thread_list,
         "export": thread_export,
         "rm": thread_rm,
@@ -7139,7 +7578,7 @@ def build_parser() -> argparse.ArgumentParser:
         "thread",
         help="Shared threads: invite several agents into one yoyo-owned conversation; each `ask --thread` is one caller-chosen turn",
     )
-    thread.add_argument("thread_action", choices=["create", "invite", "uninvite", "note", "show", "list", "export", "rm"])
+    thread.add_argument("thread_action", choices=["create", "invite", "uninvite", "note", "show", "watch", "list", "export", "rm"])
     thread.add_argument("thread_name", nargs="?")
     thread.add_argument("thread_args", nargs="*", help="invite/uninvite: agent names; note: the note text")
     thread.add_argument("--agents", help="create: comma-separated initial members")
@@ -7150,6 +7589,12 @@ def build_parser() -> argparse.ArgumentParser:
     thread.add_argument("--format", choices=["md", "json", "brief"], default="md", help="export: md transcript, json for --from-file, or brief: the packed handoff to paste into another tool")
     thread.add_argument("--out", help="export: write to this file instead of stdout")
     thread.add_argument("--history-bytes", type=int, default=None, help="export --format brief: UTF-8 budget for the packed history")
+    thread.add_argument("--pane", action="store_true", help="watch: open the live view in a new tmux or Herdr pane beside this one")
+    thread.add_argument("--events", action="store_true", help="watch: one line per turn event (started, finished, note), for a caller to follow; --json makes them JSON lines")
+    thread.add_argument("--notify", action="store_true", help="watch: show a Herdr notification when a turn finishes (inside Herdr only)")
+    thread.add_argument("--from", dest="watch_from", type=int, default=1, help="watch: start at this turn number (default 1, the whole thread)")
+    thread.add_argument("--poll", type=float, default=None, help=f"watch: seconds between checks (default {DEFAULT_THREAD_WATCH_POLL:g})")
+    thread.add_argument("--timeout", dest="watch_timeout", type=float, default=None, help="watch: stop watching after this many seconds (default: until the thread is removed or Ctrl-C)")
     thread.add_argument("--json", action="store_true")
     thread.set_defaults(func=cmd_thread)
 

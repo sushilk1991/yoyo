@@ -68,6 +68,18 @@ The history is fenced and labeled as context, not instructions. That guides the 
 
 A thread ask takes one speaker and cannot be combined with `--session`, `--raw`, `--judge`, `--judge-prompt`, `--judge-only`, or `--agent-arg` (a raw backend flag could undo the read-only mode). Read-only agy denies any shell command not allowlisted in its `settings.json`, even a read-only one, and a denial ends the run with no answer. Keep agy turns to its read tools.
 
+## Let the user follow along
+
+A thread runs out of the user's sight unless you show it. When the user wants to watch the discussion, open a live view beside them, right after `create`:
+
+```bash
+yoyo thread watch auth --pane    # tmux or Herdr: each question, codex's commands as it works, each answer in full
+```
+
+`--pane` returns at once. Outside tmux and Herdr it exits 1 and prints the watch command instead; give that command to the user to run in another terminal. A pane changes the user's workspace, so offer it for a thread of several turns rather than opening one unasked.
+
+To follow the thread yourself, read `yoyo thread watch NAME --events --from N`: one line per event, such as `auth #4 claude answered (3m10s): …`. In Claude Code, run it under Monitor so each event arrives as a notification, and give the user a one-line update per turn. Watching never starts a turn; you still read each answer and choose the next speaker.
+
 ## One speaker at a time
 
 A turn holds the thread for its whole run. A second `ask --thread` while one runs is refused at once, naming the running turn, agent, and pid. Wait for that run, then ask. Notes are allowed meanwhile. For parallel answers to the same question, fan out without `--thread`, then note the results into the thread.

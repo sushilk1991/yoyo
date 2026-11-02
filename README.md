@@ -70,6 +70,7 @@ yoyo loop claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --backgrou
 # Shared thread: invite several vendors into one conversation you own. Each ask is
 # one turn; the member gets the fenced history; nothing an agent writes starts a turn.
 yoyo thread create design --agents codex,claude --cwd "$PWD"
+yoyo thread watch design --pane      # follow it live in a tmux or Herdr pane
 yoyo ask codex  --thread design "Propose the migration."
 yoyo ask claude --thread design "Find the strongest flaw in codex's plan."
 yoyo thread invite design grok && yoyo ask grok --thread design "Break the tie."
@@ -106,7 +107,7 @@ Optional Apple Silicon advice is available through `yoyo advise --file evidence.
 | `yoyo review` | Cross-vendor consensus review of the current git diff (`--stance unanimous\|any` precision/recall dial) |
 | `yoyo research "..."` | Parallel perspectives (lenses fully yours to define) → decision brief |
 | `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with `--queue`, `--brief`, and `--spec` |
-| `yoyo thread` / `ask --thread` | Several agents in one yoyo-owned conversation, one caller-chosen turn at a time; export/import to hand it off |
+| `yoyo thread` / `ask --thread` | Several agents in one yoyo-owned conversation, one caller-chosen turn at a time; `thread watch` follows it live, in a pane if you like; export/import to hand it off |
 | `yoyo wait` / `runs autopsy` | Poll a detached run; reconstruct one that died |
 | `yoyo runs audit` | Per-agent outcomes and p50/p90 over a window of the ledger |
 | `yoyo models codex\|claude` | Native account and model discovery, with no inference |

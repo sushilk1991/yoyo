@@ -167,7 +167,7 @@ Be the judge yourself when you hold the decision context; use `--judge` when you
 
 ## Threads: invite another agent into the conversation
 
-A thread keeps that rule while sparing you the copy-paste. yoyo records the conversation; each `yoyo ask AGENT --thread NAME` is one turn by one invited member, which sees a bounded copy of the earlier turns. Agent text never schedules a turn: you read, check, write what you verified with `yoyo thread note`, and choose who speaks next. Use a thread when one agent should answer another's claim, or for several turns with an agent that has no `--session`. For independent opinions, fan out instead, because a thread anchors each speaker on the last. Recipe, turn numbering, permissions, and failure handling: see the `yoyo-thread` skill.
+A thread keeps that rule while sparing you the copy-paste. yoyo records the conversation; each `yoyo ask AGENT --thread NAME` is one turn by one invited member, which sees a bounded copy of the earlier turns. Agent text never schedules a turn: you read, check, write what you verified with `yoyo thread note`, and choose who speaks next. Use a thread when one agent should answer another's claim, or for several turns with an agent that has no `--session`. For independent opinions, fan out instead, because a thread anchors each speaker on the last. `yoyo thread watch NAME --pane` gives the user a live view of the discussion. Recipe, turn numbering, permissions, live views, and failure handling: see the `yoyo-thread` skill.
 
 ## Write the prompt so the answer is checkable
 

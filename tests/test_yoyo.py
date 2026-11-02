@@ -73,7 +73,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.30.1")
+        self.assertEqual(stdout.strip(), "yoyo 0.31.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -417,6 +417,42 @@ class YoyoTests(CliTestCase):
             self.assertIn("poll expired", stderr)
             self.assertIn(run_id, stderr)
             self.assertIn("7 bytes stdout", stderr)
+
+    def _finished_run(self, tmp, run_id, result):
+        run_dir = self._write_run_meta(tmp, run_id, pid=99999999)
+        (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        return run_dir
+
+    def test_wait_on_a_finished_timed_out_run_exits_one_not_124(self):
+        # 124 from wait means "still running, poll again"; a finished run that
+        # recorded 124 must not send an exit-code-only caller into that loop.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"YOYO_STATE_DIR": tmp}
+            run_id = "20000101T000000-00000124"
+            self._finished_run(tmp, run_id, {"exit_code": 124, "timed_out": True, "timeout_s": 1,
+                                             "stdout": "partial", "stderr": "Timed out after 1s"})
+            code, stdout, stderr = self.run_cli(["wait", run_id, "--timeout", "1", "--poll", "0.01"], env=env)
+            self.assertEqual(code, 1, stderr)
+            self.assertIn("partial", stdout)
+            self.assertIn("Timed out after 1s", stderr)
+            code, stdout, _ = self.run_cli(["wait", run_id, "--timeout", "1", "--poll", "0.01", "--json"], env=env)
+            self.assertEqual(code, 1)
+            payload = json.loads(stdout)
+            self.assertEqual((payload["exit_code"], payload["status"], payload["timed_out"]), (124, "done", True))
+
+    def test_wait_on_an_agents_own_exit_124_also_exits_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "20000101T000000-00000125"
+            self._finished_run(tmp, run_id, {"exit_code": 124, "stdout": "", "stderr": "the agent chose 124"})
+            code, _, _ = self.run_cli(["wait", run_id, "--timeout", "1", "--poll", "0.01"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 1)
+
+    def test_wait_passes_other_finished_exit_codes_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "20000101T000000-00000007"
+            self._finished_run(tmp, run_id, {"exit_code": 7, "stdout": "", "stderr": "seven"})
+            code, _, _ = self.run_cli(["wait", run_id, "--timeout", "1", "--poll", "0.01"], env={"YOYO_STATE_DIR": tmp})
+            self.assertEqual(code, 7)
 
     def test_wait_timeout_reports_proof_of_life(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6461,6 +6497,18 @@ class ThreadTests(CliTestCase):
         self.assertIn("turn 1 failed (mute)", stderr)
         self.assertEqual(self.turns()[0]["status"], "failed")
 
+    def test_background_empty_answer_turn_makes_wait_exit_nonzero(self):
+        # wait returns the envelope's exit code, so the envelope must say 1 too.
+        self.write_agents(mute=self.agent("mute", "sys.stdin.read()"))
+        self.create(agents="mute")
+        code, stdout, stderr = self.ask("mute", "say something", "--background")
+        self.assertEqual(code, 0, stderr)
+        code, _, stderr = self.cli(["wait", stdout.strip(), "--timeout", "20", "--poll", "0.05"])
+        self.assertEqual(code, 1, stderr)
+        turn = self.turns()[0]
+        self.assertEqual(turn["status"], "failed")
+        self.assertIn("exited 0 with no answer", turn["error"])
+
     def test_dry_run_reserves_no_turn(self):
         self.create()
         code, stdout, stderr = self.ask("echoa", "plan", "--dry-run")
@@ -6669,6 +6717,254 @@ class ThreadTests(CliTestCase):
             "either --seed or --from-file": ["thread", "create", "u", "--seed", "a", "--from-file", "b"],
             "needs text": ["thread", "note", "t"],
             "--history-bytes on thread applies": ["thread", "show", "t", "--history-bytes", "2048"],
+        }.items():
+            with self.subTest(needle=needle):
+                code, _, stderr = self.cli(argv)
+                self.assertEqual(code, 2)
+                self.assertIn(needle, stderr)
+
+    # --- watch: following a thread live ---
+
+    def watcher(self, *argv, **env):
+        # A real process, because watch follows turns that other commands write.
+        full_env = {k: v for k, v in os.environ.items() if k not in NESTING_ENV_KEYS and k not in ("TMUX", "HERDR_PANE_ID")}
+        full_env.update(self.env(**env))
+        return subprocess.Popen([sys.executable, str(YOYO_PATH), "thread", "watch", *argv],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=full_env)
+
+    def fake_tool(self, name, script):
+        bindir = self.root / "fakebin"
+        bindir.mkdir(exist_ok=True)
+        log = self.root / f"{name}.log"
+        path = bindir / name
+        path.write_text(
+            "#!/usr/bin/env python3\nimport json, sys\n"
+            f"open({str(log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n" + script,
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path, log
+
+    def test_watch_replays_the_thread_and_stops_at_its_timeout(self):
+        seed = self.work / "brief.md"
+        seed.write_text("Goal: decide the fix.", encoding="utf-8")
+        self.create("t", "echoa,echob", "--seed", str(seed))
+        self.cli(["thread", "note", "t", "Verified: line 88."])
+        self.ask("echoa", "Which fix?")
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--timeout", "0.2", "--poll", "0.05"])
+        self.assertEqual(code, 0, stderr)
+        for needle in ("turn 1 · thread brief", "Goal: decide the fix.", "Verified: line 88.",
+                       "turn 3 · caller asked echoa", "Which fix?", "turn 3 · echoa answered"):
+            self.assertIn(needle, stdout)
+
+    def test_watch_events_follow_new_turns_live_and_notify_in_herdr(self):
+        self.create()
+        herdr, herdr_log = self.fake_tool("herdr", "")
+        proc = self.watcher("t", "--events", "--notify", "--timeout", "6", "--poll", "0.05",
+                            HERDR_PANE_ID="p1", HERDR_BIN_PATH=str(herdr))
+        time.sleep(0.5)
+        self.cli(["thread", "note", "t", "Verified: nothing yet."])
+        code, _, stderr = self.ask("echoa", "Is it fine?")
+        self.assertEqual(code, 0, stderr)
+        stdout, stderr = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertIn("t #1 note: Verified: nothing yet.", stdout)
+        self.assertRegex(stdout, r"t #2 echoa answered \(\d+s\): ")
+        calls = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
+        self.assertIn(["notification", "show", "yoyo thread t", "--body", "turn 2: echoa answered"], calls)
+
+    def test_watch_json_events_are_one_object_per_line(self):
+        self.create()
+        self.cli(["thread", "note", "t", "a note"])
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--json", "--timeout", "0.1", "--poll", "0.05"])
+        self.assertEqual(code, 0, stderr)
+        events = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual([(e["thread"], e["event"], e["turn"]) for e in events], [("t", "note", 1)])
+
+    def test_watch_and_show_strip_terminal_escapes_from_answers(self):
+        payload = "print('ok \\x1b]0;pwned\\x07\\x1b[2J\\x1b[31mred\\x1b[0m \\u202eevil done')"
+        self.write_agents(painter=self.agent("painter", "sys.stdin.read(); " + payload))
+        self.create(agents="painter")
+        self.ask("painter", "paint")
+        for argv in (["thread", "watch", "t", "--timeout", "0.1", "--poll", "0.05"], ["thread", "show", "t"]):
+            with self.subTest(argv=argv[1]):
+                code, stdout, stderr = self.cli(argv)
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("ok red evil done", stdout)
+                self.assertNotIn("\x1b", stdout)
+                self.assertNotIn("\u202e", stdout)
+                self.assertNotIn("pwned", stdout)
+
+    def test_watch_and_show_strip_escapes_from_imported_names(self):
+        # Names are display text too: an import can carry an OSC 52 clipboard write.
+        export = self.root / "evil.json"
+        export.write_text(json.dumps({"yoyo_thread_export": 1, "turns": [
+            {"kind": "ask", "agent": "\x1b]52;c;cHduZWQ=\x07codex", "caller": "\x1b[2Jme",
+             "question": "q", "answer": "safe", "status": "answered"}]}), encoding="utf-8")
+        code, _, stderr = self.cli(["thread", "create", "imp", "--from-file", str(export), "--cwd", str(self.work)])
+        self.assertEqual(code, 0, stderr)
+        for argv in (["thread", "watch", "imp", "--timeout", "0.1", "--poll", "0.05"],
+                     ["thread", "watch", "imp", "--events", "--timeout", "0.1", "--poll", "0.05"],
+                     ["thread", "watch", "imp", "--json", "--timeout", "0.1", "--poll", "0.05"],
+                     ["thread", "show", "imp"]):
+            with self.subTest(argv=argv[2:4]):
+                code, stdout, stderr = self.cli(argv)
+                self.assertEqual(code, 0, stderr)
+                self.assertIn("safe", stdout)
+                self.assertNotIn("\x1b", stdout)
+                self.assertNotIn("\x07", stdout)
+
+    def test_watch_rereads_a_stale_running_snapshot_before_calling_it_interrupted(self):
+        # The turn records its answer, then exits; a snapshot read before that
+        # write plus a pid check after the exit must not hide the answer.
+        self.create()
+        self.ask("echoa", "the question")
+        final = self.turns()[0]
+        stale = dict(final, status="running", answer="", pid=99999999)
+        real_load = yoyo.load_thread_turns
+        calls = {"n": 0}
+
+        def snapshots(tdir):
+            calls["n"] += 1
+            return [dict(stale)] if calls["n"] == 1 else real_load(tdir)
+
+        with mock.patch.object(yoyo, "load_thread_turns", side_effect=snapshots), \
+                mock.patch.object(yoyo, "pid_is_running", return_value=False):
+            code, stdout, stderr = self.cli(["thread", "watch", "t", "--timeout", "0.2", "--poll", "0.05"])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("turn 1 · echoa answered", stdout)
+        self.assertNotIn("interrupted", stdout)
+
+    def test_watch_notifies_for_a_turn_that_started_and_finished_between_polls(self):
+        self.create()
+        herdr, herdr_log = self.fake_tool("herdr", "")
+        proc = self.watcher("t", "--notify", "--timeout", "5", "--poll", "2",
+                            HERDR_PANE_ID="p1", HERDR_BIN_PATH=str(herdr))
+        time.sleep(0.8)
+        code, _, stderr = self.ask("echoa", "quick one")
+        self.assertEqual(code, 0, stderr)
+        stdout, stderr = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertIn("turn 1 · echoa answered", stdout)
+        calls = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
+        self.assertIn(["notification", "show", "yoyo thread t", "--body", "turn 1: echoa answered"], calls)
+
+    def test_turn_activity_reads_a_run_id_that_arrives_late(self):
+        state = self.root / "state"
+        run_dir = state / "runs" / "20000101T000000-0000abcd"
+        run_dir.mkdir(parents=True)
+        (run_dir / "stderr.txt").write_text("exec\n/bin/zsh -lc 'ls' in /repo\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": str(state)}):
+            activity = yoyo._TurnActivity({"agent": "codex", "flavor": "codex"}, now=0.0)
+            self.assertEqual(activity.pump(1.0, 1), [])
+            activity.update({"run_id": run_dir.name})
+            self.assertEqual(activity.pump(2.0, 2), ["$ ls"])
+
+    def test_pane_command_resolves_a_relative_state_dir(self):
+        # The pane starts in the thread's cwd, so a relative path would move.
+        args = argparse.Namespace(watch_from=1, poll=None)
+        with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": "relative-state"}):
+            command = yoyo.thread_watch_command(args, "t", notify=False)
+        self.assertEqual(command[:2], ["env", f"YOYO_STATE_DIR={(Path.cwd() / 'relative-state').resolve()}"])
+
+    def test_watch_ends_when_the_thread_is_removed(self):
+        self.create()
+        proc = self.watcher("t", "--timeout", "15", "--poll", "0.05")
+        time.sleep(0.5)
+        code, _, stderr = self.cli(["thread", "rm", "t"])
+        self.assertEqual(code, 0, stderr)
+        stdout, stderr = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertIn("thread t was removed", stdout)
+
+    def test_a_running_turn_records_its_live_log_before_it_finishes(self):
+        self.write_agents(slow=self.agent("slow", "import time; sys.stdin.read(); time.sleep(3); print('late')"))
+        self.create(agents="slow")
+        code, stdout, stderr = self.ask("slow", "take your time", "--background")
+        self.assertEqual(code, 0, stderr)
+        run_id = stdout.strip()
+        deadline = time.monotonic() + 10
+        turn = {}
+        while time.monotonic() < deadline:
+            turns = self.turns()
+            turn = turns[0] if turns else {}
+            if turn.get("run_id"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(turn.get("status"), "running")
+        self.assertTrue((self.root / "state" / "runs" / turn["run_id"] / "stdout.txt").exists())
+        self.assertIn("flavor", turn)
+        code, _, stderr = self.cli(["wait", run_id, "--timeout", "20", "--poll", "0.05"])
+        self.assertEqual(code, 0, stderr)
+
+    def test_codex_activity_condenses_its_log_to_commands_and_messages(self):
+        activity = yoyo._CodexActivity()
+        log = [
+            "user", "You are being called as a reviewer.", "Return a verdict.",
+            "codex", "I'll trace the timeout paths.", "more of the same message",
+            "hook: PreToolUse", "exec",
+            '/bin/zsh -lc "rg -n \\"def wait_run\\" bin/yoyo" in /repo', " succeeded in 3ms:", "bin/yoyo:4954:def wait_run",
+            "exec", "/bin/zsh -lc 'false' in /repo", " exited 2 in 1ms:",
+            "codex", "## Verdict", "", "**Real bug.**", "tokens used", "12,345",
+        ]
+        lines = [out for line in log for out in activity.feed(line)]
+        self.assertEqual(lines, [
+            "codex: I'll trace the timeout paths.",
+            '$ rg -n "def wait_run" bin/yoyo',
+            "$ false",
+            "  (exited 2)",
+            "codex: **Real bug.**",
+        ])
+
+    def test_turn_activity_falls_back_to_a_heartbeat(self):
+        activity = yoyo._TurnActivity({"agent": "claude", "flavor": "claude"}, now=100.0)
+        self.assertEqual(activity.pump(110.0, 70), [])
+        self.assertEqual(activity.pump(131.0, 95), ["… claude working 1m35s"])
+        self.assertEqual(activity.pump(140.0, 104), [])
+
+    def test_watch_pane_opens_a_tmux_split_inside_tmux(self):
+        self.create()
+        _, log = self.fake_tool("tmux", "print('%7') if sys.argv[1] == 'split-window' else None\n")
+        path = f"{self.root / 'fakebin'}{os.pathsep}{os.environ.get('PATH', '')}"
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX="/tmp/tmux-1/default,1,0", PATH=path,
+                                        HERDR_PANE_ID=None)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("opened tmux pane %7 following thread t", stdout)
+        split, title = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(split[:7], ["split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "-c"])
+        self.assertIn("thread watch t", split[-1])
+        self.assertIn(f"YOYO_STATE_DIR={(self.root / 'state').resolve()}", split[-1])
+        self.assertEqual(title, ["select-pane", "-t", "%7", "-T", "thread t"])
+
+    def test_watch_pane_opens_a_herdr_split_inside_herdr(self):
+        self.create()
+        herdr, log = self.fake_tool(
+            "herdr", "print(json.dumps({'result': {'pane': {'pane_id': 'p9'}}})) if sys.argv[1:3] == ['pane', 'split'] else None\n")
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX=None, HERDR_PANE_ID="p1",
+                                        HERDR_BIN_PATH=str(herdr))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("opened Herdr pane p9 following thread t", stdout)
+        split, run, rename = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(split, ["pane", "split", "--current", "--direction", "right", "--cwd", str(self.work.resolve())])
+        self.assertEqual(run[:3], ["pane", "run", "p9"])
+        self.assertIn("thread watch t --notify", run[3])
+        self.assertEqual(rename, ["pane", "rename", "p9", "thread t"])
+
+    def test_watch_pane_without_a_multiplexer_prints_the_command(self):
+        self.create()
+        code, stdout, stderr = self.cli(["thread", "watch", "t", "--pane"], TMUX=None, HERDR_PANE_ID=None)
+        self.assertEqual(code, 1)
+        self.assertIn("no tmux or Herdr pane", stderr)
+        self.assertIn("thread watch t", stdout)
+
+    def test_watch_flag_misuse_fails_loudly(self):
+        self.create()
+        for needle, argv in {
+            "--pane only applies to thread watch": ["thread", "show", "t", "--pane"],
+            "--events, --from only apply to thread watch": ["thread", "show", "t", "--events", "--from", "2"],
+            "--pane opens the live view": ["thread", "watch", "t", "--pane", "--events"],
+            "--from must be a turn number": ["thread", "watch", "t", "--from", "0"],
+            "--poll must be greater than 0": ["thread", "watch", "t", "--poll", "0"],
         }.items():
             with self.subTest(needle=needle):
                 code, _, stderr = self.cli(argv)
