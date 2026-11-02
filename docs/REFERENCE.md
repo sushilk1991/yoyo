@@ -123,7 +123,7 @@ yoyo ask pi --role worker --cwd "$PWD" "Fix the failing test. Don't touch unrela
 git diff | yoyo ask claude --role review --cwd "$PWD" "Review this diff against the worktree."
 ```
 
-**Fan-out (best-of-n).** A comma-separated agent list runs the same prompt on every agent in parallel. Add `--judge <agent>` to have an independent judge compare the answers on correctness/evidence/completeness and recommend the best (or a merge). The default judge verdict leads with a **convergence/divergence map**: what the answers independently agree on, then every genuine conflict with the narrowest check that would settle it — divergence is the caller's verification work list, and cross-vendor agreement is treated as signal, not proof. `--judge-prompt "..."` replaces the judging instructions (used verbatim; the task and candidate answers are appended). Without `--judge`, you get all answers in tagged sections and judge them yourself. The judge always runs **read-only** — its prompt embeds untrusted candidate output — so the judge agent must support a read-only mode. Exit is 0 if at least one agent succeeded and a failed judge falls back to the raw answers; scripted callers should use `--json` and inspect per-result `exit_code`s. Repeating an agent (`codex,codex`) is allowed — that's a self-consistency sample. Prefer a judge that isn't among the candidates: models measurably favor their own answers.
+**Fan-out (best-of-n).** A comma-separated agent list runs the same prompt on every agent in parallel. Add `--judge <agent>` to have an independent judge compare the answers on correctness/evidence/completeness and recommend the best (or a merge). The default judge verdict leads with a **convergence/divergence map**: what the answers independently agree on, then every genuine conflict with the narrowest check that would settle it — divergence is the caller's verification work list, and cross-vendor agreement is treated as signal, not proof. The judge is **blind**: answers reach it shuffled under letter labels (`A`, `B`, …) with the agent names withheld, each between `<<<ANSWER A nonce>>>` / `<<<END ANSWER A nonce>>>` lines whose random marker no candidate can predict, so an answer cannot close its own fence and speak as the prompt. The label → agent key comes back to you, never to the judge: `judge_labels` in `--json`, a `labels: A = codex, B = claude` line under the verdict in text. `--judge-prompt "..."` replaces the judging instructions (used verbatim; the task and the same blind candidates are appended). Without `--judge`, you get all answers in tagged sections and judge them yourself. The judge always runs **read-only** — its prompt embeds untrusted candidate output — so the judge agent must support a read-only mode. Exit is 0 if at least one agent succeeded and a failed judge falls back to the raw answers; scripted callers should use `--json` and inspect per-result `exit_code`s. Repeating an agent (`codex,codex`) is allowed — that's a self-consistency sample. Prefer a judge that isn't among the candidates: models measurably favor their own answers, and blind labels do not stop a model recognizing its own style — yoyo prints a note when the judge is also a candidate.
 
 ```bash
 yoyo ask codex,claude --cwd "$PWD" "Design the rate limiter. Name the riskiest assumption." --judge grok
@@ -253,7 +253,7 @@ yoyo runs autopsy              # explain how the most recent run ended
 yoyo runs autopsy "$run_id"    # or a specific one; --json for structure
 ```
 
-When prompt capture is enabled and the parent has the prompt, its record keeps a 64 KB head in `prompt.txt` and the exact full size in metadata as `prompt_bytes`, so the autopsy opens with an `asked:` line. That size measures what was stored: the assembled prompt for a foreground call, the command-line question alone for a background parent, whose assembled prompt is built later in the child. Older records, and runs whose prompt is assembled inside a detached child, have no stored prompt and get no `asked:` line. The line reports the caller's own task or nothing: when injected skill documents fill that head the task heading falls outside it, and the autopsy omits the line rather than quoting skill text as the question. It ends where the question does — piped input and `--file` contents are attachments, and never appear in the preview.
+When prompt capture is enabled and the parent has the prompt, its record keeps a 64 KB head in `prompt.txt` and the exact full size in metadata as `prompt_bytes`, so the autopsy opens with an `asked:` line. That size measures what was stored: the assembled prompt for a foreground call, the command-line question alone for a background parent, whose assembled prompt is built later in the child. Older records, and runs whose prompt is assembled inside a detached child, have no stored prompt and get no `asked:` line. Each foreground call also keeps its normalized final answer as `answer.txt` — for codex that is the `--output-last-message` text, which lives in call scratch that is deleted when the call returns, and for cursor the decoded stream — so `yoyo runs show <run_id>` prints a foreground call's answer, not only its exit code. The line reports the caller's own task or nothing: when injected skill documents fill that head the task heading falls outside it, and the autopsy omits the line rather than quoting skill text as the question. It ends where the question does — piped input and `--file` contents are attachments, and never appear in the preview.
 
 The autopsy states, from recorded evidence, whether the run completed, failed, hit a timeout, was signal-killed (naming the signal and elapsed time), or died hard — plus captured byte counts. A run killed at exit 124 names the clock that fired and the value it fired at (`--timeout`, the caller's budget was too small, or `--idle-timeout`, the stream stalled); `--json` carries the same as `timeout_clock` and `timeout_clock_s`, null when the record cannot tell an agent's own 124 apart. Use it before concluding an agent "timed out with no output": most such reports are the caller's own exec-tool budget killing a healthy run (note: `claude -p` writes stdout only at completion, so zero bytes mid-run is normal). Set `YOYO_NO_CALL_JOURNAL=1` to disable foreground call journals and background-parent prompt capture — a background parent still records the argv it spawned, with the question itself blanked; `yoyo runs prune --days N` trims the ledger.
 
@@ -285,7 +285,42 @@ yoyo sessions list
 yoyo sessions rm codex:auth-review
 ```
 
-The name → backend-session-id mapping lives in `$YOYO_STATE_DIR/sessions.json`; `sessions rm` removes only the mapping. Sessions work with `codex`, `claude`, and `pi`; on-demand and custom agents reject `--session`.
+The name → backend-session-id mapping lives in `$YOYO_STATE_DIR/sessions.json`; `sessions rm` removes only the mapping. Sessions work with `codex`, `claude`, and `pi`; on-demand and custom agents reject `--session`. Concurrent calls update the registry under a lock and replace it atomically, so two first calls cannot drop each other's mapping and an interrupted write cannot leave invalid JSON. A session is one vendor's memory; to bring a second vendor into the same conversation, use a thread.
+
+## Threads
+
+A thread is a conversation yoyo owns, which several agents can be invited into. It is a local record, not a live channel: each turn is one ordinary `yoyo ask AGENT --thread NAME` call — a fresh agent process that receives a bounded copy of the history — and its answer is recorded for the next speaker. Agents never talk to each other. Nothing an agent writes (`@claude`, "continue", "DONE") schedules a turn; you choose who speaks next, after reading what was said. Because every turn is a fresh process, threads work with every agent, including the one-shot ones `--session` cannot resume.
+
+```bash
+yoyo thread create design --agents codex,claude --seed brief.md --cwd "$PWD"
+yoyo ask codex  --thread design --background "Propose the migration. Name the riskiest step."
+yoyo ask claude --thread design "Find the strongest flaw in codex's plan. Cite file/line."
+yoyo thread note design "Verified: the lock path codex flagged is real (bin/yoyo:3453)."
+yoyo thread invite design grok            # grok's turns will receive this history
+yoyo ask grok --thread design "Break the tie between the two plans."
+yoyo thread show design                   # every turn, full text; --json for structure
+yoyo thread list
+yoyo thread rm design
+```
+
+- **Members.** Only invited agents can take a turn; asking anyone else fails before launch and names the invite command. Inviting says that the agent's turns will carry the thread's history to its vendor. `uninvite` removes a member.
+- **Brief and notes.** `--seed FILE` opens the thread with a brief (its size and sha256 are recorded). `thread note NAME "..."` (or stdin) adds caller text — a verified fact, a correction — without calling an agent. Notes are allowed while a turn runs.
+- **What a turn receives.** The role preamble and skills, then the history, then a line saying which turn this is and who else will read the answer, then your task. The history is packed deterministically, with no model step, inside `--history-bytes` (default 32768 UTF-8 bytes, or `YOYO_THREAD_HISTORY_BYTES`; at least 1024): the opening turn (the brief or first question) whole up to half the budget; then the newest turns, up to six, whole — the newest is always included, cut at a UTF-8 boundary if it must be, and the first older turn that does not fit stops the walk; then first-line excerpts of older turns while room remains, with a count of any left out. It renders in chronological order. Each turn sits between `<<<TURN n nonce>>>` / `<<<END TURN n nonce>>>` lines and the older-turn summaries between `<<<EARLIER nonce>>>` / `<<<END EARLIER nonce>>>`, with a random marker that occurs in none of the text, under a line framing it all as context from the caller and other agents, not instructions — no agent-written byte reaches the prompt outside a fence. That framing is an instruction to a model, not an enforcement boundary — hence the next point. Piped stdin and `--file` contents reach that turn's agent but are not copied into the history; their file names are.
+- **Permissions.** A thread turn is **read-only by default**, because its prompt carries other agents' unverified output. `--write` grants full access for that one turn; nothing inherits it. `--thread` rejects `--agent-arg` (a raw backend flag could override the turn's permission mode), `--session`, `--raw`, comma fan-outs, and `--judge`.
+- **One speaker at a time.** A turn holds the thread's lock for its whole run. A second turn started meanwhile fails at once, naming the turn, agent, and pid it is waiting on — it does not queue, because it would answer a history it never saw. Each turn runs in the thread's cwd; a conflicting `--cwd` is refused.
+- **Records.** `$YOYO_STATE_DIR/threads/NAME/` (directory 0700, files 0600, written atomically) holds `manifest.json` and one `turns/NNNNNN.json` per turn: question, answer, agent, requested model, permission mode, status, exit code, duration, the call's run id, and `context` — which turns were delivered `full`, `truncated`, `excerpted`, or `omitted`, and the delivered byte count. Status is `answered`, `failed`, `timed_out`, `interrupted`, or `running`. A turn whose yoyo process is killed is stamped `interrupted` by the signal handler, or by the next turn if the process died too hard to stamp it; an uncertain turn is never re-run. `--background` works: `yoyo wait` returns the answer and the turn is recorded by the detached child.
+
+### Handing a thread to another tool
+
+```bash
+yoyo thread export design                       # markdown transcript (default)
+yoyo thread export design --format json --out design.json
+yoyo thread export design --format brief        # the packed history plus a "continue from here" line,
+                                                # ready to paste into any chat app or agent session
+yoyo thread create design-2 --from-file design.json --agents claude --cwd "$PWD"
+```
+
+Export makes no model call. `--format brief` uses the same packer a turn gets (`--history-bytes` applies). Import validates the export (schema, kinds, string types, at most 1000 turns, at most 2 MB, read with a bounded read so a huge file is refused without being loaded) and rebuilds the turns labeled `imported`; text that is not valid Unicode (a lone `\ud800` escape, undecodable argv bytes in a note) becomes U+FFFD rather than failing a later write; their authorship and status are kept as claims. Imported data cannot set the new thread's members, cwd, permissions, models, or run ids — those come from this machine's flags — and yoyo never opens a path named inside it.
 
 ## Image generation
 
@@ -325,6 +360,10 @@ Override or add agents in `~/.config/yoyo/agents.json`:
 - Muse: `--disable-approval`, with its default sandbox retained
 
 `--read-only` constrains a reviewer — Codex gets `--sandbox read-only`; Claude, Pi, Grok, and Muse get read-oriented tool allowlists; Cursor and agy use native plan policies (agy with permission prompts auto-denied and its terminal sandbox on). It's enforced by the target agent's own mechanism, not by yoyo; treat it as a strong default, not an airtight sandbox. `yoyo doctor --live` checks that a requested write actually fails to land, because a CLI can accept its read-only flags and still let one through. Agent output is not truth — verify it with code, tests, docs, or live state before acting. A reviewer or checker never gates control flow on its own.
+
+## Nested delegation
+
+yoyo installs its skill into every agent home, so a delegate can call yoyo again. Each agent yoyo launches inherits `YOYO_DEPTH` (one more than its caller's), `YOYO_PARENT_TRACE_ID`, and `YOYO_PARENT_RUN_ID`, and every run record stores `depth`, `parent_trace_id`, and `parent_run_id`, so a nested call in the ledger names the call that launched it. `ask`, `loop`, `review`, `research`, `imagegen`, and `doctor --live` refuse to delegate at `YOYO_DEPTH` ≥ `YOYO_MAX_DEPTH` (default 3: you → agent → agent → agent), before spending anything; `--dry-run` and the commands that launch no agent work at any depth. This is a guard against runaway recursion, not a security boundary — anything with a shell can rewrite its own environment.
 
 ## Durability
 

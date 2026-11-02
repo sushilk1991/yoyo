@@ -138,9 +138,16 @@ yoyo research --cwd "$PWD" --background "Should we move the engine to Rust?"
 # Fresh-context loop: each iteration is a new session reading a small state file,
 # so cost stays flat instead of compounding with session length.
 yoyo loop claude --cwd "$PWD" --max-iter 20 --background "Work through TODO.md, one item per iteration."
+
+# Shared thread: several vendors in one yoyo-owned conversation, one turn per ask.
+yoyo thread create design --agents codex,claude --cwd "$PWD"
+yoyo ask codex  --thread design --background "Propose the migration."
+yoyo ask claude --thread design --background "Find the strongest flaw in codex's plan."
 ```
 
-Composable on any call: `--skill <name>` injects a SKILL.md as guidance (a path works too, for a house-rules overlay); `--file` attaches context; `--session <name>` keeps a named conversation across `ask` calls; `--json` gives a machine-readable envelope; `--raw` passes a leading `/command` through untouched.
+Composable on any call: `--skill <name>` injects a SKILL.md as guidance (a path works too, for a house-rules overlay); `--file` attaches context; `--session <name>` keeps one agent's named conversation across `ask` calls; `--thread <name>` shares one conversation across agents; `--json` gives a machine-readable envelope; `--raw` passes a leading `/command` through untouched.
+
+A judged fan-out is blind: the judge sees shuffled letter labels, and the label → agent key comes back only to you (`judge_labels`). A delegate that calls yoyo itself is one level deeper; past `YOYO_MAX_DEPTH` (default 3) yoyo refuses to delegate — finish the task and return the answer instead.
 
 Every non-raw delegation carries the bundled `yoyo-fable-mode` harness — evidence discipline for one-shot work. `YOYO_DEFAULT_SKILLS` replaces it; the empty string turns it off.
 
@@ -157,6 +164,16 @@ The power is in you sitting between small calls, not in one big command.
 Be the judge yourself when you hold the decision context; use `--judge` when you want an independent one. `--no-synthesis` on research returns raw perspectives for you to synthesize.
 
 **You are the message bus.** Agents do not talk to each other directly, and that is the point — you filter, verify, and decide what crosses. Wire them together and you have an unsupervised loop, which is exactly where delegation drifts.
+
+## Threads: invite another agent into the conversation
+
+A thread keeps that rule while sparing you the copy-paste. It is a record yoyo owns, not a channel between agents: each `yoyo ask AGENT --thread NAME` is one turn by one member, which gets a bounded, fenced copy of the history and has its answer recorded for the next speaker. Agent text never schedules a turn — an `@claude` in codex's answer reaches no one. Between turns you still read, check, and choose who speaks next.
+
+- `yoyo thread invite NAME grok` before grok's first turn; a non-member is refused, because its turns would send the history to another vendor.
+- Write what you verified into the record with `yoyo thread note NAME "..."`, so the next speaker builds on checked facts rather than on the last agent's claims.
+- Turns are read-only by default because the history is other agents' unverified output; pass `--write` for the one turn that should edit.
+- One turn at a time: a second `--thread` call while one runs fails and names it. Poll the first, then ask.
+- It works for every agent, including those `--session` cannot resume. `yoyo thread export NAME --format brief` packs the conversation for pasting into another tool; `--format json` plus `thread create --from-file` moves it to a new thread.
 
 ## Write the prompt so the answer is checkable
 
