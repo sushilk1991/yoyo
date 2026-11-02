@@ -73,7 +73,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.30.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.30.1")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -6452,6 +6452,14 @@ class ThreadTests(CliTestCase):
         self.assertIn("boom", turn["error"])
         code, stdout, _ = self.ask("echob", "next")
         self.assertIn("(no answer: failed)", stdout)
+
+    def test_empty_answer_with_exit_zero_is_a_failed_turn_and_exits_nonzero(self):
+        self.write_agents(mute=self.agent("mute", "sys.stdin.read()"))
+        self.create(agents="mute")
+        code, _, stderr = self.ask("mute", "say something")
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("turn 1 failed (mute)", stderr)
+        self.assertEqual(self.turns()[0]["status"], "failed")
 
     def test_dry_run_reserves_no_turn(self):
         self.create()

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-VERSION = "0.30.0"
+VERSION = "0.30.1"
 # A deadman guard against hung subprocesses, not a work budget: real agent
 # tasks can legitimately run for hours, so the ceiling is high. Use
 # --idle-timeout to catch an agent that goes quiet after it has started
@@ -5632,7 +5632,9 @@ def run_thread_turn(args: argparse.Namespace, agents: dict[str, AgentSpec]) -> i
     emit_result(result, args.json)
     if not args.json:
         eprint(f"thread {name}: turn {turn['id']} {status} ({args.agent})")
-    return int(result.get("exit_code", 1))
+    code = int(result.get("exit_code", 1))
+    # An empty answer is recorded as failed; exit 0 would tell the caller it answered.
+    return 1 if status != "answered" and code == 0 else code
 
 
 def thread_members_arg(raw: str | None, extra: list[str] | None = None) -> list[str]:

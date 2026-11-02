@@ -167,13 +167,7 @@ Be the judge yourself when you hold the decision context; use `--judge` when you
 
 ## Threads: invite another agent into the conversation
 
-A thread keeps that rule while sparing you the copy-paste. It is a record yoyo owns, not a channel between agents: each `yoyo ask AGENT --thread NAME` is one turn by one member, which gets a bounded, fenced copy of the history and has its answer recorded for the next speaker. Agent text never schedules a turn — an `@claude` in codex's answer reaches no one. Between turns you still read, check, and choose who speaks next.
-
-- `yoyo thread invite NAME grok` before grok's first turn; a non-member is refused, because its turns would send the history to another vendor.
-- Write what you verified into the record with `yoyo thread note NAME "..."`, so the next speaker builds on checked facts rather than on the last agent's claims.
-- Turns are read-only by default because the history is other agents' unverified output; pass `--write` for the one turn that should edit.
-- One turn at a time: a second `--thread` call while one runs fails and names it. Poll the first, then ask.
-- It works for every agent, including those `--session` cannot resume. `yoyo thread export NAME --format brief` packs the conversation for pasting into another tool; `--format json` plus `thread create --from-file` moves it to a new thread.
+A thread keeps that rule while sparing you the copy-paste. yoyo records the conversation; each `yoyo ask AGENT --thread NAME` is one turn by one invited member, which sees a bounded copy of the earlier turns. Agent text never schedules a turn: you read, check, write what you verified with `yoyo thread note`, and choose who speaks next. Use a thread when one agent should answer another's claim, or for several turns with an agent that has no `--session`. For independent opinions, fan out instead, because a thread anchors each speaker on the last. Recipe, turn numbering, permissions, and failure handling: see the `yoyo-thread` skill.
 
 ## Write the prompt so the answer is checkable
 
@@ -223,4 +217,5 @@ Use `--max-stall 3` to stop after three iterations leave both state and queue un
 - Images you cannot see (screenshots, error dialogs) — see the `yoyo-vision` skill.
 - Video (YouTube, Loom, screen recordings) — see the `yoyo-watch` skill.
 - `yoyo research` in depth — see the `yoyo-research` skill.
+- Shared multi-agent conversations (`yoyo thread`) — see the `yoyo-thread` skill.
 - `yoyo runs list` / `autopsy` / `prune`, `yoyo sessions`, `yoyo agents`, `yoyo skills`, `yoyo doctor --live`, `yoyo update`.
