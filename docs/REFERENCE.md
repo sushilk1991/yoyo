@@ -341,7 +341,7 @@ Export makes no model call. `--format brief` uses the same packer a turn gets (`
 
 ## Image generation
 
-`yoyo imagegen` generates a real raster image with GPT-image (`gpt-image-2`) by delegating to the agent's native image-generation capability — for the default agent (codex) that is the bundled imagegen skill's built-in `image_gen` tool, which runs headlessly in `codex exec` on the signed-in ChatGPT plan (no API key). A run takes ~1–2 minutes:
+`yoyo imagegen` generates a raster image by delegating to the agent's native image-generation capability — for the default agent (codex) that is the bundled imagegen skill's built-in `image_gen` tool, which runs headlessly in `codex exec` on the signed-in ChatGPT plan (no API key). Yoyo does not select or report the image model; `--model` selects the agent model, not the image generator. A run takes ~1–2 minutes:
 
 ```bash
 yoyo imagegen "Hand-drawn flowchart, four boxes SPEC/BUILD/GATE/REVIEW, bold arrows." --out flow.png --size 1536x1024 --quality high
@@ -349,6 +349,8 @@ yoyo imagegen "make the background white" --edit flow.png --out flow-v2.png
 ```
 
 No `OPENAI_API_KEY` or `uv` needed — codex renders on its own ChatGPT-subscription auth. yoyo verifies the artifact deterministically: the file must exist, have changed, start with the right magic bytes for its extension, and have a plausible size.
+
+`--out` accepts `.png`, `.jpg`, `.jpeg`, and `.webp`; GIF and SVG exports are not supported by `yoyo imagegen`. OpenAI's [Image API documentation](https://developers.openai.com/api/docs/guides/image-generation) describes animated GIF and SVG generation with GPT Image 2.6 via `output_format`. That API is a separate, API-key-backed workflow; its format support does not establish support in the Codex built-in tool or in yoyo.
 
 ## Custom agents
 

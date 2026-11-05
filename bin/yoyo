@@ -3695,7 +3695,7 @@ def cmd_imagegen(args: argparse.Namespace) -> int:
 
     # All agents, codex included, generate via delegation to their own real
     # image-generation capability. For codex that is the bundled imagegen skill's
-    # built-in image_gen tool (gpt-image-2), which since codex 0.14x works in
+    # built-in image_gen tool, which since codex 0.14x works in
     # headless `codex exec` and needs no OPENAI_API_KEY — it renders on the
     # signed-in ChatGPT plan. The old deterministic image_gen.py CLI path
     # (removed 2026-07) required an API key and is no longer needed.
