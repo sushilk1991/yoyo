@@ -5766,6 +5766,34 @@ class QueueFenceTests(CliTestCase):
             self.assertEqual(summary["iterations"], 0)
 
 
+class RunSnapshotTests(CliTestCase):
+    def test_run_displays_use_the_result_read_for_that_snapshot(self):
+        run_id = "20261112T000000-00000001"
+        actions = (["runs", "list"], ["runs", "show", run_id], ["runs", "autopsy", run_id])
+        for action in actions:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "runs" / run_id
+                run_dir.mkdir(parents=True)
+                (run_dir / "meta.json").write_text(json.dumps({
+                    "agent": "echo", "pid": 0, "started_at": "2026-11-12T00:00:00Z",
+                }), encoding="utf-8")
+                result = {"exit_code": 0, "duration_s": 1.0, "stdout": "done", "stderr": ""}
+                # Completion arrives between snapshots, never halfway through one.
+                with mock.patch.object(yoyo, "run_result", side_effect=[None, result]):
+                    _, stdout, _ = self.run_cli([*action, "--json"], env={"YOYO_STATE_DIR": tmp})
+                    payload = json.loads(stdout)
+                    row = payload[0] if action[1] == "list" else payload
+                    self.assertEqual(row["status"], "dead")
+
+                    code, stdout, stderr = self.run_cli([*action, "--json"], env={"YOYO_STATE_DIR": tmp})
+                    self.assertEqual(code, 0, stderr)
+                    payload = json.loads(stdout)
+                    row = payload[0] if action[1] == "list" else payload
+                    self.assertEqual(row["status"], "done")
+                    if action[1] != "autopsy":
+                        self.assertEqual(row["exit_code"], 0)
+
+
 class RunIdentityTests(CliTestCase):
     """A recorded pid outlives the process that held it; the run must not."""
 
@@ -5790,7 +5818,7 @@ class RunIdentityTests(CliTestCase):
                 "pid_started": "Sat Jan  1 00:00:00 2000",
                 "started_at": "2026-08-27T00:00:00Z",
             })
-            self.assertEqual(yoyo.run_status(run_dir), "dead")
+            self.assertEqual(yoyo.run_status(yoyo.run_meta(run_dir), None), "dead")
 
     def test_recorded_process_reads_as_running(self):
         pid = self._live_pid()
@@ -5801,7 +5829,7 @@ class RunIdentityTests(CliTestCase):
                 "pid_started": yoyo.pid_start_time(pid),
                 "started_at": "2026-08-27T00:00:00Z",
             })
-            self.assertEqual(yoyo.run_status(run_dir), "running")
+            self.assertEqual(yoyo.run_status(yoyo.run_meta(run_dir), None), "running")
 
     def test_record_without_identity_stays_permissive(self):
         # Runs written before pid_started existed keep the old answer rather
@@ -5813,7 +5841,7 @@ class RunIdentityTests(CliTestCase):
                 "pid": pid,
                 "started_at": "2026-08-27T00:00:00Z",
             })
-            self.assertEqual(yoyo.run_status(run_dir), "running")
+            self.assertEqual(yoyo.run_status(yoyo.run_meta(run_dir), None), "running")
 
     def test_start_time_of_a_dead_pid_is_empty(self):
         proc = subprocess.Popen(["sleep", "30"])

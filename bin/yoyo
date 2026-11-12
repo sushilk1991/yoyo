@@ -1527,11 +1527,11 @@ def pid_is_running(pid: Any, started: str | None = None) -> bool:
     return live == started
 
 
-def run_status(run_dir: Path) -> str:
-    meta = run_meta(run_dir)
+def run_status(meta: dict[str, Any] | None, result: dict[str, Any] | None) -> str:
+    """Classify the same records the caller uses to display or act on the run."""
     if meta is None:
         return "unknown"
-    if run_result(run_dir) is not None:
+    if result is not None:
         return "done"
     return "running" if pid_is_running(meta.get("pid"), meta.get("pid_started")) else "dead"
 
@@ -1561,7 +1561,7 @@ def run_duration_seconds(status: str, meta: dict[str, Any] | None, result: dict[
 def run_summary(run_dir: Path) -> dict[str, Any]:
     meta = run_meta(run_dir)
     result = run_result(run_dir)
-    status = run_status(run_dir)
+    status = run_status(meta, result)
     started = run_started_at(meta, run_dir)
     duration = run_duration_seconds(status, meta, result, run_dir)
     return {
@@ -2695,7 +2695,7 @@ def show_run(run_id: str, as_json: bool, *, exit_with_result: bool = False) -> i
     run_dir = run_dir_for(run_id)
     meta = run_meta(run_dir)
     result = run_result(run_dir)
-    status = run_status(run_dir)
+    status = run_status(meta, result)
     if status == "done" and result is not None:
         payload = dict(result)
         payload.update({"run_id": run_id, "status": status})
@@ -2846,9 +2846,10 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
     if resolved is None:
         raise YoyoError("No runs recorded yet.")
     run_dir = run_dir_for(resolved)
-    meta = run_meta(run_dir) or {}
+    meta = run_meta(run_dir)
     result = run_result(run_dir)
-    status = run_status(run_dir)
+    status = run_status(meta, result)
+    meta = meta or {}
     agent = meta.get("agent")
     mode = meta.get("mode") or ("call" if meta.get("command") else "background")
     started = run_started_at(meta, run_dir)
@@ -3006,9 +3007,9 @@ def prune_runs(args: argparse.Namespace) -> int:
     selected: list[Path] = []
     if root.is_dir():
         for path in sorted([item for item in root.iterdir() if item.is_dir()], key=lambda item: item.name):
-            if run_status(path) in ("running", "unknown"):
-                continue
             meta = run_meta(path)
+            if meta is None or run_status(meta, run_result(path)) == "running":
+                continue
             started = run_started_at(meta, path)
             if started is not None:
                 timestamp = started.timestamp()
@@ -4741,12 +4742,12 @@ def wait_run(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout
     while True:
         run_dir = run_dir_for(args.run_id)
-        status = run_status(run_dir)
+        meta = run_meta(run_dir)
+        status = run_status(meta, run_result(run_dir))
         if status == "done":
             return show_run(args.run_id, args.json, exit_with_result=True)
         if status in ("dead", "unknown"):
             if args.json:
-                meta = run_meta(run_dir)
                 print(json.dumps({"run_id": args.run_id, "status": status, "meta": meta}, ensure_ascii=False))
             else:
                 eprint(f"run {args.run_id} status: {status}")
