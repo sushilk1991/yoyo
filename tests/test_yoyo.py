@@ -5673,6 +5673,54 @@ class RunsAuditTests(CliTestCase):
             self.assertIn("does not accept a run_id", stderr)
 
 
+class QueueFenceTests(CliTestCase):
+    def test_done_requires_unfinished_work_after_fenced_examples(self):
+        cases = (
+            ("~~~~markdown", "```", "~~~~"),
+            ("````markdown", "~~~", "````"),
+            ("````markdown", "```", "`````  "),
+            ("~~~markdown", "~~~still example text", "~~~"),
+        )
+        for opener, inner, closer in cases:
+            with self.subTest(opener=opener, inner=inner), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / "state.md"
+                state.write_text("STATUS: DONE\n", encoding="utf-8")
+                queue = Path(tmp) / "tasks.md"
+                queue.write_text(
+                    f"- [x] finished\n{opener}\n{inner}\n- [x] example\n{closer}\n- [ ] real work\n",
+                    encoding="utf-8",
+                )
+                code, stdout, stderr = self.run_cli(
+                    ["loop", "echo", "--cwd", tmp, "--state", str(state),
+                     "--queue", str(queue), "--max-iter", "1", "--json", "work"],
+                    env={"YOYO_AGENT_ECHO": "python3 -c \"print('still working')\""},
+                )
+                self.assertEqual(code, 0, stderr)
+                summary = json.loads(stdout)
+                self.assertEqual(summary["end_reason"], "max-iter")
+                self.assertEqual(summary["queue_rejections"], 1)
+                self.assertIn("real work", state.read_text(encoding="utf-8"))
+
+    def test_done_ignores_unfinished_examples_inside_matching_fences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.md"
+            state.write_text("STATUS: DONE\n", encoding="utf-8")
+            queue = Path(tmp) / "tasks.md"
+            queue.write_text(
+                "- [x] finished\n~~~~markdown\n```\n- [ ] example\n~~~~\n",
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                ["loop", "echo", "--cwd", tmp, "--state", str(state),
+                 "--queue", str(queue), "--max-iter", "1", "--json", "work"],
+                env={"YOYO_AGENT_ECHO": "python3 -c \"print('still working')\""},
+            )
+            self.assertEqual(code, 0, stderr)
+            summary = json.loads(stdout)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(summary["iterations"], 0)
+
+
 class RunIdentityTests(CliTestCase):
     """A recorded pid outlives the process that held it; the run must not."""
 

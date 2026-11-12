@@ -3587,6 +3587,7 @@ def warn_missing_brief_citations(text: str | None, cwd: Path) -> None:
 
 
 QUEUE_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(\S.*)$")
+QUEUE_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
 
 
 def parse_queue_items(text: str) -> list[tuple[bool, str]]:
@@ -3596,13 +3597,17 @@ def parse_queue_items(text: str) -> list[tuple[bool, str]]:
     can neither block DONE forever nor count as real work.
     """
     items: list[tuple[bool, str]] = []
-    in_fence = False
+    fence = ""
     for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
+        marker = QUEUE_FENCE_RE.match(line.lstrip())
+        if marker:
+            delimiter, suffix = marker.groups()
+            if not fence:
+                fence = delimiter
+            elif delimiter[0] == fence[0] and len(delimiter) >= len(fence) and not suffix.strip():
+                fence = ""
             continue
-        if in_fence:
+        if fence:
             continue
         match = QUEUE_ITEM_RE.match(line)
         if match:
