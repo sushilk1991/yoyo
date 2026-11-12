@@ -2276,9 +2276,11 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
             eprint(f"ask {args.trace_id}: {name} {status}")
         results = [indexed[index] for index in range(len(calls))]
 
-    successful = [r for r in results if int(r.get("exit_code", 1)) == 0 and str(r.get("stdout", "")).strip()]
+    successful: list[dict[str, Any]] = []
     for result in results:
-        if result not in successful:
+        if int(result.get("exit_code", 1)) == 0 and str(result.get("stdout", "")).strip():
+            successful.append(result)
+        else:
             eprint(
                 f"ask {args.trace_id}: {result.get('agent')} failed: "
                 f"{str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}"
@@ -4303,10 +4305,12 @@ def cmd_review(args: argparse.Namespace) -> int:
             eprint(f"review {args.trace_id}: {names[index]} {status}")
         reviews = [indexed[index] for index in range(len(names))]
 
-    successful = [r for r in reviews if int(r.get("exit_code", 1)) == 0 and str(r.get("stdout", "")).strip()]
-    failed = [r for r in reviews if r not in successful]
-    for result in failed:
-        eprint(f"review {args.trace_id}: {result.get('agent')} failed: {str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}")
+    successful: list[dict[str, Any]] = []
+    for result in reviews:
+        if int(result.get("exit_code", 1)) == 0 and str(result.get("stdout", "")).strip():
+            successful.append(result)
+        else:
+            eprint(f"review {args.trace_id}: {result.get('agent')} failed: {str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}")
     if not successful:
         eprint(f"review {args.trace_id}: all reviewers failed")
         return 1
@@ -4597,13 +4601,15 @@ def cmd_research(args: argparse.Namespace) -> int:
             eprint(f"research {args.trace_id}: {label} via {name} {status}")
         perspectives = [indexed[index] for index in range(len(jobs))]
 
-    successful = [p for p in perspectives if int(p.get("exit_code", 1)) == 0 and str(p.get("stdout", "")).strip()]
-    failed = [p for p in perspectives if p not in successful]
-    for result in failed:
-        eprint(
-            f"research {args.trace_id}: {result.get('lens')} via {result.get('agent')} failed: "
-            f"{str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}"
-        )
+    successful: list[dict[str, Any]] = []
+    for result in perspectives:
+        if int(result.get("exit_code", 1)) == 0 and str(result.get("stdout", "")).strip():
+            successful.append(result)
+        else:
+            eprint(
+                f"research {args.trace_id}: {result.get('lens')} via {result.get('agent')} failed: "
+                f"{str(result.get('stderr_plain') or result.get('stderr') or '')[:200]}"
+            )
     if not successful:
         eprint(f"research {args.trace_id}: all researchers failed")
         return 1
