@@ -16,6 +16,7 @@ import re
 import select
 import shutil
 import signal
+import stat
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -2944,6 +2946,426 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
         print(f"note:    {note}")
     for line in advice:
         print(f"advice:  {line}")
+    return 0
+
+
+# The viewer reads bounded ledger snapshots only; it never owns agent input.
+# ledger -> snapshot -> curses/plain text; launcher -> separate viewer process.
+_WATCH_TAIL_BYTES = 16_384
+_WATCH_RECORD_BYTES = 8_388_608
+_WATCH_REFRESH_SECONDS = 1.0
+_WATCH_LAUNCH_SECONDS = 15.0
+_WATCH_ESCAPE_RE = re.compile(
+    r"(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$))"
+    r"|(?:\x1b[P^_X].*?(?:\x1b\\|$))"
+    r"|(?:[\x1b\x9b]\[[0-?]*[ -/]*[@-~])"
+    r"|(?:\x9b[0-?]*[ -/]*[@-~])"
+    r"|(?:\x1b[@-_])", re.DOTALL,
+)
+
+
+def _watch_text(text: str) -> str:
+    # Remove terminal commands and invisible formatting, including clipboard OSC.
+    text = _WATCH_ESCAPE_RE.sub("", text)
+    return "".join(ch for ch in text if ch in "\n\t" or not unicodedata.category(ch).startswith("C"))
+
+
+def _watch_read(path: Path, limit: int, mode: str = "head") -> str:
+    # Regular files only: a symlink or FIFO must not disclose data or hang a view.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return ""
+            if mode == "tail":
+                handle.seek(max(0, info.st_size - limit))
+            return handle.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _watch_json(path: Path) -> dict[str, Any] | None:
+    # Concurrent writers may leave an incomplete JSON object until the next tick.
+    try:
+        value = json.loads(_watch_read(path, _WATCH_RECORD_BYTES))
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _watch_task(path: Path) -> str:
+    # Reuse autopsy's attachment boundaries without its unbounded legacy read.
+    text = _watch_read(path / "prompt.txt", PROMPT_JOURNAL_MAX_BYTES)
+    end = skill_region_end(text)
+    if end < 0:
+        return ""
+    marker = text.find(PROMPT_TASK_MARKER, end)
+    if marker < 0 and end > 0:
+        return ""
+    if marker >= 0:
+        text = text[marker + len(PROMPT_TASK_MARKER):]
+    for boundary in (PROMPT_TRAILER_MARKER,) + PROMPT_ATTACHMENT_MARKERS:
+        text = text.split(boundary, 1)[0]
+    return " ".join(_watch_text(text).split())[:PROMPT_EXCERPT_CHARS]
+
+
+def _watch_snapshot(args: argparse.Namespace, selected: str | None = None) -> dict[str, Any]:
+    # Filter before limiting; old active calls must survive newer finished calls.
+    root = runs_root()
+    cwd = str(resolve_cwd(args.cwd)) if args.cwd else None
+    try:
+        paths = sorted((p for p in root.iterdir() if not p.is_symlink() and p.is_dir()), reverse=True)
+    except FileNotFoundError:
+        paths = []
+    except OSError as exc:
+        raise YoyoError(f"Could not read run ledger {root}: {exc}") from exc
+    rows = []
+    for path in paths:
+        # Display sanitization must never rewrite a path used for later reads.
+        if _watch_text(path.name) != path.name:
+            continue
+        if args.run_id and path.name != args.run_id:
+            continue
+        meta = _watch_json(path / "meta.json")
+        if cwd and (not meta or meta.get("cwd") != cwd):
+            continue
+        result = _watch_json(path / "result.json")
+        state = "unknown"
+        if meta is not None and result is None:
+            try:
+                state = "running" if pid_is_running(meta.get("pid"), meta.get("pid_started")) else "dead"
+            except (OverflowError, ValueError, TypeError):
+                state = "unknown"
+            if state == "dead" and _safe_size(path / "result.json") > 0:
+                state = "unknown"
+        if result is not None:
+            exit_code = result.get("exit_code")
+            if type(exit_code) is int:
+                state = "completed" if exit_code == 0 else "failed"
+        row = {
+            "run_id": _watch_text(path.name), "agent": _watch_text(str((meta or {}).get("agent") or "unknown")),
+            "status": state, "cwd": _watch_text(str((meta or {}).get("cwd") or "")),
+            "role": _watch_text(str((meta or {}).get("role") or "")),
+            "kind": "call" if (meta or {}).get("mode") == "call" else "parent/iteration",
+            "task": "", "elapsed_s": run_duration_seconds(
+                "done" if result is not None else state, meta, result, path),
+        }
+        rows.append(row)
+    rows.sort(key=lambda row: row["status"] != "running")
+    rows = rows[:args.limit]
+    for row in rows:
+        row["task"] = _watch_task(root / row["run_id"])
+    chosen = next((row for row in rows if row["run_id"] == selected), rows[0] if rows else None)
+    detail = None
+    if chosen:
+        path = root / chosen["run_id"]
+        detail = dict(chosen)
+        # Background parent logs differ from native per-call stdout/stderr files.
+        detail["stdout"] = _watch_text(_watch_read(path / "stdout.txt", _WATCH_TAIL_BYTES, "tail"))
+        detail["stderr"] = _watch_text(_watch_read(path / "stderr.txt", _WATCH_TAIL_BYTES, "tail"))
+        detail["log"] = _watch_text(_watch_read(path / "log.txt", _WATCH_TAIL_BYTES, "tail"))
+        # Parent/iteration envelopes retain answers that have no native capture.
+        result = _watch_json(path / "result.json") or {}
+        for channel in ("stdout", "stderr"):
+            saved = result.get(channel)
+            if not detail[channel] and isinstance(saved, str):
+                detail[channel] = _watch_text(saved[-_WATCH_TAIL_BYTES:])
+        detail["visibility"] = "Captured output only; some providers buffer until completion."
+    return {"runs": rows, "selected": detail}
+
+
+def _watch_lines(data: dict[str, Any], stream: str = "all") -> list[str]:
+    # Keep the renderer shared so snapshots and the dashboard tell the same story.
+    lines = ["YOYO watch — read-only; completed means process exit, not verified work."]
+    for row in data["runs"]:
+        elapsed = row["elapsed_s"]
+        duration = f"{elapsed:.0f}s" if elapsed is not None else "?"
+        marker = ">" if data["selected"] and row["run_id"] == data["selected"]["run_id"] else " "
+        lines.append(f"{marker} {row['run_id']}  {row['agent']}  {row['status']}  {duration}  {row['task']}")
+    detail = data["selected"]
+    if not detail:
+        return lines + ["No runs found."]
+    lines.extend(["", f"Selected: {detail['run_id']}  {detail['kind']}  {detail['role']}",
+                  f"cwd: {detail['cwd']}", detail["visibility"]])
+    available = False
+    for channel in ("stdout", "stderr", "log"):
+        if stream not in ("all", channel) or not detail[channel]:
+            continue
+        lines.extend([f"--- {channel} (tail) ---"] + detail[channel].splitlines())
+        available = True
+    if not available:
+        lines.append("No output yet in this view.")
+    return lines
+
+
+def _watch_screen(screen: Any, args: argparse.Namespace) -> None:
+    # Keyboard input controls selection only; q exits without touching worker PIDs.
+    import curses
+    selected = args.run_id
+    stream_index = 0
+    show_prompt = False
+    scroll = 0
+    streams = ("all", "stdout", "stderr", "log")
+    screen.timeout(max(100, int(args.interval * 1000)))
+    while True:
+        data = _watch_snapshot(args, selected)
+        detail = data["selected"]
+        selected = detail["run_id"] if detail else None
+        height, width = screen.getmaxyx()
+        # Window the run list around selection so a small split can reach every row.
+        count = max(1, height // 3)
+        ids = [row["run_id"] for row in data["runs"]]
+        index = ids.index(selected) if selected in ids else 0
+        start = max(0, min(index - count // 2, len(ids) - count))
+        display = dict(data, runs=data["runs"][start:start + count])
+        lines = _watch_lines(display, streams[stream_index])
+        header_count = min(len(display["runs"]) + 5, max(1, height - 3))
+        if show_prompt and selected:
+            prompt = _watch_text(_watch_read(runs_root() / selected / "prompt.txt", PROMPT_JOURNAL_MAX_BYTES))
+            lines = [f"Prompt: {selected} (bounded head; may contain private context)"] + prompt.splitlines()
+            header_count = 1
+        screen.erase()
+        visible = lines[:header_count]
+        tail_count = max(0, height - header_count - 2)
+        body = lines[header_count:]
+        end = max(0, len(body) - scroll)
+        visible.extend(body[max(0, end - tail_count):end] if tail_count else [])
+        visible.append("Up/Down select  Tab stream  PgUp/PgDn scroll  p prompt  q detach")
+        for index, line in enumerate(visible[:max(0, height - 1)]):
+            try:
+                screen.addnstr(index, 0, line.expandtabs(), max(0, width - 1))
+            except curses.error:
+                continue
+        screen.refresh()
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            return
+        if key in (curses.KEY_UP, curses.KEY_DOWN) and data["runs"]:
+            ids = [row["run_id"] for row in data["runs"]]
+            step = -1 if key == curses.KEY_UP else 1
+            selected = ids[(ids.index(selected) + step) % len(ids)]
+            scroll = 0
+        if key == ord("\t"):
+            stream_index = (stream_index + 1) % len(streams)
+            scroll = 0
+        if key == ord("p"):
+            show_prompt = not show_prompt
+            scroll = 0
+        if key == curses.KEY_PPAGE:
+            scroll = min(max(0, len(body) - tail_count), scroll + max(1, tail_count))
+        if key == curses.KEY_NPAGE:
+            scroll = max(0, scroll - max(1, tail_count))
+
+
+def _watch_launch_cmd(cmd: list[str], **kwargs: Any) -> str:
+    # Launcher failures affect only the viewer; include bounded, safe diagnostics.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_WATCH_LAUNCH_SECONDS, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise YoyoError(f"watch launcher {cmd[0]} failed: {exc}; run yoyo watch in a terminal instead") from exc
+    if result.returncode:
+        raise YoyoError(f"watch launcher {cmd[0]} failed: {_watch_text(result.stderr)[-1000:]}")
+    return result.stdout
+
+
+def _watch_open(args: argparse.Namespace) -> int:
+    # Explicit launchers run only a viewer in a NEW surface, never an agent command.
+    argv = ["env", f"YOYO_STATE_DIR={state_dir().resolve()}", sys.executable,
+            str(Path(__file__).resolve()), "watch", "--limit", str(args.limit), "--interval", str(args.interval)]
+    if args.cwd:
+        argv.extend(["--cwd", str(resolve_cwd(args.cwd))])
+    if args.run_id:
+        argv.append(args.run_id)
+    command = shlex.join(argv)
+    if args.open == "ghostty":
+        if sys.platform != "darwin":
+            raise YoyoError("Ghostty launcher requires macOS AppleScript; run yoyo watch directly")
+        # Pass data as argv to AppleScript rather than interpolating script source.
+        target = "set viewer to new window with configuration cfg"
+        if args.split:
+            target = f"set viewer to split (focused terminal of selected tab of front window) direction {args.split} with configuration cfg"
+        script = ("on run argv\n tell application \"Ghostty\"\n"
+                  "set cfg to new surface configuration\n"
+                  "set command of cfg to item 1 of argv\n"
+                  "set initial working directory of cfg to item 2 of argv\n"
+                  + target + "\n end tell\nend run\n")
+        _watch_launch_cmd(["osascript", "-", command, str(resolve_cwd(args.cwd or os.getcwd()))], input=script)
+    else:
+        # Herdr IDs must come from the caller and the newly-created surface reply.
+        if args.split:
+            source = os.environ.get("HERDR_PANE_ID")
+            if not source:
+                raise YoyoError("Herdr split requires HERDR_PANE_ID; run this command inside a Herdr pane")
+            create = ["herdr", "pane", "split", source, "--direction", args.split, "--no-focus"]
+            field = "pane"
+        else:
+            workspace = os.environ.get("HERDR_WORKSPACE_ID")
+            if not workspace:
+                raise YoyoError("Herdr tab requires HERDR_WORKSPACE_ID; run this command inside Herdr")
+            create = ["herdr", "tab", "create", "--workspace", workspace, "--no-focus"]
+            field = "root_pane"
+        create.extend(["--cwd", str(resolve_cwd(args.cwd or os.getcwd()))])
+        raw = _watch_launch_cmd(create)
+        try:
+            pane = json.loads(raw)["result"][field]["pane_id"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise YoyoError("Herdr returned no new pane ID; no command was sent") from exc
+        if not isinstance(pane, str) or not pane or pane == os.environ.get("HERDR_PANE_ID") or pane.startswith("-"):
+            raise YoyoError("Herdr returned an invalid new pane ID; no command was sent")
+        _watch_launch_cmd(["herdr", "pane", "run", pane, command])
+    print(f"Opened read-only YOYO viewer in {args.open}.")
+    return 0
+
+
+# Footer hosts own their terminal rendering; this command returns plain text only.
+# journals -> project-scoped summary -> Claude/Pi/Herdr footer (never cursor I/O).
+_STATUS_PREVIEWS = 2
+_STATUS_WIDTH = 120
+_STATUS_MIN_WIDTH = 20
+_STATUS_MAX_WIDTH = 512
+_STATUS_PREVIOUS_SECONDS = 1.5
+_STATUS_MINUTE_SECONDS = 60
+_STATUS_HOUR_SECONDS = 3600
+
+
+def _status_rows(cwd: Path) -> list[dict[str, Any]]:
+    # Skip completed records before reading metadata; count calls, not their wrappers.
+    root = runs_root()
+    try:
+        paths = sorted(root.iterdir(), reverse=True)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise YoyoError(f"Could not read run ledger {root}: {exc}") from exc
+    rows = []
+    for path in paths:
+        if path.is_symlink() or not path.is_dir() or _safe_size(path / "result.json") > 0:
+            continue
+        meta = _watch_json(path / "meta.json")
+        if not meta or meta.get("mode") != "call" or meta.get("cwd") != str(cwd):
+            continue
+        try:
+            alive = pid_is_running(meta.get("pid"), meta.get("pid_started"))
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if not alive:
+            continue
+        row = {"agent": str(meta.get("agent") or "agent"), "role": str(meta.get("role") or "working"),
+               "elapsed": run_duration_seconds("running", meta, None, path)}
+        # Task text is needed only for previews; attachments are cut by the reader.
+        row["task"] = _watch_task(path) if len(rows) < _STATUS_PREVIEWS else ""
+        rows.append(row)
+    return rows
+
+
+def _status_duration(seconds: float | None) -> str:
+    # Keep time compact enough to share the host's existing model/context footer.
+    if seconds is None:
+        return "?"
+    value = max(0, int(seconds))
+    if value < _STATUS_MINUTE_SECONDS:
+        return f"{value}s"
+    if value < _STATUS_HOUR_SECONDS:
+        return f"{value // _STATUS_MINUTE_SECONDS}m"
+    return f"{value // _STATUS_HOUR_SECONDS}h"
+
+
+def _status_fit(text: str, width: int) -> str:
+    # Bound terminal columns, not code points: e.g. a CJK character occupies two.
+    text = " ".join(_watch_text(text).split())
+    used = 0
+    kept = []
+    for char in text:
+        columns = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in ("W", "F") else 1)
+        if used + columns > width - 1:
+            return "".join(kept) + "…"
+        kept.append(char)
+        used += columns
+    return text
+
+
+def _status_line(cwd: Path, width: int) -> str:
+    # The count covers all recorded active calls, even when only two previews fit.
+    rows = _status_rows(cwd)
+    if not rows:
+        return "YOYO · idle"
+    parts = [f"YOYO · {len(rows)} running"]
+    for row in rows[:_STATUS_PREVIEWS]:
+        task = _status_fit(row["task"] or row["role"], 36)
+        parts.append(f"{row['agent']}: {task} ({_status_duration(row['elapsed'])})")
+    if len(rows) > _STATUS_PREVIEWS:
+        parts.append(f"+{len(rows) - _STATUS_PREVIEWS} more")
+    return _status_fit(" · ".join(parts), width)
+
+
+def _status_previous(command: str, payload: str) -> str:
+    # Run only the user's trusted renderer; forward its original JSON unchanged.
+    with _agent_temp_dir() as tmp:
+        stdout_path, stderr_path = tmp / "stdout", tmp / "stderr"
+        try:
+            run_to_files(["/bin/sh", "-c", command], payload, Path.cwd(), stdout_path, stderr_path,
+                         _STATUS_PREVIOUS_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        text, _ = read_limited_text(stdout_path, _WATCH_TAIL_BYTES)
+        return text.rstrip("\n")
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    # Each host supplies cwd differently; never interpolate that untrusted value into shell code.
+    if not _STATUS_MIN_WIDTH <= args.width <= _STATUS_MAX_WIDTH:
+        raise YoyoError(f"status --width must be {_STATUS_MIN_WIDTH}..{_STATUS_MAX_WIDTH}")
+    if args.append_command and not args.claude:
+        raise YoyoError("--append-command requires --claude")
+    payload = ""
+    host_cwd = None
+    if args.claude and not _stdin_isatty():
+        payload, _, _ = read_limited_stdin(DEFAULT_MAX_INPUT_BYTES)
+        try:
+            data = json.loads(payload)
+        except (ValueError, RecursionError):
+            data = {}
+        if isinstance(data, dict):
+            workspace = data.get("workspace")
+            host_cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
+            host_cwd = host_cwd or data.get("cwd")
+    if args.herdr:
+        host_cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD")
+    if not isinstance(host_cwd, str):
+        host_cwd = None
+    cwd = resolve_cwd(args.cwd or host_cwd or os.getcwd())
+    if args.append_command:
+        previous = _status_previous(args.append_command, payload)
+        if previous:
+            print(previous)
+    print(_status_line(cwd, args.width))
+    return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    # Non-TTY and automation callers get one snapshot, never an accidental hang.
+    if args.limit < 1 or not 0 < args.interval <= 60:
+        raise YoyoError("watch requires --limit >= 1 and --interval between 0 and 60 seconds")
+    if args.split and not args.open:
+        raise YoyoError("--split requires --open ghostty or --open herdr")
+    if args.open and (args.once or args.json):
+        raise YoyoError("--open cannot be combined with --once or --json")
+    if args.run_id:
+        run_dir_for(args.run_id)
+    if args.open:
+        return _watch_open(args)
+    if args.once or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        data = _watch_snapshot(args, args.run_id)
+        print(json.dumps(data, ensure_ascii=False) if args.json else "\n".join(_watch_lines(data)))
+        return 0
+    try:
+        import curses
+        curses.wrapper(_watch_screen, args)
+    except ImportError as exc:
+        raise YoyoError("Terminal dashboard needs curses; use yoyo watch --once") from exc
+    except curses.error as exc:
+        raise YoyoError(f"Terminal dashboard unavailable: {exc}; use yoyo watch --once") from exc
     return 0
 
 
@@ -5936,6 +6358,26 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--dry-run", action="store_true", help="Print the researcher commands and prompts without running them")
     research.add_argument("--background", action="store_true", help="Detach the research run and record it in the run ledger (poll with `yoyo wait`)")
     research.set_defaults(func=cmd_research, collect_unknown_prompt=True, use_stdin_context=False)
+
+    status = sub.add_parser("status", help="One-line delegated-work status for agent/terminal footers")
+    status.add_argument("--cwd", help="Project cwd (default: host-provided cwd or current directory)")
+    status.add_argument("--width", type=int, default=_STATUS_WIDTH, help="Maximum terminal columns, default 120")
+    host = status.add_mutually_exclusive_group()
+    host.add_argument("--claude", action="store_true", help="Read Claude status-line JSON from stdin")
+    host.add_argument("--herdr", action="store_true", help="Use Herdr's active pane cwd")
+    status.add_argument("--append-command", help="Trusted existing Claude renderer; receives the original stdin")
+    status.set_defaults(func=_cmd_status)
+
+    watch = sub.add_parser("watch", help="Read-only live dashboard of delegated agents")
+    watch.add_argument("run_id", nargs="?", help="Show one recorded run")
+    watch.add_argument("--cwd", help="Filter runs by their exact recorded working directory")
+    watch.add_argument("--limit", type=int, default=20, help="Maximum rows; running calls first")
+    watch.add_argument("--interval", type=float, default=_WATCH_REFRESH_SECONDS, help="Refresh seconds (0 < N <= 60)")
+    watch.add_argument("--once", action="store_true", help="Print one text snapshot")
+    watch.add_argument("--json", action="store_true", help="Print one JSON snapshot")
+    watch.add_argument("--open", choices=["ghostty", "herdr"], help="Launch a separate viewer surface")
+    watch.add_argument("--split", choices=["right", "down"], help="Split instead of opening a window/tab")
+    watch.set_defaults(func=_cmd_watch)
 
     runs = sub.add_parser("runs", help="List, show, autopsy, audit, and prune run records")
     runs.add_argument("runs_action", nargs="?", choices=["list", "show", "autopsy", "audit", "prune"], default="list")

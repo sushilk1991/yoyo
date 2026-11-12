@@ -55,3 +55,11 @@ Sources checked September 22, 2026: [NanoJev](https://huggingface.co/C-Tianyu/Na
 [The research runner](autoresearch/program.md) searches prompt wording and evidence formatting with fixed weights. It freezes development and holdout data, records every candidate, monitors memory, and keeps the installed helper unchanged. The September 22 follow-up improved a new 45-case holdout from 31 to 36 correct raw labels with similar memory use. It returned 13 correct suggestions instead of 14 while removing one wrong suggestion, so the preset coverage gate rejected automatic promotion. The candidate remains a research result.
 
 A third round required normal memory pressure and tested 60 fresh cases. No new prompt beat that candidate under the existing rules. The same candidate scored 44/60 versus the installed baseline's 41/60, issued 16 correct suggestions versus 15, and no wrong suggestions versus one. Peak process RSS across all 16 trials was 767 MB. This holdout passed the gate, but it does not erase the earlier coverage regression or establish production accuracy. Installed behavior remains unchanged.
+
+## Pi status footer
+
+`pi/yoyo-status.ts` is an optional native Pi extension for the main-terminal YOYO status line. It polls `yoyo status --cwd <Pi cwd>` and adds a keyed footer status without replacing other extensions' statuses. No model call is involved.
+
+Load it with `pi -e /absolute/path/to/yoyo/extras/pi/yoyo-status.ts`, or copy it to Pi's user extensions directory and run `/reload`. It requires the updated `yoyo` executable on PATH; `YOYO_STATUS_BIN` can name an absolute executable. See [footer setup](../docs/REFERENCE.md#status-footers) for Claude and Herdr/Codex too.
+
+The lifecycle tests run through the Python suite when Node.js is available, or directly with `node --experimental-strip-types --test tests/pi_status.test.mjs` from the repo root. The Pi host requires Node.js 22.19+.

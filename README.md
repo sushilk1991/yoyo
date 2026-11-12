@@ -45,6 +45,27 @@ yoyo wait "$run_id" --timeout 25    # 124 = still running, wait again; 0 = done
 
 The detached run gets its own session, so it survives the caller's turn ending. `--background` works on `ask`, `loop`, `research`, and `review`.
 
+## Status in your main terminal
+
+```text
+YOYO · 2 running · codex: Review auth (2m) · claude: Fix layout (45s)
+```
+
+`yoyo status` prints a compact summary of active recorded calls in the current project. Claude Code can append it to its existing status line; Pi can show it through the bundled footer extension. Codex uses Herdr's bottom bar because its native footer has no command-backed custom field. No split is required. See [footer setup](docs/REFERENCE.md#status-footers).
+
+## Watch delegated agents
+
+```bash
+yoyo watch                                   # read-only live dashboard
+yoyo watch --cwd "$PWD"                      # this project's runs
+yoyo watch --open ghostty                     # separate macOS window
+yoyo watch --open herdr --split right         # run inside a Herdr pane
+```
+
+Select runs with Up/Down, switch output streams with Tab, scroll with Page Up/Down, show the stored prompt with `p`, and detach with `q`. Closing the viewer leaves agents running. `yoyo watch --once` prints a snapshot; `--json` returns structured data.
+
+This shows recorded tasks and available captures, not the native interactive agent screen. Buffered providers can stay quiet until completion; streaming adapter changes are not included. Ghostty automation requires 1.3+ on macOS and Automation permission. Herdr launchers require its CLI and a compatible running server. See [watch reference](docs/REFERENCE.md#watch).
+
 ## The 60-second tour
 
 ```bash

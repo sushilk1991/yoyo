@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -6133,6 +6134,444 @@ class ReviewFixTests(CliTestCase):
             self.assertTrue(agents["claude"].buffers_output)
             self.assertFalse(agents["mine"].buffers_output)
             self.assertTrue(agents["slow"].buffers_output)
+
+
+class WatchTests(CliTestCase):
+    # Small ledger fixtures exercise the public CLI without launching providers.
+    def make_run(self, name="20261018T120000-aabbccdd", **meta):
+        path = Path(self._state_guard.name) / "runs" / name
+        path.mkdir(parents=True)
+        data = {"agent": "echo", "mode": "call", "cwd": str(ROOT),
+                "started_at": "2026-10-18T12:00:00Z", "pid": None}
+        data.update(meta)
+        (path / "meta.json").write_text(json.dumps(data))
+        return path
+
+    def test_watch_skips_directory_names_changed_by_sanitizing(self):
+        self.make_run("\x1b[31m..")
+        state = Path(self._state_guard.name)
+        (state / "prompt.txt").write_text("Task:\nOUTSIDE_RUNS_ROOT")
+        (state / "stdout.txt").write_text("OUTSIDE_CAPTURE")
+        code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["runs"], [])
+        self.assertNotIn("OUTSIDE", out)
+
+    def test_ledger_permission_failure_is_not_an_empty_snapshot(self):
+        for argv in (["watch", "--json"], ["status"]):
+            with self.subTest(argv=argv), mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
+                code, out, err = self.run_cli(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("Could not read run ledger", err)
+
+    def test_watch_empty_snapshot(self):
+        code, out, err = self.run_cli(["watch", "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("No runs", out)
+
+    def test_watch_json_task_and_failure(self):
+        path = self.make_run()
+        (path / "prompt.txt").write_text("Role\nTask:\nReview auth\n\nContext files:\nSECRET")
+        (path / "result.json").write_text('{"exit_code": 1}')
+        (path / "stderr.txt").write_text("test failed\n")
+        code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["runs"][0]["task"], "Review auth")
+        self.assertEqual(data["runs"][0]["status"], "failed")
+        self.assertIn("test failed", data["selected"]["stderr"])
+        self.assertNotIn("SECRET", out)
+        self.assertNotIn("prompt", data["selected"])
+
+    def test_watch_filters_before_limit(self):
+        wanted = self.make_run("20261017T120000-aabbccdd")
+        (wanted / "result.json").write_text('{"exit_code": 0}')
+        self.make_run(cwd="/elsewhere")
+        code, out, err = self.run_cli(["watch", "--cwd", str(ROOT), "--limit", "1", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r["run_id"] for r in json.loads(out)["runs"]], [wanted.name])
+
+    def test_watch_running_before_recent_done(self):
+        running = self.make_run("20261017T120000-aabbccdd", pid=os.getpid())
+        done = self.make_run()
+        (done / "result.json").write_text('{"exit_code": 0}')
+        code, out, err = self.run_cli(["watch", "--json", "--limit", "1"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["runs"][0]["run_id"], running.name)
+
+    def test_watch_selects_run_and_strips_controls(self):
+        path = self.make_run(agent="bad\x1b]52;c;SECRET\x07name")
+        (path / "stdout.txt").write_text("\x1b[31mhello\x1b[0m\x1b]52;c;SECRET\x07\r\x08\x9b2J\u202eevil")
+        code, out, err = self.run_cli(["watch", path.name, "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("hello", out)
+        for control in ("\x1b", "\x07", "\x08", "\x9b", "\u202e", "SECRET"):
+            self.assertNotIn(control, out)
+
+    def test_watch_tolerates_partial_metadata(self):
+        path = self.make_run()
+        (path / "meta.json").write_text('{"pid":')
+        code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["runs"][0]["status"], "unknown")
+
+    def test_watch_missing_exit_is_unknown(self):
+        path = self.make_run()
+        for result in ({}, {"exit_code": None}, {"exit_code": "0"}):
+            with self.subTest(result=result):
+                (path / "result.json").write_text(json.dumps(result))
+                code, out, err = self.run_cli(["watch", "--json"])
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)["runs"][0]["status"], "unknown")
+
+    def test_watch_handles_corrupt_pid(self):
+        self.make_run(pid=float("inf"))
+        code, out, err = self.run_cli(["watch", "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("unknown", out)
+
+    def test_watch_bounds_output_and_skips_links(self):
+        path = self.make_run()
+        (path / "stdout.txt").write_text("x" * 200000 + "TAIL")
+        private = Path(self._state_guard.name) / "private"
+        private.write_text("PRIVATE")
+        (path / "stderr.txt").symlink_to(private)
+        code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        selected = json.loads(out)["selected"]
+        self.assertTrue(selected["stdout"].endswith("TAIL"))
+        self.assertLess(len(selected["stdout"]), 20000)
+        self.assertNotIn("PRIVATE", out)
+
+    def test_watch_buffered_provider_is_labelled(self):
+        self.make_run(agent="claude", pid=os.getpid())
+        code, out, err = self.run_cli(["watch", "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("buffer", out.lower())
+        self.assertIn("No output yet", out)
+
+    def test_watch_shows_background_final_answer(self):
+        path = self.make_run(mode=None)
+        (path / "result.json").write_text(json.dumps({"exit_code": 0, "stdout": "Final answer", "stderr": "diagnostic"}))
+        code, out, err = self.run_cli(["watch", "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Final answer", out)
+        self.assertIn("diagnostic", out)
+
+    def test_watch_bad_result_is_not_completion(self):
+        path = self.make_run()
+        (path / "result.json").write_text('{"exit_code":')
+        code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["runs"][0]["status"], "unknown")
+
+    def test_watch_background_log_is_visible(self):
+        path = self.make_run(mode=None)
+        (path / "log.txt").write_text("still running, 20s elapsed")
+        code, out, err = self.run_cli(["watch", "--once"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("still running, 20s elapsed", out)
+
+    def test_watch_non_tty_is_one_snapshot(self):
+        self.make_run()
+        code, out, err = self.run_cli(["watch"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("YOYO", out)
+
+    def test_watch_rejects_invalid_options(self):
+        for argv in (["watch", "../private"], ["watch", "--limit", "0"],
+                     ["watch", "--interval", "nan"], ["watch", "--interval", "0"],
+                     ["watch", "--split", "right"], ["watch", "--open", "herdr", "--once"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(argv)
+                self.assertEqual(code, 2)
+
+    def test_herdr_launch_uses_new_pane(self):
+        response = subprocess.CompletedProcess([], 0, '{"result":{"pane":{"pane_id":"w1:p2"}}}', "")
+        with mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "herdr", "--split", "right"],
+                                          env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_args_list[0].args[0][:4], ["herdr", "pane", "split", "w1:p1"])
+        command = run.call_args_list[1].args[0]
+        self.assertEqual(command[:4], ["herdr", "pane", "run", "w1:p2"])
+        self.assertIn("YOYO_STATE_DIR=", command[4])
+        self.assertNotIn("--open", command[4])
+
+    def test_herdr_bad_reply_never_sends_input(self):
+        response = subprocess.CompletedProcess([], 0, '{}', "")
+        with mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "herdr", "--split", "right"],
+                                          env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertEqual(code, 2)
+        self.assertEqual(run.call_count, 1)
+
+    def test_ghostty_launch_uses_configuration(self):
+        response = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(yoyo.sys, "platform", "darwin"), \
+             mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "ghostty"])
+        self.assertEqual(code, 0, err)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "osascript")
+        self.assertIn("new window with configuration", run.call_args.kwargs["input"])
+        self.assertIn("set command of cfg", run.call_args.kwargs["input"])
+
+    def test_herdr_tab_uses_new_root_pane(self):
+        response = subprocess.CompletedProcess([], 0, '{"result":{"root_pane":{"pane_id":"w1:p3"}}}', "")
+        with mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "herdr"],
+                                          env={"HERDR_WORKSPACE_ID": "w1"})
+        self.assertEqual(code, 0, err)
+        self.assertIn("--workspace", run.call_args_list[0].args[0])
+        self.assertEqual(run.call_args_list[1].args[0][3], "w1:p3")
+
+    def test_herdr_rejects_original_pane(self):
+        response = subprocess.CompletedProcess([], 0, '{"result":{"pane":{"pane_id":"w1:p1"}}}', "")
+        with mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "herdr", "--split", "right"],
+                                          env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertEqual(code, 2)
+        self.assertEqual(run.call_count, 1)
+
+    def test_ghostty_quotes_paths_as_arguments(self):
+        response = subprocess.CompletedProcess([], 0, "", "")
+        cwd = Path(self._state_guard.name) / 'a "quoted" path'
+        cwd.mkdir()
+        with mock.patch.object(yoyo.sys, "platform", "darwin"), \
+             mock.patch.object(yoyo.subprocess, "run", return_value=response) as run:
+            code, out, err = self.run_cli(["watch", "--open", "ghostty", "--cwd", str(cwd)])
+        self.assertEqual(code, 0, err)
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], str(cwd.resolve()))
+        self.assertNotIn('quoted', run.call_args.kwargs["input"])
+        viewer = shlex.split(command[-2])
+        self.assertEqual(viewer[viewer.index("--cwd") + 1], str(cwd.resolve()))
+
+    def test_snapshot_does_not_probe_finished_pid(self):
+        path = self.make_run(pid=os.getpid())
+        (path / "result.json").write_text('{"exit_code": 0}')
+        with mock.patch.object(yoyo, "pid_is_running") as probe:
+            code, out, err = self.run_cli(["watch", "--json"])
+        self.assertEqual(code, 0, err)
+        probe.assert_not_called()
+
+    def test_watch_reads_only_displayed_prompts(self):
+        self.make_run()
+        self.make_run("20261017T120000-aabbccdd")
+        with mock.patch.object(yoyo, "_watch_task", wraps=yoyo._watch_task) as preview:
+            code, out, err = self.run_cli(["watch", "--once", "--limit", "1"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(preview.call_count, 1)
+
+    def test_watch_keeps_selection_visible(self):
+        import curses
+        for index in range(20):
+            self.make_run(f"20261018T120000-{index:08x}")
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (12, 120)
+        screen.getch.side_effect = [curses.KEY_UP, ord("q")]
+        frames = []
+        current = []
+        screen.addnstr.side_effect = lambda row, col, text, limit: current.append(text)
+        def refresh():
+            frames.append(list(current))
+            current.clear()
+        screen.refresh.side_effect = refresh
+        args = yoyo.build_parser().parse_args(["watch"])
+        with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": self._state_guard.name}):
+            yoyo._watch_screen(screen, args)
+        self.assertTrue(any(line.startswith("> 20261018T120000-00000000") for line in frames[-1]), frames[-1])
+        self.assertTrue(any("Selected:" in line for line in frames[-1]), frames[-1])
+
+    def test_watch_keyboard_navigation(self):
+        import curses
+        first = self.make_run()
+        second = self.make_run("20261017T120000-aabbccdd")
+        (first / "stdout.txt").write_text("FIRST OUTPUT")
+        (second / "stderr.txt").write_text("SECOND OUTPUT")
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (30, 120)
+        screen.getch.side_effect = [curses.KEY_DOWN, ord("\t"), ord("p"), ord("p"), ord("q")]
+        def dashboard(callback, args):
+            callback(screen, args)
+        class TtyBuffer(io.StringIO):
+            def isatty(self):
+                return True
+        with mock.patch("curses.wrapper", side_effect=dashboard), \
+             mock.patch.object(io, "StringIO", TtyBuffer):
+            code, out, err = self.run_cli(["watch"])
+        self.assertEqual(code, 0, err)
+        rendered = "\\n".join(call.args[2] for call in screen.addnstr.call_args_list)
+        self.assertIn("FIRST OUTPUT", rendered)
+        self.assertIn(second.name, rendered)
+        self.assertIn("Prompt:", rendered)
+
+    def test_watch_detach_leaves_worker_alive(self):
+        # A real PTY covers curses setup and q; the independent worker must survive.
+        import pty
+        import select
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: worker.poll() is None and worker.terminate())
+        path = self.make_run(pid=worker.pid)
+        master, slave = pty.openpty()
+        env = dict(os.environ, YOYO_STATE_DIR=self._state_guard.name, TERM="xterm-256color")
+        viewer = subprocess.Popen([sys.executable, str(YOYO_PATH), "watch", "--interval", "0.1"],
+                                  stdin=slave, stdout=slave, stderr=slave, env=env)
+        os.close(slave)
+        try:
+            deadline = time.monotonic() + 5
+            output = b""
+            while b"q detach" not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output += os.read(master, 65536)
+            self.assertIn(b"q detach", output)
+            os.write(master, b"q")
+            deadline = time.monotonic() + 5
+            while viewer.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        output += os.read(master, 65536)
+                    except OSError:
+                        break
+            self.assertEqual(viewer.poll(), 0, output[-2000:])
+            self.assertIsNone(worker.poll())
+            self.assertFalse((path / "result.json").exists())
+        finally:
+            if viewer.poll() is None:
+                viewer.kill()
+            viewer.wait(timeout=5)
+            os.close(master)
+            worker.terminate()
+            worker.wait(timeout=5)
+
+    def test_launcher_failure_is_actionable(self):
+        with mock.patch.object(yoyo.subprocess, "run", side_effect=FileNotFoundError("herdr")):
+            code, out, err = self.run_cli(["watch", "--open", "herdr", "--split", "right"],
+                                          env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertEqual(code, 2)
+        self.assertIn("herdr", err)
+
+
+class StatusTests(CliTestCase):
+    # Active call records, not wrapper directories, define the footer count.
+    def make_call(self, name="20261018T120000-aabbccdd", **values):
+        path = Path(self._state_guard.name) / "runs" / name
+        path.mkdir(parents=True)
+        meta = {"mode": "call", "agent": "codex", "role": "review", "cwd": str(ROOT),
+                "pid": os.getpid(), "started_at": yoyo.iso_utc(yoyo.utc_now())}
+        meta.update(values)
+        (path / "meta.json").write_text(json.dumps(meta))
+        (path / "prompt.txt").write_text("Role\nTask:\nReview auth\n\nContext files:\nPRIVATE ATTACHMENT")
+        return path
+
+    def test_status_idle(self):
+        code, out, err = self.run_cli(["status"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "YOYO · idle")
+
+    def test_status_shows_active_task(self):
+        self.make_call()
+        code, out, err = self.run_cli(["status", "--cwd", str(ROOT)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 running", out)
+        self.assertIn("codex: Review auth", out)
+        self.assertNotIn("PRIVATE", out)
+        self.assertEqual(len(out.splitlines()), 1)
+
+    def test_status_does_not_count_wrappers(self):
+        self.make_call()
+        self.make_call("20261018T120001-aabbccdd", mode=None)
+        self.make_call("20261018T120002-aabbccdd", mode="iteration")
+        code, out, err = self.run_cli(["status"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 running", out)
+
+    def test_status_filters_project(self):
+        self.make_call(cwd="/somewhere-else")
+        code, out, err = self.run_cli(["status", "--cwd", str(ROOT)])
+        self.assertEqual(code, 0, err)
+        self.assertIn("idle", out)
+
+    def test_status_finished_or_dead_is_not_running(self):
+        finished = self.make_call()
+        (finished / "result.json").write_text('{"exit_code": 0}')
+        self.make_call("20261018T120001-aabbccdd", pid=None)
+        code, out, err = self.run_cli(["status"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("idle", out)
+
+    def test_status_counts_beyond_preview(self):
+        for index in range(5):
+            self.make_call(f"20261018T120000-{index:08x}")
+        code, out, err = self.run_cli(["status", "--width", "200"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("5 running", out)
+        self.assertEqual(out.count("Review auth"), 2)
+        self.assertIn("+3 more", out)
+
+    def test_status_sanitizes_and_bounds_width(self):
+        path = self.make_call(agent="codex\x1b]52;c;PRIVATE\x07")
+        (path / "prompt.txt").write_text("Task:\n" + "界" * 200 + "\n\x1b[2J")
+        code, out, err = self.run_cli(["status", "--width", "40"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("PRIVATE", out)
+        import unicodedata
+        columns = sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                      for c in out.strip() if not unicodedata.combining(c))
+        self.assertLessEqual(columns, 40)
+
+    def test_status_claude_uses_payload_cwd(self):
+        self.make_call()
+        code, out, err = self.run_cli(["status", "--claude"],
+                                      stdin=json.dumps({"workspace": {"current_dir": str(ROOT)}, "cwd": "/wrong"}))
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 running", out)
+
+    def test_status_herdr_uses_active_cwd(self):
+        self.make_call()
+        code, out, err = self.run_cli(["status", "--herdr"],
+                                      env={"HERDR_ACTIVE_PANE_CWD": str(ROOT)})
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 running", out)
+
+    def test_status_preserves_previous_renderer(self):
+        saved = Path(self._state_guard.name) / "input.json"
+        script = Path(self._state_guard.name) / "previous.py"
+        script.write_text("import sys,pathlib; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read()); print('Existing model/context footer')")
+        command = shlex.join([sys.executable, str(script), str(saved)])
+        payload = json.dumps({"cwd": str(ROOT), "session_id": "private-id"})
+        code, out, err = self.run_cli(["status", "--claude", "--append-command", command], stdin=payload)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith("Existing model/context footer\n"), out)
+        self.assertEqual(saved.read_text(), payload)
+        self.assertTrue(out.rstrip().endswith("YOYO · idle"))
+        self.assertNotIn("private-id", out)
+
+    def test_status_previous_failure_keeps_yoyo(self):
+        code, out, err = self.run_cli(["status", "--claude", "--append-command", "exit 1"], stdin="{}")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "YOYO · idle")
+
+    @unittest.skipUnless(shutil.which("node"), "Pi extension lifecycle tests require Node.js")
+    def test_pi_footer_lifecycle(self):
+        # Keep the stdlib CLI suite usable on hosts with an older optional Node.
+        version = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
+        parts = version.stdout.strip().lstrip("v").split(".")
+        if len(parts) < 2 or (int(parts[0]), int(parts[1])) < (22, 19):
+            self.skipTest("Pi adapter requires Node.js 22.19+")
+        result = subprocess.run(["node", "--experimental-strip-types", "--test", str(ROOT / "tests/pi_status.test.mjs")],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_status_validates_options(self):
+        for argv in (["status", "--width", "0"], ["status", "--width", "513"],
+                     ["status", "--append-command", "echo hi"], ["status", "--herdr", "--claude"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(argv)
+                self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

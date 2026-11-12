@@ -244,6 +244,124 @@ yoyo runs prune --days 7
 
 `yoyo wait` exit codes: 124 = still running (wait again); 0 = success (result on stdout); anything else = failed or died. The 124 path reports proof of life — the poll expired, not the run — with how long the run has been going and the freshest progress on disk: the last heartbeat line from `log.txt`, else the captured byte counts. Under `--json` those arrive as `run_status`, `elapsed_s`, `last_progress`, `stdout_bytes`, `stderr_bytes` alongside the unchanged `run_id` and `status`. Runs live under `$YOYO_STATE_DIR/runs/<run_id>/` (default `~/.local/state/yoyo`). A run reports `running` only while its recorded pid still belongs to the process that started it: the ledger stores the pid's start time alongside it, because a pid on its own is reused, and a run killed hard enough to skip writing its result would otherwise read as `running` forever — polled by `wait` and skipped by `prune`. The check needs both halves, so a record written before this release, or one on a host where `ps` cannot answer, falls back to the pid alone and stays as permissive as it was. Argument validation still happens in the foreground, so a bad agent name fails loudly before detaching.
 
+## Status footers
+
+`yoyo status` prints one plain-text line for the main agent or terminal footer. It defaults to the current directory; `--cwd PATH` selects an exact project directory. It counts active foreground call journals, not background parents or loop mirrors, so one delegation is not counted twice. All sessions sharing that cwd contribute; this is project status, not a session-isolated task list.
+
+```bash
+yoyo status
+yoyo status --cwd "$PWD" --width 100
+```
+
+Example:
+
+```text
+YOYO · 2 running · codex: Review auth (2m) · claude: Fix layout (45s)
+```
+
+With no active recorded calls it prints `YOYO · idle`. Up to two calls show task previews and elapsed time, followed by a remaining count when space permits. Output is single-line, strips terminal controls, and is bounded by terminal columns, including wide characters. `--width` accepts 20–512 columns and defaults to 120. A task comes from the stored prompt, cut before attached files/stdin; missing task text falls back to the recorded role. No output captures or full prompts are printed.
+
+This reports recorded processes, not model reasoning, tool-level progress, task verification, or calls made with journaling disabled. Completed/dead calls disappear at the next refresh. Footer polling sends no agent prompts and has no token cost. It does start a short local Python process for each refresh.
+
+### Claude Code
+
+Merge this into `~/.claude/settings.json`, using the absolute path to your installed `yoyo` if it is not on the status command's PATH:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "yoyo status --claude",
+    "refreshInterval": 2
+  }
+}
+```
+
+`--claude` reads Claude's JSON from stdin and selects `workspace.current_dir`, falling back to `cwd`. An explicit `--cwd` wins. If you already have a renderer, preserve its command using `--append-command`; shell-quote that complete trusted command as one argument:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "yoyo status --claude --append-command 'bash ~/.claude/statusline-command.sh'",
+    "refreshInterval": 2
+  }
+}
+```
+
+The previous command receives the original stdin unchanged, and its output remains above the added YOYO line. Its execution is bounded to 1.5 seconds and 16 KiB of output; failure/timeout leaves the YOYO line available. Only pass your own trusted renderer; this option executes shell code. Do not append a command that invokes this same wrapper recursively. Existing padding and other status-line fields can stay unchanged. Older Claude versions without `refreshInterval` update only when Claude triggers the status command.
+
+### Pi
+
+Load the bundled extension for one invocation:
+
+```bash
+pi -e /absolute/path/to/yoyo/extras/pi/yoyo-status.ts
+```
+
+For persistent activation, copy that file to `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/yoyo-status.ts`, then run `/reload` in Pi. Install or update the `yoyo` executable first; optionally set `YOYO_STATUS_BIN` to its absolute path. The extension uses `ctx.ui.setStatus("yoyo", text)` rather than replacing your footer. It polls every two seconds, with a two-second command timeout, never overlaps requests, and aborts/clears its resources on shutdown or reload. It does nothing in non-TUI modes. A failed status command shows `YOYO · status unavailable`, not idle.
+
+### Codex through Herdr
+
+Codex's built-in footer supports a fixed set of items, not a YOYO command. Use Herdr's existing bottom tab row while running Codex inside Herdr. Merge these keys into the existing `[ui]` table in `~/.config/herdr/config.toml`; do not add a second `[ui]` table or replace other status entries:
+
+```toml
+[ui]
+tab_bar_position = "bottom"
+tab_bar_right = [
+  { type = "command", command = "yoyo status --herdr --width 100", interval_seconds = 2, timeout_seconds = 2 },
+]
+```
+
+`--herdr` uses `HERDR_ACTIVE_PANE_CWD` supplied by Herdr. It also works while Claude or Pi is focused. The command runs on the Herdr server, so an SSH server needs YOYO installed there and access to that machine's ledger. Use an absolute executable path if the server's PATH differs from your shell. Herdr hides the status area when the tab row has insufficient space; reduce `--width` if needed. Its temporary prefix/navigation bars can also replace that row.
+
+Run `herdr server reload-config` only when a server is already running; this does not require a server restart. Otherwise the next Herdr launch reads the settings. Codex outside Herdr still needs `yoyo watch`; no Codex config is changed and no terminal cursor escapes are injected into its TUI.
+
+API references checked October 18, 2026: [Claude status lines](https://code.claude.com/docs/en/statusline), [Pi extensions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md), [Codex footer items](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/status_line_setup.rs), and [Herdr configuration](https://herdr.dev/docs/configuration/). Local compatibility checks used Claude 2.1.302, Pi 1.3.0, Codex 0.162.1, and Herdr 0.8.2. The CLI remains stdlib Python; the optional Pi adapter requires its host's Node.js runtime.
+
+## Watch
+
+`yoyo watch` opens a read-only curses dashboard when stdin and stdout are terminals. It reads the existing ledger; no daemon, extra Python dependencies, native agent attachment, or agent input channel is added.
+
+```bash
+yoyo watch                                      # all recorded projects
+yoyo watch --cwd "$PWD"                         # exact cwd match
+yoyo watch RUN_ID                                # only this run
+yoyo watch --once                                # text snapshot
+yoyo watch --json                                # JSON snapshot
+yoyo watch --open ghostty                        # new macOS window
+yoyo watch --open ghostty --split right          # frontmost Ghostty terminal
+yoyo watch --open herdr --split down             # caller's Herdr pane
+yoyo watch --open herdr                          # new tab in caller's workspace
+```
+
+| Option | Behavior |
+| --- | --- |
+| `RUN_ID` | Optional existing run ID; rejects unknown or unsafe paths |
+| `--cwd PATH` | Exact match against the resolved working directory, not a subtree |
+| `--limit N` | Maximum rows, default 20; running runs come first, then newest records |
+| `--interval N` | Delay between refreshes, default 1 second; greater than 0 and at most 60, with a 0.1-second UI minimum, plus snapshot processing time |
+| `--once` / `--json` | One snapshot; non-TTY invocations also print once and exit |
+
+`--open ghostty|herdr` launches one separate viewer, preserving the effective `YOYO_STATE_DIR`, filter, run ID, limit, and interval. `--split right|down` requires `--open`; omit it for a Ghostty window or Herdr tab. Launching cannot be combined with `--once` or `--json`. No pane opens automatically when an agent starts.
+
+1. **Select:** Up/Down moves through the displayed runs; small terminals scroll the list around the selected row.
+2. **Inspect:** Tab cycles all/stdout/stderr/background log. Page Up/Down scrolls the bounded output tail. Captures may be raw provider JSONL.
+3. **Read the prompt:** `p` toggles a bounded stored prompt view. Prompts are hidden by default and can contain private context. Missing/opted-out prompts remain absent.
+4. **Detach:** `q` or Escape closes the viewer without signalling workers. Closing its window also leaves separately running agents alone.
+
+Rows distinguish `running`, `completed` (exit 0), `failed` (other recorded exit), `dead` (process gone with no result), and `unknown` (missing/unreadable evidence). Completion describes the process, not verified task correctness. Parent, iteration, and call records can represent the same delegation; the viewer labels them and does not invent a parent/child tree from trace strings.
+
+The selected run shows its cwd, role, and available stdout/stderr/log tails. Background/iteration envelopes also supply saved final answers when a native capture is absent. Output tails are limited to 16 KiB per file; prompt reads to 64 KiB; metadata/result reads to 8 MiB. Oversized or incomplete JSON is unreadable until a usable record exists. Symlinked run directories and capture files are skipped, and FIFO/device files are not read. Terminal control sequences and invisible control/formatting characters are removed before display. This is safe rendering, not secret redaction; captured output itself can contain secrets.
+
+**Visibility limits:** Claude/Pi and custom providers can buffer their output. No bytes does not establish a hang, thinking state, or permission block. This release does not change agent invocation flags or add Codex/Claude structured-stream adapters. For a foreground Codex call, the viewer shows persisted native captures; the temporary `--output-last-message` file is not a durable final-answer artifact. Journaling opt-out prevents foreground calls from appearing. Historical and background records can lack task text.
+
+**Ghostty:** macOS AppleScript is required (introduced in 1.3.0; preview API in 1.3, with breaking changes anticipated in 1.4). macOS can ask for Automation permission; `macos-applescript = false` disables it. A requested split targets the frontmost window's focused terminal at invocation time, so focus that terminal first; use the default new window to avoid focus ambiguity. Unsupported/denied automation returns an error, never a simulated-keyboard fallback.
+
+**Herdr:** run the launcher inside Herdr. Splits use `HERDR_PANE_ID`; tabs use `HERDR_WORKSPACE_ID`. The launcher creates a new surface with `--no-focus`, then submits the trusted viewer command only to its returned pane ID. Select the new tab if needed. It rejects missing/malformed IDs and the caller's existing pane. It never starts or resumes an agent, attaches writable terminal control, installs Herdr, or takes over a terminal. Launchers are tested with fake CLI responses, not live GUI/server automation; verify compatibility with your installed CLI/server (`herdr api schema --json`). If creation succeeds but starting the viewer fails, the newly created empty surface remains open; running agents are unaffected.
+
+JSON snapshots contain `runs` and `selected`. Each row includes `run_id`, `agent`, `status`, `cwd`, `role`, `kind`, `task`, and `elapsed_s`. `selected` additionally includes `stdout`, `stderr`, `log`, and `visibility`; it is null when nothing matches. Full stored prompts are never included in JSON snapshots.
+
 ## The call journal and autopsy
 
 Foreground agent calls are journaled into the same ledger as they execute (`meta.json` at start, `result.json` at exit, live stdout/stderr captures in the run dir), so a call killed by its caller leaves evidence instead of vanishing. If yoyo receives SIGINT/SIGTERM/SIGHUP mid-call, the journal records which signal and when.
