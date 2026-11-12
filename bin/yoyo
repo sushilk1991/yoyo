@@ -3947,7 +3947,6 @@ def cmd_loop(args: argparse.Namespace) -> int:
         consecutive_failures = 0
         queue_rejections = 0
         verification_rejections = 0
-        check_failures = 0
         unchanged_iterations = 0
         verification = None
         iterations_run = 0
@@ -3957,14 +3956,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
         def verify_done() -> bool:
             # DONE -> caller's check -> accept or preserve failure evidence.
             # No model grades another model, and no extra inference is needed.
-            nonlocal verification, verification_rejections, check_failures
+            nonlocal verification, verification_rejections
             if args.verify is None:
                 return True
             verification = _run_loop_check(args)
             if verification["exit_code"] == 0:
-                check_failures = 0
                 return True
-            check_failures += 1
+            # A passing check ends the loop, so every rejection shares one budget.
             verification_rejections += 1
             evidence = (verification["stdout"] + "\n" + verification["stderr"])[-LOOP_CHECK_MAX_CHARS:]
             # Prefix every captured line, including multiline commands, so a
@@ -4018,7 +4016,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
             if accept_done():
                 end_reason = "done"
                 break
-            if check_failures >= args.max_fail:
+            if verification_rejections >= args.max_fail:
                 end_reason = "max-fail"
                 break
 
@@ -4070,7 +4068,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
             if accept_done():
                 end_reason = "done"
                 break
-            if consecutive_failures >= args.max_fail or check_failures >= args.max_fail:
+            if consecutive_failures >= args.max_fail or verification_rejections >= args.max_fail:
                 end_reason = "max-fail"
                 break
             if args.max_stall is not None and unchanged_iterations >= args.max_stall:

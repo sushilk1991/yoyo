@@ -5673,6 +5673,51 @@ class RunsAuditTests(CliTestCase):
             self.assertIn("does not accept a run_id", stderr)
 
 
+class LoopVerificationTests(CliTestCase):
+    def _verification_loop(self, tmp, *, pass_on_second_check):
+        from shlex import join
+
+        state = Path(tmp) / "state.md"
+        checks = Path(tmp) / "checks"
+        worker = (
+            "from pathlib import Path; "
+            f"Path({str(state)!r}).write_text('STATUS: DONE\\n'); print('done')"
+        )
+        check = (
+            "from pathlib import Path; import sys; "
+            f"p = Path({str(checks)!r}); "
+            "n = int(p.read_text()) + 1 if p.exists() else 1; p.write_text(str(n)); "
+            f"sys.exit(0 if {pass_on_second_check!r} and n >= 2 else 1)"
+        )
+        code, stdout, stderr = self.run_cli(
+            ["loop", "echo", "--cwd", tmp, "--state", str(state),
+             "--max-iter", "5", "--max-fail", "2", "--verify",
+             join([sys.executable, "-c", check]), "--json", "work"],
+            env={"YOYO_AGENT_ECHO": join([sys.executable, "-c", worker])},
+        )
+        return code, json.loads(stdout), stderr, int(checks.read_text())
+
+    def test_failed_verification_budget_survives_successful_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, summary, stderr, checks = self._verification_loop(tmp, pass_on_second_check=False)
+            self.assertEqual(code, 1, stderr)
+            self.assertEqual(summary["end_reason"], "max-fail")
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["verification_rejections"], 2)
+            self.assertEqual(checks, 2)
+            self.assertTrue(all(row["exit_code"] == 0 for row in summary["runs"]))
+
+    def test_successful_verification_accepts_done_after_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, summary, stderr, checks = self._verification_loop(tmp, pass_on_second_check=True)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(summary["end_reason"], "done")
+            self.assertEqual(summary["iterations"], 2)
+            self.assertEqual(summary["verification_rejections"], 1)
+            self.assertEqual(summary["verification"]["exit_code"], 0)
+            self.assertEqual(checks, 2)
+
+
 class QueueFenceTests(CliTestCase):
     def test_done_requires_unfinished_work_after_fenced_examples(self):
         cases = (
