@@ -2582,6 +2582,7 @@ def execute_agent_call(
         stdout, cursor_note = decode_agent_stdout(agents[agent_name], stdout)
         if cursor_note:
             stderr = f"{stderr}\n{cursor_note}" if stderr else cursor_note
+        stderr_plain = stderr
         if codex_output_file:
             path = Path(codex_output_file)
             if path.exists():
@@ -2591,14 +2592,6 @@ def execute_agent_call(
                     stdout_truncated = final_truncated
                     if proc.returncode == 0:
                         stderr_plain = ""
-                    else:
-                        stderr_plain = stderr
-                else:
-                    stderr_plain = stderr
-            else:
-                stderr_plain = stderr
-        else:
-            stderr_plain = stderr
 
         result = {
             "agent": agent_name,
