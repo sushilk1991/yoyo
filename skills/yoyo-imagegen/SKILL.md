@@ -1,11 +1,11 @@
 ---
 name: yoyo-imagegen
-description: Generate real raster images — diagrams, explainer illustrations, mockups, posters — through yoyo imagegen. Use when a plan, README, or HTML report would land better with a visual, or when the user asks for an image, diagram, or mockup.
+description: Generate real raster images — diagrams, explainer illustrations, mockups, posters — through yoyo imagegen. Use when a plan, README, or HTML report would land better with a visual, or when the user asks for an image, diagram, mockup, animated GIF, or SVG and needs format guidance.
 ---
 
 # Yoyo Imagegen
 
-`yoyo imagegen` delegates to a headless `codex exec` run that renders through codex's built-in `image_gen` tool (`gpt-image-2`), copies the result to `--out`, and reports its size. It needs a signed-in codex CLI and **no `OPENAI_API_KEY`** — the tool renders on the ChatGPT subscription login. Expect 1–2 minutes.
+`yoyo imagegen` delegates to a headless `codex exec` run that renders through codex's built-in `image_gen` tool, copies the result to `--out`, and reports its size. It needs a signed-in codex CLI and **no `OPENAI_API_KEY`** — the tool renders on the ChatGPT subscription login. Yoyo does not select or report the underlying image model; `--model` controls the agent model. Expect 1–2 minutes.
 
 Yoyo verifies the artifact deterministically: the file exists, changed, carries correct magic bytes for its extension, and has a plausible size. That rejects junk, a stale leftover, and a renamed SVG — but a matplotlib-drawn PNG would also pass. **Read the image yourself before embedding it.** Yoyo proves it is a real image; only you can tell whether it is the right one.
 
@@ -18,6 +18,10 @@ yoyo imagegen "make the background white" --edit diagram.png --out diagram-v2.pn
 - `--size WIDTHxHEIGHT` — `1536x1024` for doc and plan images, `1024x1024` for icons, up to `3840x2160`.
 - `--quality low` while iterating, `high` for the final.
 - `--edit existing.png` keeps the layout stable across revisions.
+
+### GIF and SVG output
+
+`yoyo imagegen` cannot export `.gif` or `.svg`; it rejects those extensions. OpenAI's [Image API documentation](https://developers.openai.com/api/docs/guides/image-generation) describes animated GIF and SVG output with GPT Image 2.6 using `output_format: "gif"` or `"svg"` on the image generation endpoint. That is a separate API-key-backed workflow, not a yoyo or Codex built-in tool option. Do not promise animated GIF or SVG export through yoyo, rename a PNG to another format, or treat a static image as an animation. For an actual GIF, inspect the format and confirm it has multiple frames.
 
 One or two refine-and-regenerate passes are normal. A third means the prompt is wrong — rewrite it instead of rerolling.
 

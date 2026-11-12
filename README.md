@@ -64,7 +64,7 @@ yoyo watch --open herdr --split right         # run inside a Herdr pane
 
 Select runs with Up/Down, switch output streams with Tab, scroll with Page Up/Down, show the stored prompt with `p`, and detach with `q`. Closing the viewer leaves agents running. `yoyo watch --once` prints a snapshot; `--json` returns structured data.
 
-This shows recorded tasks and available captures, not the native interactive agent screen. Buffered providers can stay quiet until completion; streaming adapter changes are not included. Ghostty automation requires 1.3+ on macOS and Automation permission. Herdr launchers require its CLI and a compatible running server. See [watch reference](docs/REFERENCE.md#watch).
+This shows recorded tasks and available captures, not the native interactive agent screen. Pi and custom providers can stay quiet until completion; the viewer displays the captures each provider supplies. Ghostty automation requires 1.3+ on macOS and Automation permission. Herdr launchers require its CLI and a compatible running server. See [watch reference](docs/REFERENCE.md#watch).
 
 ## The 60-second tour
 
@@ -87,6 +87,14 @@ yoyo loop codex,claude --cwd "$PWD" --max-iter 30 --background "Fix the failing 
 # iteration, DONE rejected while any box is unchecked. --brief injects shared
 # repo knowledge so fresh contexts stop re-deriving it.
 yoyo loop claude --cwd "$PWD" --queue tasks.md --brief .yoyo/brief.md --background "Work the queue."
+
+# Shared thread: invite several vendors into one conversation you own. Each ask is
+# one turn; the member gets the fenced history; nothing an agent writes starts a turn.
+yoyo thread create design --agents codex,claude --cwd "$PWD"
+yoyo thread watch design --pane      # follow it live in a tmux, Herdr, or Herdr desktop pane
+yoyo ask codex  --thread design "Propose the migration."
+yoyo ask claude --thread design "Find the strongest flaw in codex's plan."
+yoyo thread invite design grok && yoyo ask grok --thread design "Break the tie."
 
 # Bonus: real images via GPT-image
 yoyo imagegen "Hand-drawn architecture diagram, four boxes, bold arrows" --out arch.png
@@ -120,6 +128,7 @@ Optional Apple Silicon advice is available through `yoyo advise --file evidence.
 | `yoyo review` | Cross-vendor consensus review of the current git diff (`--stance unanimous\|any` precision/recall dial) |
 | `yoyo research "..."` | Parallel perspectives (lenses fully yours to define) → decision brief |
 | `yoyo loop <agent(s)> "..."` | Fresh-context iterations at flat cost, with `--queue`, `--brief`, and `--spec` |
+| `yoyo thread` / `ask --thread` | Several agents in one yoyo-owned conversation, one caller-chosen turn at a time; `thread watch` follows it live, in a pane if you like; export/import to hand it off |
 | `yoyo wait` / `runs autopsy` | Poll a detached run; reconstruct one that died |
 | `yoyo runs audit` | Per-agent outcomes and p50/p90 over a window of the ledger |
 | `yoyo models codex\|claude` | Native account and model discovery, with no inference |
