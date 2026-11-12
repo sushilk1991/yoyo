@@ -5767,6 +5767,18 @@ class QueueFenceTests(CliTestCase):
 
 
 class RunSnapshotTests(CliTestCase):
+    def test_wait_skips_result_when_metadata_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "20261112T000000-00000002"
+            run_dir = Path(tmp) / "runs" / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_bytes(b"\xff")
+            code, stdout, stderr = self.run_cli(
+                ["wait", run_id, "--json"], env={"YOYO_STATE_DIR": tmp},
+            )
+            self.assertEqual(code, 4, stderr)
+            self.assertEqual(json.loads(stdout)["status"], "unknown")
+
     def test_run_displays_use_the_result_read_for_that_snapshot(self):
         run_id = "20261112T000000-00000001"
         actions = (["runs", "list"], ["runs", "show", run_id], ["runs", "autopsy", run_id])

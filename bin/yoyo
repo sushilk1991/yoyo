@@ -4742,7 +4742,7 @@ def wait_run(args: argparse.Namespace) -> int:
     while True:
         run_dir = run_dir_for(args.run_id)
         meta = run_meta(run_dir)
-        status = run_status(meta, run_result(run_dir))
+        status = run_status(meta, run_result(run_dir) if meta is not None else None)
         if status == "done":
             return show_run(args.run_id, args.json, exit_with_result=True)
         if status in ("dead", "unknown"):
