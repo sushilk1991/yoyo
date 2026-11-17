@@ -1,33 +1,39 @@
 # Long runs and quota
 
-Branch: `feat/long-runs-and-quota`. Six ordered items in
-`docs/plans/2026-11-17-long-runs-and-quota.md`; one passing commit per item;
-no push, tag, release or installation.
+Branch: `feat/long-runs-and-quota`. Follow the six ordered items in
+`docs/plans/2026-11-17-long-runs-and-quota.md`; one passing commit per item.
+No push, tag, release or installation. Bump VERSION only in item6.
 
-Done: item1 renewable default deadlines; item2 interrupted answers/native
-per-run sessions/continuation, bounded Claude SIGINT before TERM/KILL.
-Verified: item1 535 tests; item2 547 tests; compile silent0; SkillGuard9OK.
-Both actual Yoyo vendor timeouts exited124 with answers and resumed to recall
-a random word, without creating sessions.json. Native picker observations and
-full gate outputs in verification report. No smaller behavior shipped.
+Done:
+- Item1: `3b221dd`, renewable default deadlines; full535 tests OK.
+- Item2: `370441b`, interrupted answers and native continuation; full547 OK.
+- Item3: `9b3fec4`, sanitized quota and terminal usage-limit outcomes; full560 OK.
+- Every commit passed compile (silent0) and SkillGuard9.
+- Real Codex and Claude Yoyo deadline/resume trials retained answers and recalled
+  random words without sessions.json. Final native quota command passed.
 
-Done: item3 quota reporting/classification, 13 regressions; native quota
-passed against finalcode. Remote full560testsOK, SkillGuard9OK, compile0.
-User requires ALL SUITES REMOTE. Additional boxcreation denied5/5; user
-explicitly authorized starting another existingbox. Videoverify diskfull,
-restoredsuspended. Masonry retainedbox resumed, /data2.2Gfree, Batonidle;
-use explicit `boxrun --box masonry` remainingitems, preserve itsfiles.
+Done: item4 fallback/aliases and doctor catalogs; remote580 tests, compile0,
+SkillGuard9 all passed.
 
-Next: item4 fallback. Draft tests staged in ignored `.yoyo/long-runs/item3-tests.txt`
-through item6; adapt before applying. Quota map: only native unmodified adapters;
-Codex init+rateLimits only for quota, reuse models pipe; explicit allowance
-beats utilization; Claude latest event/mtime, root documented fields fallback;
-classify terminal nonzero errors only, preserve timeout/signal precedence.
+Next: item5 token recording and audit percentiles. Native deadline worker owns token parser/persistence/metadata, TokenUsageTests
+and docs. Parent owns collect_audit/audit_runs, TokenAuditTests, checklist,
+report and commits. Canonical tokens integer/null input/output/cached/total;
+absent usage omitted. Models prefer provider result, explicit meta, else unknown. Prospective
+item5-6 tests in ignored `.yoyo/long-runs/`; adapt before applying. No version
+change until item6. No code for later items before the preceding commit.
 
-Testing: boxrun on retained build, unset XDG_CONFIG_HOME for fixture homes.
-All trials use isolated YOYO_STATE_DIR; never prune/retain real ledger.
-Evidence: `.yoyo/long-runs/evidence/`. Report:
+All suites stay REMOTE, explicitly confirmed by user. Use:
+`boxrun --box masonry --lane build --mem 2G -- 'env -u XDG_CONFIG_HOME ...'`.
+User authorized starting another existing machine after build contention and
+new-box quota5/5. Video-verify had only733MB free; restored suspended. Retained
+masonry resumed: Python3.13.5, idle Baton, /data2.2GiB free. Separate owned
+YoYo checkout `/data/workspace/yoyo-2c067b94`; preserve all Masonry data/services.
+Build box remains retained. No local suite ran. Native authenticated vendor
+probes run on Mac only; credentials never copied to remote boxes.
+
+Every test/trial has isolated YOYO_STATE_DIR. Never prune/retain real ledger.
+Evidence `.yoyo/long-runs/evidence/`; report:
 `docs/plans/2026-11-17-long-runs-and-quota-verification.md`.
 
-Muse sandbox could not create boxrun locks; stopped its worker and descendants.
-Native deadline worker completed items1-2. Task-owned native probe processes exited.
+Muse sandbox could not create boxrun locks; its worker/descendants were stopped.
+Native worker completed items1-3. No task-owned native probe process remains.

@@ -8879,5 +8879,246 @@ class QuotaTests(CliTestCase):
         self.assertIsNone(yoyo.parse_iso_utc('0001-01-01T00:00:00+23:59'))
 
 
+class FallbackTests(CliTestCase):
+    def _env(self, error):
+        fail=shlex.join(['python3','-c','import sys;print('+repr(error)+',file=sys.stderr);sys.exit(1)'])
+        good=shlex.join(['python3','-c','import sys;print(sys.stdin.read())'])
+        return {'YOYO_AGENT_FIRST':fail,'YOYO_AGENT_SECOND':good}
+
+    def test_quota_failure_falls_back_and_warns_about_partial_edits(self):
+        code,out,err=self.run_cli(['ask','first','--fallback','second','--json','do work'],env=self._env('ERROR: You have hit your usage limit'))
+        self.assertEqual(code,0,err)
+        row=json.loads(out);self.assertEqual(row['agent'],'second')
+        self.assertTrue(row['stdout'].startswith('A previous agent was stopped by its usage limit'))
+        self.assertEqual(row['routing'][0]['reason'],'quota')
+        self.assertEqual(row['routing'][-1]['agent'],'second')
+
+    def test_ordinary_failure_does_not_fall_back(self):
+        code,out,err=self.run_cli(['ask','first','--fallback','second','--json','work'],env=self._env('network disconnected'))
+        self.assertEqual(code,1,err);self.assertEqual(json.loads(out)['agent'],'first')
+
+    def test_alias_skips_blocked_entry_and_keeps_only_named_model(self):
+        config=Path(self._state_guard.name)/'agents.json'
+        config.write_text(json.dumps({'agents':{'first':{'kind':'claude','command':['python3','-c','import sys;print(sys.stdin.read())']},
+                                               'second':{'kind':'claude','command':['python3','-c','import sys;print(sys.stdin.read())']}}}))
+        (config.parent/'routes.json').write_text(json.dumps({'work':[{'agent':'first','model':'named-first'},
+                                                                  {'agent':'second','model':'named-second'}]}))
+        def quota(agent,*args,**kwargs):
+            return {'agent':agent,'source':'live','observed_at':yoyo.iso_utc(yoyo.utc_now()),'windows':[],'blocked':agent=='first'}
+        with mock.patch.object(yoyo,'quota_for_agent',side_effect=quota):
+            code,out,err=self.run_cli(['ask','@work','--json','work'],env={'YOYO_CONFIG':str(config)})
+        self.assertEqual(code,0,err);row=json.loads(out)
+        self.assertEqual(row['agent'],'second')
+        self.assertIn('named-second',row['command']);self.assertNotIn('named-first',row['command'])
+        self.assertEqual(row['routing'][0]['reason'],'blocked')
+
+    def test_expired_observed_block_does_not_skip_entry(self):
+        row={'agent':'first','source':'observed','observed_at':yoyo.iso_utc(yoyo.utc_now()),'blocked':True,
+             'windows':[{'name':'primary','used_percent':100,'resets_at':yoyo.iso_utc(yoyo.utc_now())}]}
+        with mock.patch.object(yoyo,'quota_for_agent',return_value=row):
+            code,out,err=self.run_cli(['ask','first','--fallback','second','--json','work'],env=self._env('network disconnected'))
+        self.assertEqual(code,1,err);self.assertEqual(json.loads(out)['agent'],'first')
+
+    def _config(self, first_script, second_script, *, native=False):
+        config=Path(self._state_guard.name)/'agents.json'
+        config.write_text(json.dumps({'agents':{
+            name:{'kind':'claude' if native else 'custom',
+                  'command':['python3','-c',script], 'read_only_args':['--read-guard']}
+            for name,script in [('first',first_script),('second',second_script)]}}))
+        return {'YOYO_CONFIG':str(config)}
+
+    def test_read_only_fallback_reuses_rendered_stdin_and_files_once(self):
+        state=Path(self._state_guard.name)
+        captured=state/'captured';context=state/'context';context.write_text('file context')
+        first=('import pathlib,sys; pathlib.Path('+repr(str(captured))+').write_text(sys.stdin.read()); '
+               'assert "--read-guard" in sys.argv; print("Individual quota reached",file=sys.stderr); sys.exit(1)')
+        second='import sys; assert "--read-guard" in sys.argv; print(sys.stdin.read())'
+        env=self._config(first,second)
+        with mock.patch.object(yoyo,'build_prompt',wraps=yoyo.build_prompt) as render:
+            code,out,err=self.run_cli(['ask','first','--fallback','second','--read-only','--file',str(context),'--json','work'],
+                                      env=env,stdin='pipe context')
+        self.assertEqual(code,0,err);render.assert_called_once()
+        row=json.loads(out)
+        self.assertEqual(row['stdout'].rstrip(),captured.read_text().rstrip())
+        self.assertIn('pipe context',row['stdout']);self.assertIn('file context',row['stdout'])
+        self.assertFalse(row['stdout'].startswith('A previous agent'))
+        self.assertIn('--read-guard',row['command'])
+
+    def test_explicit_model_is_preserved_for_each_direct_candidate(self):
+        first='import sys;print("Individual quota reached",file=sys.stderr);sys.exit(1)'
+        second='print("answer")'
+        env=self._config(first,second,native=True)
+        code,out,err=self.run_cli(['ask','first','--fallback','second','--model','exact-user-model','--json','work'],env=env)
+        self.assertEqual(code,0,err)
+        calls=list((Path(self._state_guard.name)/'runs').glob('*/meta.json'))
+        self.assertEqual(len(calls),2)
+        for path in calls:
+            command=json.loads(path.read_text())['command']
+            self.assertEqual(command[command.index('--model')+1],'exact-user-model')
+        self.assertEqual([step['model'] for step in json.loads(out)['routing']],['exact-user-model']*2)
+
+    def test_background_fallback_wait_returns_final_answer_and_route(self):
+        config=Path(self._state_guard.name)/'agents.json'
+        (config.parent/'routes.json').write_text(json.dumps({'work':[{'agent':'first'},{'agent':'second'}]}))
+        env={**self._env("You've hit your usage limit"),'YOYO_CONFIG':str(config)}
+        for candidate in (['first','--fallback','second'],['@work']):
+            with self.subTest(candidate=candidate):
+                code,out,err=self.run_cli(['ask',*candidate,'--background','work'],env=env,stdin='background context')
+                self.assertEqual(code,0,err);run_id=out.strip()
+                code,out,err=self.run_cli(['wait',run_id,'--json','--timeout','5','--poll','.01'],env=env)
+                self.assertEqual(code,0,err);row=json.loads(out)
+                self.assertEqual(row['agent'],'second');self.assertEqual(row['routing'][0]['reason'],'quota')
+                self.assertIn('background context',row['stdout'])
+
+    def test_raw_agent_flags_do_not_probe_a_different_account(self):
+        result={'agent':'codex','exit_code':0,'stdout':'answer','stderr':''}
+        with mock.patch.object(yoyo,'execute_agent_call',return_value=result) as execute, \
+             mock.patch.object(yoyo,'quota_for_agent') as probe, \
+             mock.patch.object(yoyo.subprocess,'Popen') as launch:
+            code,out,err=self.run_cli(['ask','codex','--fallback','claude','--agent-arg=--profile=other','--json','work'])
+        self.assertEqual(code,0,err);probe.assert_not_called();launch.assert_not_called()
+        self.assertIn('--profile=other',execute.call_args.args[1].agent_arg)
+
+    def test_no_quota_probe_for_plain_ask_dry_run_or_before_detach(self):
+        env=self._env('ordinary failure')
+        with mock.patch.object(yoyo,'quota_for_agent') as probe:
+            code,out,err=self.run_cli(['ask','second','--json','work'],env=env)
+            self.assertEqual(code,0,err)
+            code,out,err=self.run_cli(['ask','first','--fallback','second','--dry-run','--json','work'],env=env)
+            self.assertEqual(code,0,err)
+            with mock.patch.object(yoyo,'start_background_run',return_value=0) as detach, \
+                 mock.patch.object(yoyo,'build_prompt') as render:
+                code,out,err=self.run_cli(['ask','first','--fallback','second','--background','work'],env=env)
+                self.assertEqual(code,0,err);detach.assert_called_once();render.assert_not_called()
+            probe.assert_not_called()
+
+    def test_all_blocked_skips_launch_and_does_not_warn_about_partial_edits(self):
+        with mock.patch.object(yoyo,'quota_for_agent',return_value={'source':'live','blocked':True}) as probe, \
+             mock.patch.object(yoyo,'execute_agent_call') as execute:
+            code,out,err=self.run_cli(['ask','first','--fallback','second','--json','work'],env=self._env('unused'))
+        self.assertEqual(code,1,err);execute.assert_not_called();self.assertEqual(probe.call_count,2)
+        row=json.loads(out)
+        self.assertIsNone(row['agent']);self.assertEqual([step['reason'] for step in row['routing']],['blocked','blocked'])
+        self.assertNotIn('partial changes',out)
+
+    def test_blocked_candidate_does_not_add_partial_edit_warning(self):
+        def quota(agent,*args,**kwargs):
+            return {'source':'live','blocked':agent=='first'}
+        with mock.patch.object(yoyo,'quota_for_agent',side_effect=quota):
+            code,out,err=self.run_cli(['ask','first','--fallback','second','--json','work'],env=self._env('unused'))
+        self.assertEqual(code,0,err)
+        row=json.loads(out);self.assertEqual(row['routing'][0]['reason'],'blocked')
+        self.assertFalse(row['stdout'].startswith('A previous agent'))
+
+    def test_routing_conflicts_and_unknown_candidate_fail_before_launch(self):
+        cases=[['first','--fallback','second','--session','named'],
+               ['first','--fallback','second','--thread','named'],
+               ['first','--fallback','second','--resume-run','run'],
+               ['first,second','--fallback','second'],
+               ['first','--fallback','second','--raw'],
+               ['first','--fallback','missing'], ['first','--fallback',''],
+               ['first','--fallback','second','--model','cannot-forward'],
+               ['@work','--model','override'], ['@work','--fallback','second'],
+               ['@work','--agent-arg=--model=override']]
+        for argv in cases:
+            with self.subTest(argv=argv), mock.patch.object(yoyo.subprocess,'Popen') as launch, \
+                 mock.patch.object(yoyo,'quota_for_agent') as probe:
+                code,out,err=self.run_cli(['ask',*argv,'work'],env=self._env('unused'))
+                self.assertEqual(code,2,err);launch.assert_not_called();probe.assert_not_called()
+
+    def test_malformed_route_file_fails_before_launch(self):
+        config=Path(self._state_guard.name)/'agents.json'
+        routes=config.parent/'routes.json'
+        for value in ([], {'work':[]}, {'work':[{'agent':'first','models':'typo'}]},
+                      {'work':[{'agent':'@recursive'}]}, {'work':[{'agent':'first','model':17}]}):
+            routes.write_text(json.dumps(value))
+            with self.subTest(value=value), mock.patch.object(yoyo.subprocess,'Popen') as launch:
+                code,out,err=self.run_cli(['ask','@work','work'],env={'YOYO_CONFIG':str(config)})
+                self.assertEqual(code,2,err);self.assertIn('Invalid route aliases',err);launch.assert_not_called()
+
+    def test_timeout_or_temporary_throttle_does_not_fall_back(self):
+        for error in ('You\'ve hit your rate limit; retry in one second','ordinary failure'):
+            with self.subTest(error=error):
+                code,out,err=self.run_cli(['ask','first','--fallback','second','--json','work'],env=self._env(error))
+                self.assertEqual(code,1,err);self.assertEqual(len(json.loads(out)['routing']),1)
+        env=self._env('unused');env['YOYO_AGENT_FIRST']=shlex.join(['python3','-c','import time;time.sleep(5)'])
+        code,out,err=self.run_cli(['ask','first','--fallback','second','--timeout','.05','--json','work'],env=env)
+        self.assertEqual(code,124,err);row=json.loads(out)
+        self.assertEqual(row['agent'],'first');self.assertEqual(len(row['routing']),1)
+
+
+class RouteDoctorTests(CliTestCase):
+    def test_unsupported_model_protocol_never_launches_an_agent(self):
+        with mock.patch.object(yoyo.subprocess, "Popen") as spawn:
+            with self.assertRaises(yoyo.YoyoError):
+                yoyo.model_catalog(argparse.Namespace(agent="pi", cwd=str(ROOT), timeout=.1))
+        spawn.assert_not_called()
+
+    def _routes(self, routes):
+        config = Path(self._state_guard.name) / "agents.json"
+        config.write_text("{}")
+        (config.parent / "routes.json").write_text(json.dumps(routes))
+        return {"YOYO_CONFIG": str(config)}
+
+    def _doctor(self, argv, env):
+        with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"), \
+                mock.patch.object(yoyo, "doctor_report_default_skills"), \
+                mock.patch.object(yoyo, "doctor_check_skill_sync", return_value=0):
+            return self.run_cli(["doctor", *argv], env=env)
+
+    def test_doctor_checks_each_catalog_once_and_accepts_resolved_ids(self):
+        env = self._routes({"work": [{"agent": "claude", "model": "sonnet"},
+                                    {"agent": "claude", "model": "resolved-sonnet"}],
+                            "missing": [{"agent": "claude", "model": "absent-model"}]})
+        catalog = {"models": [{"model": "sonnet", "resolved_model": "resolved-sonnet"}]}
+        with mock.patch.object(yoyo, "model_catalog", return_value=catalog, create=True) as probe:
+            code, out, err = self._doctor(["--strict"], env)
+        self.assertEqual(code, 1, err)
+        probe.assert_called_once()
+        self.assertIn("absent-model", out)
+        self.assertIn("missing from", out)
+        self.assertNotIn("resolved-sonnet", out)
+
+    def test_doctor_without_routes_never_probes_a_catalog(self):
+        config = Path(self._state_guard.name) / "absent.json"
+        with mock.patch.object(yoyo, "model_catalog", create=True) as probe:
+            code, out, err = self._doctor([], {"YOYO_CONFIG": str(config)})
+        self.assertEqual(code, 0, err)
+        probe.assert_not_called()
+
+    def test_doctor_unavailable_catalog_warns_without_claiming_missing_model(self):
+        env = self._routes({"work": [{"agent": "codex", "model": "named-model"}]})
+        with mock.patch.object(yoyo, "model_catalog", side_effect=yoyo.YoyoError("PRIVATE_ACCOUNT"), create=True):
+            code, out, err = self._doctor([], env)
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not verify", out)
+        self.assertNotIn("missing from", out)
+        self.assertNotIn("PRIVATE_ACCOUNT", out + err)
+
+    def test_live_json_doctor_preserves_json_and_reports_route_warning(self):
+        env = self._routes({"work": [{"agent": "codex", "model": "absent-model"}]})
+        row = {"agent": "codex", "status": "ok", "mode": "full-access", "duration_s": .1}
+        with mock.patch.object(yoyo, "model_catalog", return_value={"models": [{"model": "present"}]}, create=True), \
+                mock.patch.object(yoyo, "doctor_probe_agent", return_value=[row]):
+            code, out, err = self._doctor(["--live", "--agent", "codex", "--json", "--strict"], env)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), [row])
+        self.assertIn("absent-model", err)
+
+    def test_doctor_malformed_routes_and_probe_clock_warn_without_launch(self):
+        env = self._routes({"work": [{"agent": "codex", "model": "named-model"}]})
+        with mock.patch.object(yoyo, "model_catalog", create=True) as probe:
+            code, out, err = self._doctor(["--strict"], {**env, "YOYO_MODEL_PROBE_TIMEOUT": "nan"})
+        self.assertEqual(code, 1)
+        self.assertIn("YOYO_MODEL_PROBE_TIMEOUT", out)
+        probe.assert_not_called()
+        Path(env["YOYO_CONFIG"]).with_name("routes.json").write_text("{")
+        with mock.patch.object(yoyo, "model_catalog", create=True) as probe:
+            code, out, err = self._doctor(["--strict"], env)
+        self.assertEqual(code, 1)
+        self.assertIn("routes", out)
+        probe.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

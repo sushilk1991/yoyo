@@ -117,9 +117,30 @@ Codex's explicit ordinary-usage allowance wins over a full window, because credi
 
 A nonzero run with a terminal usage-limit error records `failure_kind: "quota"` and `quota_resets_at` when the message supplies a reset. Codex terminal error events, Claude error results (including `errors` arrays), and final plain error lines are supported. Absolute ordinal dates use the CLI host's local timezone; relative resets such as `75h19m18s` are measured from detection. The classifier reads bounded raw tails, so output caps cannot hide the final error. Earlier errors, routine `rate_limit_event` records and successful answers quoting a quota message do not classify the run. Timeout and signal causes take precedence. `runs audit` counts quota failures in their own outcome column.
 
-The calling agent selects a returned model with the existing `--model` flag. The bundled skill prefers an available subscription tier for bounded, objectively checkable tasks and keeps the configured default for complex work. There is no background router, hard-coded model allowlist, or automatic provider fallback. Existing explicit model choices still pass through unchanged.
+The calling agent selects a returned model with the existing `--model` flag. The bundled skill prefers an available subscription tier for bounded, objectively checkable tasks and keeps the configured default for complex work. Routing runs only when requested as described below; Yoyo ships no model table. Existing explicit model choices pass through unchanged.
 
 Protocol references, checked September 22, 2026: [Codex app server](https://learn.chatgpt.com/docs/app-server), [Claude model configuration](https://code.claude.com/docs/en/model-config), and [Claude SDK initialization](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).
+
+## Fallback routing
+
+```bash
+yoyo ask codex --fallback claude,pi --role worker --background "Finish the scoped change."
+yoyo ask @review --read-only --file bin/yoyo "Review this code."
+```
+
+`--fallback` tries the named agents in order. A candidate is skipped only when its quota is known to be blocked; after launch, only `failure_kind: "quota"` advances to the next candidate. Ordinary errors, temporary request throttles, timeouts and signals stop the route. Unknown quota permits a call. Observed blocks expire at their known reset. Quota probes run only for explicit routing, once per distinct candidate agent; `YOYO_QUOTA_TIMEOUT` sets their positive, finite deadline in seconds (default 20). Direct calls with `--agent-arg` treat quota as unknown because those flags can select a different account or profile. Plain asks and dry runs do not probe quota. Background asks detach before probing or rendering their prompt.
+
+The prompt, stdin and attached files are rendered once and reused, with the same read-only setting. If an executed full-access candidate hits its usage limit, the next prompt begins `A previous agent was stopped by its usage limit; the working tree may hold partial changes.` A skipped blocked candidate adds no warning. Only the final answer is emitted. Its JSON envelope identifies the actual `agent` and includes ordered `routing` entries with `agent`, `model`, `reason` (`blocked`, `quota`, `answered`, `failed`) and an exit code for executed candidates. If every candidate is blocked, exit 1 has no answering agent and launches no agent. Each executed attempt has its own call journal and backend session.
+
+An optional `routes.json` beside `agents.json` (or beside the path selected by `YOYO_CONFIG`) defines user-owned aliases. The file maps each alias to a nonempty ordered candidate list; `model` is optional. For example, replace the placeholders with exact IDs from your native catalog:
+
+```json
+{"review": [{"agent": "codex", "model": "YOUR_CODEX_MODEL_ID"}, {"agent": "claude", "model": "YOUR_CLAUDE_MODEL_ID"}]}
+```
+
+Yoyo never invents a replacement model. A direct `--model` is forwarded unchanged to every fallback candidate; candidates that cannot forward it are rejected. Aliases reject `--model`, `--fallback` and `--agent-arg` overrides. Routing rejects fan-out, judge flags, `--session`, `--resume-run`, `--thread` and `--raw`. All candidates are validated before any launch. A dry run renders the first candidate without trying alternatives.
+
+`yoyo doctor`, including `doctor --live`, checks configured alias model IDs against the native catalog once per distinct agent, accepting Claude's alias or resolved ID. It warns about missing models; an unavailable or custom catalog warns that it cannot verify the model. `--strict` exits nonzero for these warnings. Live JSON retains its probe-array format and writes alias warnings to stderr. `YOYO_MODEL_PROBE_TIMEOUT` sets this metadata deadline in seconds (default 20). No alias file means no catalog probes.
 
 ## Local advice
 

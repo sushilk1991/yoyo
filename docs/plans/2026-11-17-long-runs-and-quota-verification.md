@@ -193,3 +193,44 @@ Ran 9 tests in 0.066s
 
 OK
 ```
+
+## Item 4 - explicit fallback and route aliases
+
+Tests added: `FallbackTests` (14), `RouteDoctorTests` (6). Coverage includes
+quota-only fallback, no ordinary/throttle/timeout retry, blocked/expired/all
+blocked choices, exact models, one prompt render with stdin and file content,
+read-only propagation, direct and alias background/wait, flag/config
+validation, raw-profile account isolation, once-per-vendor catalogs, resolved
+IDs, unavailable catalogs, strict warnings and valid live JSON output.
+Routing red: 4 failures in0.037s. Doctor red: 4 failures among5 tests in0.030s.
+Final focused25 (including5 existing catalog tests):2.339s, OK.
+
+Routing rejects --raw, named sessions, resume-run, threads and fan-out because
+those have incompatible prompt or conversation identity contracts. Aliases
+reject model/raw-argument overrides. Direct routing with raw arguments keeps
+them but treats launch-time quota as unknown, avoiding a default-account probe
+for a potentially different profile. No ordinary call auto-routes or probes.
+Doctor warnings also fail --strict; live JSON keeps its list shape and writes
+warnings to stderr. No live quota exhaustion was induced; proof uses fake
+agents as specified. No model table or unnamed model substitution shipped.
+
+Full remote gate output (`python3 -m py_compile bin/yoyo`: silent, exit0):
+
+```text
+boxrun: masonry:/data/workspace/yoyo-2c067b94/
+.........................
+----------------------------------------------------------------------
+Ran 25 tests in 2.339s
+
+OK
+....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 580 tests in 56.547s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.057s
+
+OK
+```

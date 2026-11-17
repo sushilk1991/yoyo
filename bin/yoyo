@@ -2827,7 +2827,133 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
     return 0
 
 
+def load_routes() -> dict[str, list[dict[str, Any]]]:
+    path = config_path().parent / "routes.json"
+    if not path.exists():
+        return {}
+    try:
+        raw = _watch_read(path, 1_000_001)
+        if len(raw.encode("utf-8")) > 1_000_000:
+            raise ValueError("file exceeds 1000000 bytes")
+        routes = json.loads(raw)
+        if not isinstance(routes, dict):
+            raise ValueError("expected an object mapping names to candidate lists")
+        for name, candidates in routes.items():
+            if not isinstance(name, str) or not SESSION_NAME_RE.fullmatch(name):
+                raise ValueError("alias names must contain only letters, digits, '.', '_' or '-'")
+            if not isinstance(candidates, list) or not candidates:
+                raise ValueError(f"@{name} needs a nonempty candidate list")
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or set(candidate) - {"agent", "model"}:
+                    raise ValueError(f"@{name} candidates accept only agent and model")
+                agent = candidate.get("agent")
+                model = candidate.get("model")
+                if not isinstance(agent, str) or not agent.strip() or agent != agent.strip() or "," in agent or agent.startswith("@"):
+                    raise ValueError(f"@{name} needs one agent name per candidate")
+                if model is not None and (not isinstance(model, str) or not model.strip()):
+                    raise ValueError(f"@{name} model must be a nonempty string when supplied")
+        return routes
+    except (ValueError, RecursionError) as exc:
+        raise YoyoError(f"Invalid route aliases in {path}: {exc}") from exc
+
+
+def route_candidates(args: argparse.Namespace) -> list[dict[str, Any]]:
+    for flag in ("session", "thread", "resume_run", "judge", "judge_prompt", "judge_only", "raw"):
+        if getattr(args, flag, None):
+            raise YoyoError(f"Routing cannot be combined with --{flag.replace('_', '-')}")
+    if getattr(args, "history_bytes", None) is not None:
+        raise YoyoError("--history-bytes needs --thread")
+    if "," in args.agent:
+        raise YoyoError("Routing cannot be combined with fan-out")
+    if args.agent.startswith("@"):
+        if args.model or args.fallback or args.agent_arg:
+            raise YoyoError("Route aliases cannot be combined with --model, --fallback or --agent-arg")
+        name = args.agent[1:]
+        routes = load_routes()
+        if name not in routes:
+            raise YoyoError(f"Unknown route alias @{name}; configure {config_path().parent / 'routes.json'}")
+        return routes[name]
+    names = [args.agent.strip()] + [name.strip() for name in args.fallback.split(",")]
+    if any(not name or name.startswith("@") for name in names):
+        raise YoyoError("--fallback needs comma-separated agent names, without aliases")
+    return [{"agent": name, "model": args.model} for name in names]
+
+
+def route_is_blocked(quota: dict[str, Any]) -> bool:
+    if quota.get("blocked") is not True:
+        return False
+    if quota.get("source") == "observed":
+        reset = parse_iso_utc(quota.get("resets_at"))
+        if reset is None:
+            windows = quota.get("windows")
+            resets = [parse_iso_utc(window.get("resets_at")) for window in windows
+                      if isinstance(window, dict)] if isinstance(windows, list) else []
+            if resets and all(value is not None for value in resets):
+                reset = max(resets)
+        if reset is not None and reset <= utc_now():
+            return False
+    return True
+
+
+def run_routed_ask(args: argparse.Namespace) -> int:
+    candidates = route_candidates(args)
+    args.read_only = bool(args.read_only)
+    attempts = []
+    # Validate every candidate before a probe, detach or agent launch. Each
+    # attempt owns its run/session state while sharing the rendered input.
+    for candidate in candidates:
+        attempt = argparse.Namespace(**vars(args))
+        attempt.agent = candidate["agent"]
+        attempt.model = candidate.get("model")
+        attempt.session_info = None
+        attempt._call_run_id = None
+        agents = validate_ask_args(attempt)
+        if attempt.model and agents[attempt.agent].flavor not in ("codex", "claude", "pi", "cursor", "agy", "grok", "muse"):
+            raise YoyoError(f"Agent {attempt.agent!r} cannot forward a route's --model; configure a supported kind")
+        attempts.append(attempt)
+    args.role = attempts[0].role
+    if args.background and not args.dry_run:
+        return start_background_run(args)
+    prompt = build_prompt(args)
+    if args.dry_run:
+        result = execute_agent_call(attempts[0].agent, attempts[0], prompt, agents)
+        emit_dry_run_result(result, args.json)
+        return 0
+    probe_timeout = positive_env_seconds("YOYO_QUOTA_TIMEOUT", MODEL_PROBE_SECONDS)
+    routing = []
+    result = None
+    partial_edits = False
+    quotas: dict[str, dict[str, Any]] = {}
+    for attempt in attempts:
+        if attempt.agent not in quotas:
+            # Raw flags can select another account/profile; probing the base
+            # adapter would report somebody else's allowance.
+            quotas[attempt.agent] = (unknown_quota(attempt.agent) if attempt.agent_arg else
+                                     quota_for_agent(attempt.agent, resolve_cwd(args.cwd), probe_timeout, agents))
+        step = {"agent": attempt.agent, "model": attempt.model}
+        if route_is_blocked(quotas[attempt.agent]):
+            routing.append({**step, "reason": "blocked"})
+            continue
+        next_prompt = prompt
+        if partial_edits:
+            next_prompt = ("A previous agent was stopped by its usage limit; the working tree may hold partial changes.\n" + prompt)
+        result = execute_agent_call(attempt.agent, attempt, next_prompt, agents)
+        reason = "quota" if result.get("failure_kind") == "quota" else ("answered" if result["exit_code"] == 0 else "failed")
+        routing.append({**step, "reason": reason, "exit_code": result["exit_code"]})
+        if reason != "quota":
+            break
+        partial_edits = partial_edits or not args.read_only
+    if result is None:
+        result = {"agent": None, "exit_code": 1, "stdout": "", "stderr": "yoyo: every route candidate is blocked by its usage limit",
+                  "failure_kind": "quota", "trace_id": args.trace_id}
+    result["routing"] = routing
+    emit_result(result, args.json)
+    return int(result["exit_code"])
+
+
 def run_agent(args: argparse.Namespace) -> int:
+    if getattr(args, "fallback", None) is not None or args.agent.startswith("@"):
+        return run_routed_ask(args)
     if getattr(args, "resume_run", None):
         for flag in ("session", "thread"):
             if getattr(args, flag, None):
@@ -7925,9 +8051,11 @@ def _claude_models(proc, deadline: float) -> dict:
     return {"models": models}
 
 
-def _cmd_models(args: argparse.Namespace) -> int:
+def model_catalog(args: argparse.Namespace) -> dict[str, Any]:
     # Only probe commands whose native protocol is known. Ignoring profile or
     # wrapper arguments could advertise models from the wrong account.
+    if args.agent not in ("codex", "claude"):
+        raise YoyoError("Model discovery supports only codex and claude native protocols")
     spec = load_agents().get(args.agent)
     if spec != DEFAULT_AGENTS.get(args.agent):
         raise YoyoError("Model discovery requires an unmodified built-in agent; inspect your custom CLI directly")
@@ -7936,8 +8064,8 @@ def _cmd_models(args: argparse.Namespace) -> int:
         cmd = list(spec.command) + ["--input-format", "stream-json", "--output-format", "stream-json",
                                    "--verbose", "--tools", "", "--strict-mcp-config",
                                    "--settings", '{"disableAllHooks":true}']
-    if args.timeout <= 0:
-        raise YoyoError("--timeout must be greater than 0")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise YoyoError("--timeout must be positive and finite")
     with _metadata_process(cmd, resolve_cwd(args.cwd)) as proc:
         deadline = time.monotonic() + args.timeout
         discover = _codex_models if args.agent == "codex" else _claude_models
@@ -7951,6 +8079,11 @@ def _cmd_models(args: argparse.Namespace) -> int:
     # Whitelist returned metadata: native account replies can include email,
     # organization identifiers and unrelated settings that routing never needs.
     result.update({"agent": args.agent, "source": "native-cli", "checked_at": utc_now().isoformat()})
+    return result
+
+
+def _cmd_models(args: argparse.Namespace) -> int:
+    result = model_catalog(args)
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
         return 0
@@ -8073,6 +8206,49 @@ def doctor_report_default_skills() -> None:
         print(f"default skill {name}: {origin} ({path})")
 
 
+def doctor_route_warnings(agents: dict[str, AgentSpec]) -> list[str]:
+    try:
+        routes = load_routes()
+    except YoyoError:
+        return [f"route warning: could not read valid aliases from {config_path().parent / 'routes.json'}"]
+    if not routes:
+        return []
+    try:
+        timeout = positive_env_seconds("YOYO_MODEL_PROBE_TIMEOUT", MODEL_PROBE_SECONDS)
+    except YoyoError:
+        return ["route warning: YOYO_MODEL_PROBE_TIMEOUT must be positive and finite"]
+
+    # An unavailable catalog is not evidence that a named model is absent.
+    # Cache once per adapter so aliases sharing a vendor do not repeat I/O.
+    catalogs: dict[str, set[str] | None] = {}
+    warnings = []
+    for alias, entries in routes.items():
+        for entry in entries:
+            agent, model = entry["agent"], entry.get("model")
+            if agent not in agents:
+                warnings.append(f"route @{alias}: unknown agent {agent!r}")
+                continue
+            if model is None:
+                continue
+            if agent not in catalogs:
+                choices: set[str] = set()
+                try:
+                    catalog = model_catalog(argparse.Namespace(agent=agent, cwd=os.getcwd(), timeout=timeout))
+                    for row in catalog.get("models", []):
+                        if isinstance(row, dict):
+                            choices.update(row[key] for key in ("model", "resolved_model")
+                                           if isinstance(row.get(key), str) and row[key])
+                except (YoyoError, OSError):
+                    pass
+                catalogs[agent] = choices or None
+            choices = catalogs[agent]
+            if choices is None:
+                warnings.append(f"route @{alias}: could not verify {agent!r} live catalog for model {model!r}")
+            elif model not in choices:
+                warnings.append(f"route @{alias}: model {model!r} missing from {agent!r} live catalog")
+    return warnings
+
+
 def doctor(args: argparse.Namespace) -> int:
     if getattr(args, "live", False):
         return doctor_live(args)
@@ -8090,6 +8266,10 @@ def doctor(args: argparse.Namespace) -> int:
         print(f"{name}: ok ({found})")
     doctor_report_default_skills()
     failed += doctor_check_skill_sync()
+    route_warnings = doctor_route_warnings(agents)
+    for warning in route_warnings:
+        print(warning)
+    failed += len(route_warnings)
     path = config_path()
     print(f"config: {path} ({'present' if path.exists() else 'not present'})")
     source_path = source_record_path()
@@ -8294,12 +8474,17 @@ def doctor_live(args: argparse.Namespace) -> int:
                 by_agent[futures[future]] = future.result()
 
     rows = [row for name in names for row in by_agent[name]]
+    route_warnings = doctor_route_warnings(agents)
     if args.json:
         print(json.dumps(rows, indent=2))
+        for warning in route_warnings:
+            eprint(warning)
     else:
         doctor_print_live_report(rows)
+        for warning in route_warnings:
+            print(warning)
 
-    failed = any(row["status"] in ("failed", "missing") for row in rows)
+    failed = bool(route_warnings) or any(row["status"] in ("failed", "missing") for row in rows)
     return 1 if failed and args.strict else 0
 
 
@@ -8768,6 +8953,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--stdin-wait", type=float, default=None, help="Seconds to wait for piped stdin before giving up (default 0: read only if already available)")
     ask.add_argument("--no-stdin", action="store_true", help="Never read stdin as context, even when piped")
     ask.add_argument("--model", help="Pass a model name to agents that support --model")
+    ask.add_argument("--fallback", help="Try these comma-separated agents only after a usage-limit failure or known quota block")
     ask.add_argument("--read-only", action="store_true", default=None, help="Constrain the target agent to read-only mode where supported (the default for --thread turns)")
     ask.add_argument("--write", action="store_false", dest="read_only", help="Full access: the default outside --thread; a --thread turn needs it to edit, for that turn only")
     ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
