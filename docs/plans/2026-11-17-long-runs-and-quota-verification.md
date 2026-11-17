@@ -138,3 +138,58 @@ Ran 9 tests in 0.062s
 
 OK
 ```
+
+## Item 3 - quota visibility and classification
+
+Tests added: `QuotaTests` (13): native pipe allowlisting, newest Claude event
+and age, three real terminal error formats, explicit Codex allowance and
+unknown numeric values, minimal Claude events and expiry, retained sanitized
+snapshots, terminal error/clock precedence, custom adapters and transport
+failures, model-pipe reuse, structured Claude error arrays, progress followed
+by terminal stderr, raw-stream bounds, adapter provenance and malformed dates.
+Initial red: 3 tests, 2 failures and 1 error (missing quota command/metadata).
+Expanded green: 13 tests, 1.053s, OK.
+
+Actual `yoyo quota codex claude pi --json` output, using only the isolated
+Claude adapter-trial ledger for observations:
+
+```json
+[{"agent": "codex", "source": "live", "observed_at": "2026-11-17T15:59:48.040385Z", "age_s": 0, "windows": [{"name": "primary", "used_percent": 44, "resets_at": "2026-11-18T06:46:07Z"}], "blocked": false, "resets_at": null}, {"agent": "claude", "source": "observed", "observed_at": "2026-11-17T15:39:51.761714Z", "windows": [{"name": "seven_day", "used_percent": 10.0, "resets_at": "2026-11-23T21:00:00Z"}, {"name": "seven_day_overage_included", "used_percent": 2.0, "resets_at": "2026-11-23T21:00:00Z"}], "blocked": false, "resets_at": "2026-11-23T21:00:00Z", "age_s": 1196.3}, {"agent": "pi", "source": "unknown", "observed_at": null, "age_s": null, "windows": [], "blocked": null, "resets_at": null}]
+```
+
+The Claude observation time uses capture mtime, an approximation rather than
+a server event timestamp; age and source are explicit. Native quota failure
+leaves a model catalog available with unknown quota. Full native overrides
+remain unknown to avoid probing a different account. Claude's structured
+terminal error array was verified against the
+[official SDK result type](https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage).
+
+The remote build lane was occupied. Disposable test-box creation was rejected
+at the account's five-box limit; nothing was created. The user confirmed remote
+suites only and authorized starting another existing machine. The old video
+verification box failed the disk preflight and was restored to suspended state.
+The retained `masonry` test box has a separate YoYo checkout for later items;
+its files and services are preserved. Item3's already-running batch completed
+on `build`. No local suite ran.
+
+Full remote gate output (repetitive scheduler wait lines omitted; these are
+outside the gate commands; compile was silent, exit0):
+
+```text
+boxrun: build:/data/workspace/yoyo-2c067b94/
+.............
+----------------------------------------------------------------------
+Ran 13 tests in 1.053s
+
+OK
+................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 560 tests in 59.317s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.066s
+
+OK
+```

@@ -98,9 +98,24 @@ yoyo models claude --cwd "$PWD" --json
 
 Reads the native CLI's account metadata and selectable model list, without sending a user turn. Codex uses its app-server `account/read` and paginated `model/list`; Claude uses the SDK initialization handshake and `auth status`. No API keys, email addresses, or organization identifiers appear in Yoyo's output. Probes close their processes and have a 20-second deadline (`--timeout` changes it); nothing stays resident.
 
-JSON contains `agent`, `source`, `checked_at`, `account`, and `models`. Each model includes its selectable `model` ID, name, native description, picker-default marker, and supported reasoning efforts when supplied. Claude also reports the resolved model ID. The picker-default marker is not a readback of your configured model. Account type distinguishes ChatGPT/Claude login from API-key access; remaining quota and extra-usage billing are not checked. Model availability can change after discovery.
+JSON contains `agent`, `source`, `checked_at`, `account`, `models`, and a sanitized `quota` view. Each model includes its selectable `model` ID, name, native description, picker-default marker, and supported reasoning efforts when supplied. Claude also reports the resolved model ID. The picker-default marker is not a readback of your configured model. Account type distinguishes ChatGPT/Claude login from API-key access. The quota line is the same one `yoyo quota` prints; extra-usage billing is not estimated. Model availability can change after discovery.
 
 Discovery supports unmodified built-in Codex and Claude commands. If an agent is overridden in `agents.json` or `YOYO_AGENT_*`, it fails rather than dropping profile/wrapper arguments and querying a different account. Use that custom CLI directly. Other providers retain their own discovery commands.
+
+## Quota
+
+```bash
+yoyo quota                         # Codex and Claude
+yoyo quota codex claude pi --json   # other agents report unknown
+```
+
+Codex reads `account/rateLimits/read` over its native app-server pipe after initialization, without a user turn or inference. `models codex` requests quota over the same pipe as its catalog; unavailable quota leaves a valid catalog intact. Claude's handshake has no quota, so Yoyo reports the last `rate_limit_event` in the newest applicable captured stream, labelled `observed` with its capture time and age. Each finishing Claude call also saves a sanitized snapshot in `result.json`, so the observation survives raw-stream retention. Stream scans use bounded lines and keep only the last event; metadata replies are size- and time-bounded. `--cwd` selects the probe directory and `--timeout` overrides the 20-second metadata deadline.
+
+JSON is an array of agent rows: `agent`, `source` (`live`, `observed`, `unknown`), `observed_at`, `age_s`, `windows` (`name`, `used_percent`, `resets_at`), `blocked`, and an overall `resets_at` when known. Unknown percentages, resets and block state remain null. Output excludes raw account replies, credits, identifiers and error details. Custom/wrapped agents report unknown rather than dropping profile arguments and querying a different account. Transport failure also reports unknown. Claude observations can belong to an earlier account configuration; their age is evidence, not a live allowance.
+
+Codex's explicit ordinary-usage allowance wins over a full window, because credits may allow continued use. Without it, Yoyo uses the reached-limit marker and window utilization. Claude's `allowed`/`allowed_warning` statuses mean unblocked and `rejected` means blocked; other statuses stay unknown, and overage billing status does not determine ordinary access. Fractional Claude utilization becomes a percentage. Only the documented root fields are needed; named unified windows are included when present. An observed block stops counting when its known reset passes.
+
+A nonzero run with a terminal usage-limit error records `failure_kind: "quota"` and `quota_resets_at` when the message supplies a reset. Codex terminal error events, Claude error results (including `errors` arrays), and final plain error lines are supported. Absolute ordinal dates use the CLI host's local timezone; relative resets such as `75h19m18s` are measured from detection. The classifier reads bounded raw tails, so output caps cannot hide the final error. Earlier errors, routine `rate_limit_event` records and successful answers quoting a quota message do not classify the run. Timeout and signal causes take precedence. `runs audit` counts quota failures in their own outcome column.
 
 The calling agent selects a returned model with the existing `--model` flag. The bundled skill prefers an available subscription tier for bounded, objectively checkable tasks and keeps the configured default for complex work. There is no background router, hard-coded model allowlist, or automatic provider fallback. Existing explicit model choices still pass through unchanged.
 

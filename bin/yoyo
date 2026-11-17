@@ -1823,7 +1823,7 @@ def parse_iso_utc(raw: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -1998,6 +1998,7 @@ def journal_call_start(
     cwd: Path,
     prompt: str,
     flavor: str | None = None,
+    native_adapter: bool = False,
 ) -> Path | None:
     """Record a foreground agent call in the runs ledger as it executes.
 
@@ -2019,6 +2020,7 @@ def journal_call_start(
             "mode": "call",
             "agent": agent_name,
             "flavor": flavor,
+            "native_adapter": native_adapter,
             "role": getattr(args, "role", None),
             "cwd": str(cwd),
             "trace_id": getattr(args, "trace_id", None),
@@ -2981,7 +2983,8 @@ def execute_agent_call(
 
         started = time.monotonic()
         journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(
-            agent_name, cmd, args, cwd, prompt, agents[agent_name].flavor)
+            agent_name, cmd, args, cwd, prompt, agents[agent_name].flavor,
+            agents[agent_name] == DEFAULT_AGENTS.get(agent_name) and not getattr(args, "agent_arg", None))
         on_journal = getattr(args, "_on_call_journal", None)
         if journal_dir is not None and on_journal is not None:
             try:
@@ -3021,6 +3024,11 @@ def execute_agent_call(
         def retain_result(result: dict[str, Any]) -> dict[str, Any]:
             args._call_run_id = journal_dir.name if journal_dir is not None else None
             attach_session_result(args, agents[agent_name], result, stdout_path)
+            if agents[agent_name].flavor == "claude":
+                quota = read_claude_quota(stdout_path, agent_name)
+                if quota is not None:
+                    result["quota"] = quota
+            classify_quota_failure(result, stdout_path, stderr_path)
             session = result.get("session") or {}
             if (journal_dir is not None and session.get("backend_id") and not args.read_only
                     and agents[agent_name].flavor in ("codex", "claude")
@@ -3034,7 +3042,7 @@ def execute_agent_call(
             # Session recovery must precede result.json: signal handling and
             # background callers use it as the completed journal boundary.
             saved = {key: result[key] for key in ("session", "continue_command", "killed_by_signal", "timed_out", "idle_timed_out",
-                                                 "idle_seconds", "silent_exit") if key in result}
+                                                 "idle_seconds", "silent_exit", "quota", "failure_kind", "quota_resets_at") if key in result}
             finish_journal(result["exit_code"], **saved, **extra)
             return result
 
@@ -3043,7 +3051,7 @@ def execute_agent_call(
                                      stderr_path, "", codex_output_file)
             result.update(exit_code=None, killed_by_signal=signum)
             retain_result(result)
-            return {key: result[key] for key in ("session", "continue_command") if key in result}
+            return {key: result[key] for key in ("session", "continue_command", "quota") if key in result}
 
         if journal_dir is not None:
             with _ACTIVE_JOURNALS_LOCK:
@@ -4062,6 +4070,7 @@ AUDIT_OUTCOMES = (
     "idle-timeout",
     "exit-124",
     "signal",
+    "quota",
     "nonzero",
     "no-result",
     "unreadable",
@@ -4106,6 +4115,8 @@ def run_outcome(result: dict[str, Any] | None, recorded: bool, live: bool = Fals
     if clock is not None:
         return {HARD_TIMEOUT_CLOCK: "hard-timeout", SOFT_TIMEOUT_CLOCK: "soft-timeout",
                 MAX_RUNTIME_CLOCK: "max-runtime", IDLE_TIMEOUT_CLOCK: "idle-timeout"}[clock[0]]
+    if result.get("failure_kind") == "quota":
+        return "quota"
     return "exit-124" if exit_code == 124 else "nonzero"
 
 
@@ -7489,6 +7500,283 @@ def cmd_thread(args: argparse.Namespace) -> int:
     return handlers[action](args)
 
 
+def unknown_quota(agent: str) -> dict[str, Any]:
+    return {"agent": agent, "source": "unknown", "observed_at": None, "age_s": None,
+            "windows": [], "blocked": None, "resets_at": None}
+
+
+def quota_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
+
+
+def quota_time(value: Any) -> str | None:
+    parsed = parse_iso_utc(value)
+    if parsed is not None:
+        return iso_utc(parsed)
+    number = quota_number(value)
+    if number is not None:
+        try:
+            return iso_utc(datetime.fromtimestamp(number, timezone.utc))
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+def refresh_observed_quota(row: dict[str, Any]) -> dict[str, Any]:
+    observed = parse_iso_utc(row.get("observed_at"))
+    row["age_s"] = round(max(0, time.time() - observed.timestamp()), 1) if observed else None
+    reset = parse_iso_utc(row.get("resets_at"))
+    if row.get("blocked") is True and reset is not None and reset.timestamp() <= time.time():
+        row["blocked"] = False
+    return row
+
+
+def codex_quota(payload: dict[str, Any]) -> dict[str, Any]:
+    limits = payload.get("rateLimits")
+    if not isinstance(limits, dict):
+        return unknown_quota("codex")
+    windows = []
+    for name in ("primary", "secondary"):
+        window = limits.get(name)
+        if isinstance(window, dict) and window:
+            windows.append({"name": name, "used_percent": quota_number(window.get("usedPercent")),
+                            "resets_at": quota_time(window.get("resetsAt"))})
+    allowed = payload.get("ordinaryUsageAllowed")
+    percentages = [w["used_percent"] for w in windows if w["used_percent"] is not None]
+    reached = limits.get("rateLimitReachedType")
+    reached = reached if isinstance(reached, str) else None
+    # Credits can permit ordinary usage even with a full subscription window.
+    if type(allowed) is bool:
+        blocked = not allowed
+    elif reached:
+        blocked = True
+    else:
+        blocked = any(p >= 100 for p in percentages) if percentages else None
+    resets = [w["resets_at"] for w in windows if w["used_percent"] is not None and
+              w["used_percent"] >= 100 and w["resets_at"]]
+    return {"agent": "codex", "source": "live", "observed_at": iso_utc(utc_now()), "age_s": 0,
+            "windows": windows, "blocked": blocked, "resets_at": min(resets) if resets else None}
+
+
+def claude_quota(info: dict[str, Any], agent: str, observed_at: str) -> dict[str, Any]:
+    windows = []
+    rejected_resets = []
+    unified = info.get("unifiedWindows")
+    if isinstance(unified, dict):
+        for name, window in unified.items():
+            if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) or not isinstance(window, dict):
+                continue
+            used = quota_number(window.get("utilization"))
+            windows.append({"name": name, "used_percent": quota_number(used * 100) if used is not None else None,
+                            "resets_at": quota_time(window.get("resetsAt"))})
+            if window.get("status") == "rejected" and windows[-1]["resets_at"]:
+                rejected_resets.append(windows[-1]["resets_at"])
+    used = quota_number(info.get("utilization"))
+    reset = quota_time(info.get("resetsAt"))
+    if not windows or used is not None:
+        windows.append({"name": "current", "used_percent": quota_number(used * 100) if used is not None else None, "resets_at": reset})
+    if reset is None and rejected_resets:
+        reset = max(rejected_resets)
+    status = info.get("status")
+    blocked = {"allowed": False, "allowed_warning": False, "rejected": True}.get(status) if isinstance(status, str) else None
+    # Root status is authoritative; overageStatus is a different billing path.
+    return refresh_observed_quota({"agent": agent, "source": "observed", "observed_at": observed_at,
+                                  "windows": windows, "blocked": blocked, "resets_at": reset})
+
+
+def read_claude_quota(path: Path, agent: str) -> dict[str, Any] | None:
+    latest = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            for line in _bounded_lines(handle, STREAM_EVENT_MAX_BYTES):
+                if handle.tell() > info.st_size:
+                    break  # take a finite snapshot while a live stream grows
+                event = _stream_event(line) if line else None
+                if event and event["type"] == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict):
+                    latest = event["rate_limit_info"]
+        if latest is not None:
+            return claude_quota(latest, agent, iso_utc(datetime.fromtimestamp(info.st_mtime, timezone.utc)))
+    except OSError:
+        pass
+    return None
+
+
+def native_claude_record(meta: dict[str, Any]) -> bool:
+    if type(meta.get("native_adapter")) is bool:
+        return meta["native_adapter"]
+    # Legacy records have no scope marker. Recognize only Yoyo's native
+    # argument layout; wrappers and profile/settings overrides stay unknown.
+    cmd = meta.get("command")
+    if not isinstance(cmd, list) or not cmd or cmd[0] != "claude" or "-p" not in cmd:
+        return False
+    fixed = {"--output-format": "stream-json", "--permission-mode": "bypassPermissions",
+             "--tools": _CLAUDE_READ_ONLY_TOOLS, "--disallowedTools": _CLAUDE_READ_ONLY_DENIED}
+    parts = iter(cmd[1:])
+    for flag in parts:
+        if not isinstance(flag, str):
+            return False
+        if flag in ("-p", "--no-session-persistence", "--verbose"):
+            continue
+        if flag not in fixed and flag not in ("--model", "--resume", "--session-id"):
+            return False
+        value = next(parts, None)
+        if not isinstance(value, str) or not value or (flag in fixed and value != fixed[flag]):
+            return False
+    return True
+
+
+def observed_claude_quota(agent: str = "claude") -> dict[str, Any]:
+    candidates = []
+    root = runs_root()
+    try:
+        runs = list(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        return unknown_quota(agent)
+    for run in runs:
+        if run.is_symlink() or not run.is_dir():
+            continue
+        meta = _watch_json(run / "meta.json")
+        if not meta or meta.get("agent") != agent or meta.get("mode") != "call" or not native_claude_record(meta):
+            continue
+        saved = (_watch_json(run / "result.json") or {}).get("quota")
+        if isinstance(saved, dict) and saved.get("source") == "observed":
+            stamp = parse_iso_utc(saved.get("observed_at"))
+            if stamp:
+                candidates.append((stamp.timestamp(), run, saved))
+        try:
+            candidates.append(((run / "stdout.txt").stat().st_mtime, run, None))
+        except OSError:
+            pass
+    for _, run, saved in sorted(candidates, key=lambda c: c[0], reverse=True):
+        if saved is None:
+            row = read_claude_quota(run / "stdout.txt", agent)
+            if row:
+                return row
+        else:
+            # Stored snapshots survive raw-stream retention, but remain an
+            # allowlisted quota view even if an older result had extra fields.
+            saved_windows = saved.get("windows")
+            if not isinstance(saved_windows, list):
+                continue
+            windows = [{"name": w.get("name"), "used_percent": quota_number(w.get("used_percent")),
+                        "resets_at": quota_time(w.get("resets_at"))}
+                       for w in saved_windows if isinstance(w, dict) and isinstance(w.get("name"), str)
+                       and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", w["name"])]
+            return refresh_observed_quota({"agent": agent, "source": "observed", "observed_at": saved["observed_at"],
+                                          "windows": windows, "blocked": saved.get("blocked") if type(saved.get("blocked")) is bool else None,
+                                          "resets_at": quota_time(saved.get("resets_at"))})
+    return unknown_quota(agent)
+
+
+def quota_for_agent(agent: str, cwd: Path, timeout: float, agents: dict[str, AgentSpec] | None = None) -> dict[str, Any]:
+    agents = agents if agents is not None else load_agents()
+    if agent not in ("codex", "claude") or agents.get(agent) != DEFAULT_AGENTS.get(agent):
+        return unknown_quota(agent)  # never drop custom account/profile arguments
+    if agent == "claude":
+        return observed_claude_quota(agent)
+    try:
+        with _metadata_process([agents[agent].command[0], "app-server"], cwd) as proc:
+            deadline = time.monotonic() + timeout
+            _codex_initialize(proc, deadline)
+            return codex_quota(_codex_request(proc, "account/rateLimits/read", {}, deadline))
+    except (YoyoError, OSError):
+        return unknown_quota(agent)
+
+
+def quota_line(row: dict[str, Any]) -> str:
+    blocked = "blocked" if row["blocked"] is True else "available" if row["blocked"] is False else "block unknown"
+    age = f", {row['age_s']}s old" if row["source"] == "observed" else ""
+    windows = []
+    for window in row["windows"]:
+        used = "unknown" if window["used_percent"] is None else f"{window['used_percent']:g}%"
+        windows.append(f"{window['name']} {used} used, reset {window['resets_at'] or 'unknown'}")
+    return f"{row['agent']}: quota {row['source']}{age}, observed {row['observed_at'] or 'unknown'}, {blocked}" + ("; " + "; ".join(windows) if windows else "")
+
+
+def cmd_quota(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise YoyoError("--timeout must be positive and finite")
+    agents = load_agents()
+    rows = [quota_for_agent(name, resolve_cwd(args.cwd), args.timeout, agents) for name in (args.agents or ["codex", "claude"])]
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(quota_line(row))
+    return 0
+
+
+def terminal_error(stdout_path: Path, stderr_path: Path) -> str:
+    # The caller-facing stderr is prefix-capped. Read the actual terminal
+    # evidence independently, never search an answer or an entire transcript.
+    stdout = _watch_read(stdout_path, 16_384, "tail")
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    for line in reversed(lines):
+        event = _stream_event(line)
+        if event is None:
+            break
+        if event["type"] in ("turn.failed", "error"):
+            error = event.get("error")
+            return str(error.get("message") or "") if isinstance(error, dict) else str(event.get("message") or error or "")
+        if event["type"] == "result":
+            if not event.get("is_error") and not str(event.get("subtype") or "").startswith("error_"):
+                return ""
+            errors = event.get("errors")
+            last = errors[-1] if isinstance(errors, list) and errors and isinstance(errors[-1], str) else ""
+            text = event.get("result")
+            return text if isinstance(text, str) and text else last
+        if event["type"] == "turn.completed":
+            return ""
+        if event["type"] != "rate_limit_event":
+            break  # stop searching old stdout; the terminal error may be stderr
+    stderr = _watch_read(stderr_path, 16_384, "tail")
+    last = next((line.strip() for line in reversed(stderr.splitlines()) if line.strip()), "")
+    if last:
+        return "" if _stream_event(last) else _watch_text(last)
+    return lines[-1] if lines and _stream_event(lines[-1]) is None else ""
+
+
+def quota_error_reset(message: str) -> str | None:
+    relative = re.search(r"resets?\s+in\s+((?:\d+(?:\.\d+)?\s*[dhms]\s*)+)", message, re.I)
+    if relative:
+        seconds = sum(float(value) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit.lower()]
+                      for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", relative.group(1), re.I))
+        return quota_time(time.time() + seconds)
+    absolute = re.search(r"try again at\s+([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)", message, re.I)
+    if absolute:
+        value = re.sub(r"(\d)(?:st|nd|rd|th)", r"\1", absolute.group(1), flags=re.I)
+        value = re.sub(r"\s+", " ", value)
+        for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p", "%b %d %Y %I:%M %p", "%B %d %Y %I:%M %p"):
+            try:
+                return iso_utc(datetime.strptime(value, fmt).astimezone(timezone.utc))
+            except ValueError:
+                pass
+    return None
+
+
+def classify_quota_failure(result: dict[str, Any], stdout_path: Path, stderr_path: Path) -> None:
+    if (result.get("exit_code") in (None, 0) or result.get("killed_by_signal") is not None
+            or timeout_clock(result) is not None):
+        return
+    message = terminal_error(stdout_path, stderr_path)
+    pattern = (r"(?:hit\s+your\s+usage\s+limit|quota\s+(?:reached|exceeded|exhausted)|"
+               r"(?:reached|exceeded)\s+(?:your\s+)?(?:session\s+)?usage\s+limit|insufficient_quota|usage_limit_reached)")
+    if re.search(pattern, message, re.I):
+        result["failure_kind"] = "quota"
+        reset = quota_error_reset(message)
+        if reset:
+            result["quota_resets_at"] = reset
+
+
 def _probe_reply(proc, message: dict, key: str, value: Any, deadline: float) -> dict:
     # Native CLI -> JSON lines -> matching reply. No user turn is sent, so
     # discovery cannot spend a model call or execute the task being routed.
@@ -7514,24 +7802,53 @@ def _probe_reply(proc, message: dict, key: str, value: Any, deadline: float) -> 
             line, pending = pending.split(b"\n", 1)
             try:
                 reply = json.loads(line)
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 continue
             if isinstance(reply, dict) and reply.get(key) == value:
                 return reply
+
+
+def _codex_request(proc, method: str, params: dict, deadline: float) -> dict:
+    reply = _probe_reply(proc, {"id": method, "method": method, "params": params}, "id", method, deadline)
+    if "error" in reply or not isinstance(reply.get("result"), dict):
+        raise YoyoError(f"Codex metadata discovery failed at {method}; check the CLI login and version")
+    return reply["result"]
+
+
+def _codex_initialize(proc, deadline: float) -> None:
+    _codex_request(proc, "initialize", {"clientInfo": {"name": "yoyo", "version": VERSION}}, deadline)
+    proc.stdin.write(b'{"method":"initialized"}\n')
+    proc.stdin.flush()
+
+
+@contextmanager
+def _metadata_process(cmd: list[str], cwd: Path) -> Iterator[Any]:
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, cwd=str(cwd), start_new_session=True)
+    except FileNotFoundError as exc:
+        raise YoyoError(f"Agent command not found: {cmd[0]}") from exc
+    _register_child(proc.pid)
+    try:
+        yield proc
+    finally:
+        _terminate_child(proc, proc.pid)
+        proc.wait()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.stdout.close()
+        _unregister_child(proc.pid)
 
 
 def _codex_models(proc, deadline: float) -> dict:
     # Ask the native app server for the current account and picker catalog;
     # a packaged model list is not evidence of this user's current access.
     def request(method: str, params: dict) -> dict:
-        reply = _probe_reply(proc, {"id": method, "method": method, "params": params}, "id", method, deadline)
-        if "error" in reply or not isinstance(reply.get("result"), dict):
-            raise YoyoError(f"Codex model discovery failed at {method}; check the CLI login and version")
-        return reply["result"]
+        return _codex_request(proc, method, params, deadline)
 
-    request("initialize", {"clientInfo": {"name": "yoyo", "version": VERSION}})
-    proc.stdin.write(b'{"method":"initialized"}\n')
-    proc.stdin.flush()
+    _codex_initialize(proc, deadline)
     account = request("account/read", {"refreshToken": False}).get("account") or {}
     if not isinstance(account, dict) or not account:
         raise YoyoError("Codex is not signed in; run codex login before discovering account models")
@@ -7557,7 +7874,13 @@ def _codex_models(proc, deadline: float) -> dict:
         if not isinstance(cursor, str) or cursor in seen_cursors:
             raise YoyoError("Codex model discovery repeated a page cursor")
         seen_cursors.add(cursor)
-    return {"account": {"type": account.get("type", "unknown"), "plan": account.get("planType")}, "models": models}
+    quota = unknown_quota("codex")
+    try:
+        quota = codex_quota(request("account/rateLimits/read", {}))
+    except (YoyoError, OSError):
+        pass  # quota transport/schema changes cannot discard a valid catalog
+    return {"account": {"type": account.get("type", "unknown"), "plan": account.get("planType")},
+            "models": models, "quota": quota}
 
 
 def _claude_account(args, deadline: float) -> dict:
@@ -7615,29 +7938,15 @@ def _cmd_models(args: argparse.Namespace) -> int:
                                    "--settings", '{"disableAllHooks":true}']
     if args.timeout <= 0:
         raise YoyoError("--timeout must be greater than 0")
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, cwd=str(resolve_cwd(args.cwd)), start_new_session=True)
-    except FileNotFoundError as exc:
-        raise YoyoError(f"Agent command not found: {cmd[0]}") from exc
-    _register_child(proc.pid)
-    try:
+    with _metadata_process(cmd, resolve_cwd(args.cwd)) as proc:
         deadline = time.monotonic() + args.timeout
         discover = _codex_models if args.agent == "codex" else _claude_models
         result = discover(proc, deadline)
         if not result["models"]:
             raise YoyoError("The native CLI returned no selectable models; check its login and version")
-    finally:
-        _terminate_child(proc, proc.pid)
-        proc.wait()
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        proc.stdout.close()
-        _unregister_child(proc.pid)
     if args.agent == "claude":
         result["account"] = _claude_account(args, deadline)
+        result["quota"] = observed_claude_quota(args.agent)
 
     # Whitelist returned metadata: native account replies can include email,
     # organization identifiers and unrelated settings that routing never needs.
@@ -7646,7 +7955,8 @@ def _cmd_models(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 0
     account = result["account"]
-    print(f"{args.agent}: {account['type']} ({account.get('plan') or 'plan unknown'}); quota not checked")
+    print(f"{args.agent}: {account['type']} ({account.get('plan') or 'plan unknown'})")
+    print(quota_line(result["quota"]))
     for row in result["models"]:
         print(f"{row['model']}: {row['description']}")
     return 0
@@ -8707,6 +9017,13 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("--timeout", type=float, default=MODEL_PROBE_SECONDS, help="Metadata probe timeout in seconds")
     models.add_argument("--json", action="store_true", help="Emit account type and selectable models as JSON")
     models.set_defaults(func=_cmd_models)
+
+    quota = sub.add_parser("quota", help="Read live Codex quota and the newest observed Claude quota, without inference")
+    quota.add_argument("agents", nargs="*", help="Agents to report (default: codex claude; other/custom agents are unknown)")
+    quota.add_argument("--cwd", default=os.getcwd())
+    quota.add_argument("--timeout", type=float, default=MODEL_PROBE_SECONDS, help="Native metadata deadline in seconds")
+    quota.add_argument("--json", action="store_true", help="Emit only sanitized quota fields")
+    quota.set_defaults(func=cmd_quota)
 
     advise = sub.add_parser("advise", help="Run optional local checks for repeated attempts, failures, or duplicate findings")
     advise.add_argument("--file", required=True, help="JSON evidence file containing a checks array; originals are retained")

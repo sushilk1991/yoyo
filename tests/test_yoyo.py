@@ -8628,5 +8628,256 @@ class InterruptedRunTests(CliTestCase):
                 proc.kill(); proc.communicate()
 
 
+class QuotaTests(CliTestCase):
+    def _codex_pipe(self, limits):
+        folder=Path(self._state_guard.name)/'bin';folder.mkdir(exist_ok=True)
+        exe=folder/'codex'
+        payload={'rateLimits':limits,'accountId':'PRIVATE_ACCOUNT','email':'PRIVATE_EMAIL'}
+        exe.write_text('#!/usr/bin/env python3\nimport sys,json\nfor line in sys.stdin:\n m=json.loads(line); print(json.dumps({"id":m.get("id"),"result":'+repr(payload)+' if m.get("method")=="account/rateLimits/read" else {}}),flush=True)\n')
+        exe.chmod(0o755)
+        return {'PATH':str(folder)+os.pathsep+os.environ['PATH'],'YOYO_CONFIG':str(folder/'missing.json')}
+
+    def test_codex_quota_uses_native_pipe_and_allowlists_reply(self):
+        future=int(time.time()+3600)
+        env=self._codex_pipe({'primary':{'usedPercent':100,'windowDurationMins':300,'resetsAt':future},
+                             'secondary':{'usedPercent':40,'resetsAt':future+600},'rateLimitReachedType':'usage_limit',
+                             'accountId':'PRIVATE_INNER'})
+        code,out,err=self.run_cli(['quota','codex','--json'],env=env)
+        self.assertEqual(code,0,err)
+        row=json.loads(out)[0]
+        self.assertEqual(row['source'],'live');self.assertTrue(row['blocked'])
+        self.assertEqual(row['windows'][0]['used_percent'],100)
+        self.assertNotIn('PRIVATE',out)
+        self.assertIsNotNone(yoyo.parse_iso_utc(row['observed_at']))
+
+    def test_claude_quota_reads_newest_event_with_age(self):
+        state=Path(self._state_guard.name)
+        for index,status in enumerate(('rejected','allowed')):
+            path=state/'runs'/f'20261117T00000{index}-abcd';path.mkdir(parents=True)
+            (path/'meta.json').write_text(json.dumps({'agent':'claude','mode':'call','native_adapter':True,'started_at':yoyo.iso_utc(yoyo.utc_now())}))
+            event={'type':'rate_limit_event','rate_limit_info':{'status':status,'resetsAt':time.time()+1000,
+                   'unifiedWindows':{'five_hour':{'utilization':.25,'resetsAt':time.time()+1000,'status':status}},'account':'PRIVATE_ACCOUNT'}}
+            (path/'stdout.txt').write_text(json.dumps(event)+'\n')
+            os.utime(path/'stdout.txt',(time.time()-100+index,time.time()-100+index))
+        code,out,err=self.run_cli(['quota','claude','pi','--json'])
+        self.assertEqual(code,0,err)
+        row,unknown=json.loads(out)
+        self.assertEqual(row['source'],'observed');self.assertFalse(row['blocked'])
+        self.assertEqual(row['windows'][0]['used_percent'],25)
+        self.assertGreaterEqual(row['age_s'],90)
+        self.assertEqual(unknown['source'],'unknown');self.assertIsNone(unknown['blocked'])
+        self.assertNotIn('PRIVATE',out)
+
+    def test_quota_errors_are_classified_from_terminal_errors_only(self):
+        errors=["ERROR: You've hit your usage limit. Please try again at Sep 19th, 2026 2:04 PM",
+                'Individual quota reached. Resets in 75h19m18s',
+                '429 reached your session usage limit']
+        for message in errors:
+            script='import sys;print('+repr(message)+',file=sys.stderr);sys.exit(1)'
+            env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])}
+            code,out,err=self.run_cli(['ask','broken','--json','work'],env=env)
+            self.assertEqual(code,1,err)
+            row=json.loads(out);self.assertEqual(row['failure_kind'],'quota')
+            if 'try again' in message or 'Resets in' in message:self.assertTrue(row['quota_resets_at'])
+            saved=sorted((Path(self._state_guard.name)/'runs').iterdir())[-1]
+            self.assertEqual(json.loads((saved/'result.json').read_text())['failure_kind'],'quota')
+        code,out,err=self.run_cli(['runs','audit','--json'])
+        self.assertEqual(json.loads(out)['agents'][0]['outcomes']['quota'],3)
+        script='import sys;print(\'rate_limit_event {"status":"rejected"}\\nthis is a regular failure\',file=sys.stderr);sys.exit(1)'
+        code,out,err=self.run_cli(['ask','broken','--json','work'],env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+        self.assertNotEqual(json.loads(out).get('failure_kind'),'quota')
+
+
+    def test_codex_allowance_wins_and_unknown_values_stay_unknown(self):
+        limits = {'primary': {'usedPercent': 100, 'resetsAt': time.time() + 1000}, 'rateLimitReachedType': 'usage_limit'}
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed):
+                row = yoyo.codex_quota({'ordinaryUsageAllowed': allowed, 'rateLimits': limits})
+                self.assertEqual(row['blocked'], not allowed)
+        row = yoyo.codex_quota({'rateLimits': {'primary': {'usedPercent': True, 'resetsAt': 'bad'},
+                                              'secondary': {'usedPercent': float('nan')}}})
+        self.assertIsNone(row['blocked'])
+        self.assertIsNone(row['windows'][0]['used_percent'])
+        self.assertIsNone(row['windows'][0]['resets_at'])
+        self.assertIsNone(row['windows'][1]['used_percent'])
+
+    def test_claude_root_fields_and_expired_observation(self):
+        run = Path(self._state_guard.name)/'runs'/'20261117T000000-abcd'
+        run.mkdir(parents=True)
+        (run/'meta.json').write_text(json.dumps({'agent':'claude','mode':'call','native_adapter':True}))
+        for status, blocked in (('allowed',False),('allowed_warning',False),('rejected',True),('unfamiliar',None)):
+            with self.subTest(status=status):
+                info = {'status': status, 'utilization': .6, 'resetsAt': time.time()+1000, 'overageStatus':'rejected'}
+                event = {'type':'rate_limit_event','rate_limit_info':info}
+                (run/'stdout.txt').write_text(json.dumps(event)+'\n')
+                code,out,err=self.run_cli(['quota','claude','--json'])
+                self.assertEqual(code,0,err)
+                row=json.loads(out)[0]
+                self.assertIs(row['blocked'],blocked)
+                self.assertEqual(row['windows'][0]['used_percent'],60)
+        event['rate_limit_info'].update(status='rejected', resetsAt=time.time()-1)
+        (run/'stdout.txt').write_text(json.dumps(event)+'\n')
+        code,out,err=self.run_cli(['quota','claude','--json'])
+        self.assertFalse(json.loads(out)[0]['blocked'])
+
+    def test_claude_last_event_is_persisted_and_survives_raw_stream_removal(self):
+        events = [ {'type':'rate_limit_event','rate_limit_info':{'status':status,'utilization':used,'resetsAt':time.time()+1000,
+                                                              'accountId':'PRIVATE_ACCOUNT'}}
+                   for status,used in (('rejected',1),('allowed',.2))]
+        events += [{'type':'result','result':'done','is_error':False}]
+        script = 'import json; ' + '; '.join('print('+repr(json.dumps(e))+',flush=True)' for e in events)
+        folder=Path(self._state_guard.name)/'native';folder.mkdir()
+        executable=folder/'claude'
+        executable.write_text('#!/usr/bin/env python3\n'+script+'\n');executable.chmod(0o755)
+        env={'PATH':str(folder)+os.pathsep+os.environ['PATH'],'YOYO_CONFIG':str(folder/'absent')}
+        code,out,err=self.run_cli(['ask','claude','--json','work'],env=env)
+        self.assertEqual(code,0,err)
+        self.assertEqual(json.loads(out)['quota']['windows'][0]['used_percent'],20)
+        record=next((Path(self._state_guard.name)/'runs').iterdir())
+        saved=(record/'result.json').read_text()
+        self.assertNotIn('PRIVATE',saved)
+        (record/'stdout.txt').unlink()
+        code,out,err=self.run_cli(['quota','claude','--json'],env=env)
+        self.assertEqual(code,0,err)
+        row=json.loads(out)[0]
+        self.assertEqual(row['source'],'observed')
+        self.assertFalse(row['blocked'])
+        self.assertEqual(row['windows'][0]['used_percent'],20)
+
+    def test_quota_success_earlier_errors_and_clock_precedence(self):
+        cases = [
+            (0, "You've hit your usage limit", None),
+            (1, "You've hit your rate limit; retry in one second", None),
+            (1, "You've hit your usage limit\nordinary terminal error", None),
+            (1, 'rate_limit_event {"status":"rejected"}\nregular error', None),
+            (1, 'x'*1000 + "\nYou've hit your usage limit", 'quota'),
+        ]
+        for exit_code,text,expected in cases:
+            with self.subTest(text=text[-50:]):
+                script='import sys;print('+repr(text)+',file=sys.stderr);sys.exit('+str(exit_code)+')'
+                code,out,err=self.run_cli(['ask','broken','--json','--max-output-bytes','30','work'],
+                                         env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+                self.assertEqual(code,exit_code,err)
+                self.assertEqual(json.loads(out).get('failure_kind'),expected)
+        for event in ({'type':'turn.failed','error':{'message':'ordinary final error'}},
+                      {'type':'result','is_error':True,'result':'ordinary final error'}):
+            earlier={'type':'error','message':"You've hit your usage limit"}
+            script='import json,sys;print('+repr(json.dumps(earlier))+');print('+repr(json.dumps(event))+');sys.exit(1)'
+            code,out,err=self.run_cli(['ask','broken','--json','work'],env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+            self.assertNotIn('failure_kind',json.loads(out))
+        for result in ({'exit_code':124,'timed_out':True,'timeout_s':1}, {'exit_code':-15,'killed_by_signal':15}):
+            out_path=Path(self._state_guard.name)/'out';err_path=Path(self._state_guard.name)/'err'
+            out_path.write_text('');err_path.write_text("You've hit your usage limit")
+            yoyo.classify_quota_failure(result,out_path,err_path)
+            self.assertNotIn('failure_kind',result)
+
+    def test_native_quota_transport_failure_and_custom_overrides_are_unknown(self):
+        env=self._codex_pipe({})
+        for name in ('codex','claude'):
+            with self.subTest(name=name), mock.patch.object(yoyo.subprocess,'Popen') as spawn:
+                code,out,err=self.run_cli(['quota',name,'--json'],env={**env,'YOYO_AGENT_'+name.upper():'custom --profile other'})
+                self.assertEqual(code,0,err)
+                self.assertEqual(json.loads(out)[0]['source'],'unknown')
+                spawn.assert_not_called()
+        exe=Path(env['PATH'].split(os.pathsep)[0])/'codex'
+        exe.write_text('#!/usr/bin/env python3\nimport time;time.sleep(30)\n')
+        before=time.monotonic()
+        code,out,err=self.run_cli(['quota','codex','--timeout','.1','--json'],env=env)
+        self.assertEqual(code,0,err)
+        self.assertEqual(json.loads(out)[0]['source'],'unknown')
+        self.assertLess(time.monotonic()-before,3)
+
+    def test_models_reuses_codex_pipe_for_quota(self):
+        folder=Path(self._state_guard.name)/'native';folder.mkdir()
+        exe=folder/'codex';calls=folder/'calls'
+        exe.write_text('#!/usr/bin/env python3\nimport json,os,sys\n'
+                       'for line in sys.stdin:\n'
+                       ' m=json.loads(line); method=m["method"]\n'
+                       ' if method=="initialized":continue\n'
+                       ' with open('+repr(str(calls))+',"a") as f:f.write(str(os.getpid())+" "+method+"\\n")\n'
+                       ' result={"initialize":{},"account/read":{"account":{"type":"chatgpt","planType":"pro"}},'
+                       '"model/list":{"data":[{"model":"native-choice"}]},'
+                       '"account/rateLimits/read":{"ordinaryUsageAllowed":True,"rateLimits":{"primary":{"usedPercent":100}}}}[method]\n'
+                       ' print(json.dumps({"id":m["id"],"result":result}),flush=True)\n')
+        exe.chmod(0o755)
+        code,out,err=self.run_cli(['models','codex','--json'],env={'PATH':str(folder)+os.pathsep+os.environ['PATH'],
+                                                               'YOYO_CONFIG':str(folder/'absent')})
+        self.assertEqual(code,0,err)
+        row=json.loads(out)
+        self.assertEqual(row['models'][0]['model'],'native-choice')
+        self.assertEqual(row['quota']['source'],'live')
+        self.assertFalse(row['quota']['blocked'])
+        requests=calls.read_text().splitlines()
+        self.assertEqual(len({line.split()[0] for line in requests}),1)
+        self.assertEqual(sum(line.endswith('account/rateLimits/read') for line in requests),1)
+
+
+    def test_structured_terminal_quota_errors_include_claude_error_arrays(self):
+        events = [{'type':'turn.failed','error':{'message':"You've hit your usage limit"}},
+                  {'type':'error','message':"You've hit your usage limit"},
+                  {'type':'result','is_error':True,'result':'Individual quota reached. Resets in 1h'},
+                  {'type':'result','is_error':True,'subtype':'error_during_execution',
+                   'errors':['earlier error','429 reached your session usage limit']}]
+        for event in events:
+            with self.subTest(event=event):
+                script='import sys;print('+repr(json.dumps(event))+');sys.exit(1)'
+                code,out,err=self.run_cli(['ask','broken','--json','work'],env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+                self.assertEqual(code,1,err)
+                self.assertEqual(json.loads(out)['failure_kind'],'quota')
+        events[-1]['errors']=["You've hit your usage limit", 'ordinary final error']
+        script='import sys;print('+repr(json.dumps(events[-1]))+');sys.exit(1)'
+        code,out,err=self.run_cli(['ask','broken','--json','work'],env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+        self.assertNotIn('failure_kind',json.loads(out))
+
+
+    def test_observed_log_scan_skips_nonregular_and_oversized_lines(self):
+        state=Path(self._state_guard.name)
+        fifo=state/'fifo';os.mkfifo(fifo)
+        self.assertIsNone(yoyo.read_claude_quota(fifo,'claude'))
+        actual=state/'actual'
+        first={'type':'rate_limit_event','rate_limit_info':{'status':'rejected','utilization':1}}
+        last={'type':'rate_limit_event','rate_limit_info':{'status':'allowed','utilization':.3}}
+        actual.write_text(json.dumps(first)+'\n'+'x'*2000+'\n'+json.dumps(last)+'\n')
+        symlink=state/'link';symlink.symlink_to(actual)
+        self.assertIsNone(yoyo.read_claude_quota(symlink,'claude'))
+        with mock.patch.object(yoyo,'STREAM_EVENT_MAX_BYTES',256):
+            row=yoyo.read_claude_quota(actual,'claude')
+        self.assertFalse(row['blocked'])
+        self.assertEqual(row['windows'][0]['used_percent'],30)
+
+
+    def test_json_progress_does_not_hide_terminal_stderr_or_revive_old_errors(self):
+        progress={'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}
+        earlier={'type':'error','message':"You've hit your usage limit"}
+        for terminal,expected in (("You've hit your usage limit",'quota'),('ordinary final error',None)):
+            with self.subTest(terminal=terminal):
+                script=('import sys; print('+repr(json.dumps(earlier))+'); print('+repr(json.dumps(progress))+'); '
+                        'print('+repr(terminal)+',file=sys.stderr); sys.exit(1)')
+                code,out,err=self.run_cli(['ask','broken','--json','work'],env={'YOYO_AGENT_BROKEN':shlex.join(['python3','-c',script])})
+                self.assertEqual(code,1,err)
+                self.assertEqual(json.loads(out).get('failure_kind'),expected)
+
+
+    def test_observations_keep_native_scope_and_reject_malformed_saved_data(self):
+        state=Path(self._state_guard.name);run=state/'runs'/'20261117T000000-abcd';run.mkdir(parents=True)
+        event={'type':'rate_limit_event','rate_limit_info':{'status':'rejected','utilization':1}}
+        (run/'stdout.txt').write_text(json.dumps(event)+'\n')
+        for command in (['python3','wrapper.py'], ['claude','-p','--settings','other-profile.json'], None):
+            with self.subTest(command=command):
+                (run/'meta.json').write_text(json.dumps({'agent':'claude','mode':'call','command':command}))
+                code,out,err=self.run_cli(['quota','claude','--json'])
+                self.assertEqual(code,0,err)
+                self.assertEqual(json.loads(out)[0]['source'],'unknown')
+        (run/'meta.json').write_text(json.dumps({'agent':'claude','mode':'call','command':['claude','-p','--no-session-persistence']}))
+        code,out,err=self.run_cli(['quota','claude','--json'])
+        self.assertEqual(json.loads(out)[0]['source'],'observed')
+        (run/'stdout.txt').unlink()
+        (run/'result.json').write_text(json.dumps({'quota':{'source':'observed','observed_at':yoyo.iso_utc(yoyo.utc_now()),'windows':None}}))
+        code,out,err=self.run_cli(['quota','claude','--json'])
+        self.assertEqual(code,0,err)
+        self.assertEqual(json.loads(out)[0]['source'],'unknown')
+        self.assertIsNone(yoyo.parse_iso_utc('0001-01-01T00:00:00+23:59'))
+
+
 if __name__ == "__main__":
     unittest.main()

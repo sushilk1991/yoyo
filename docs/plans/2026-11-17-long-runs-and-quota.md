@@ -58,7 +58,7 @@ The goal is that a long delegated run is never lost to a clock while it is worki
   - Verify first: start a real Codex run and a real Claude run that are each given a random word, stop each mid-task the way yoyo's deadline does, resume it, and ask for the word. Also check what keeping sessions adds to `codex resume` and `claude --resume` listings for the user. If a killed session cannot be resumed on either CLI, ship the recovered answer alone for that CLI.
   - Proof: a test that a fake agent killed at the deadline leaves a non-empty `answer.txt` and a continue command in the envelope; the live output above.
 
-- [ ] **3. `yoyo quota` reports what is left, and quota failures are named.**
+- [x] **3. `yoyo quota` reports what is left, and quota failures are named.**
   - Codex: the app-server method `account/rateLimits/read`, on the same pipe `_codex_models` opens. On codex-cli 0.169.0 it answered in 2.1 s with `rateLimits.primary.{usedPercent, windowDurationMins, resetsAt}`, `secondary`, `credits` and `rateLimitReachedType`.
   - Claude: the initialize handshake has no quota fields. 66 of this month's 88 stored `claude -p` streams contain a `rate_limit_event`. On 2.1.326 it carries `rate_limit_info.{status, rateLimitType, resetsAt, unifiedWindows.<name>.{utilization, resetsAt, status}}`; Anthropic documents only `status`, `resetsAt` and `utilization`, so read the others when present and do not require them. Report the newest event from the ledger with its age, labelled as observed, not live.
   - Other agents report `unknown`. Do not scrape private endpoints.
