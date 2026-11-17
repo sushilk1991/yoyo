@@ -50,7 +50,7 @@ The goal is that a long delegated run is never lost to a clock while it is worki
   - This applies wherever the default timeout applies: `ask`, `review`, `research`, loop iterations and background workers.
   - Proof: tests for a chatty agent that outlives the soft deadline and exits 0 with at least one extension; an agent that goes quiet and is killed at the soft deadline; a chatty agent stopped at the ceiling; an explicit `--timeout` that kills a chatty agent at N with no extension. Repeat the first case through `--background` and `yoyo wait`, because the killed runs were launched that way.
 
-- [ ] **2. A killed run leaves an answer and a way to continue.**
+- [x] **2. A killed run leaves an answer and a way to continue.**
   The killed Codex runs ran with `--ephemeral` and left a 0-byte `answer.txt`; the Claude runs ran with `--no-session-persistence`.
   - On any timeout or signal kill, `answer.txt` holds the last complete agent message recovered from the captured stream, for Codex as well as Claude.
   - Full-access `ask` calls to Codex and Claude keep a backend session, and its id is stored in that run's own record. The timeout envelope and `yoyo runs autopsy` print one command that continues the run. Read-only calls stay ephemeral. How this shares code with `--session` is your call; do not add an entry per run to the named-session registry.

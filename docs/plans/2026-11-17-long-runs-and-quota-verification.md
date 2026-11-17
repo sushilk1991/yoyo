@@ -96,3 +96,45 @@ presence, matching adjacent fixtures; their skill assertions are unchanged.
 The Linux box has no authenticated native vendor CLIs. No smaller deadline
 behavior shipped. The ceiling bounds the implicit renewable policy; explicit
 caller-selected budgets retain their selected hard limit.
+
+## Item 2 - interrupted answers and continuation
+
+Tests added: `InterruptedRunTests` (12): last complete native message on
+kill, automatic full-access sessions and ephemeral read-only calls, graceful
+Claude final result, Yoyo and agent signals, continuation identity/permission
+validation, background wait/autopsy, fresh internal calls, Codex JSON watch,
+invalid grace clocks before spawn and detached-parent signal recovery.
+Initial red: 4 selected tests, 4 failures and 1 error. Focused final green:
+22 tests (including lifecycle/skill guards), 7.210s, OK.
+
+Actual current-Yoyo adapter output (each receives a random word, starts sleep90,
+hits explicit25s timeout, then resumes by run ID with no word in follow-up):
+
+```json
+{"vendor": "codex", "timeout_exit": 124, "has_answer": true, "continue_command": "env YOYO_STATE_DIR=/Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-state-codex YOYO_CONFIG=/Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-codex/no-config.json /opt/homebrew/opt/python@3.15/bin/python3.15 /Users/sushil/Code/yoyo/bin/yoyo ask codex --cwd /Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-codex --resume-run 20261117T153844-6168aa82 'Continue the interrupted task.'", "run_id": "20261117T153844-6168aa82", "resume_exit": 0, "recall": true, "named_registry_created": false}
+{"vendor": "claude", "timeout_exit": 124, "has_answer": true, "continue_command": "env YOYO_STATE_DIR=/Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-state-claude YOYO_CONFIG=/Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-claude/no-config.json /opt/homebrew/opt/python@3.15/bin/python3.15 /Users/sushil/Code/yoyo/bin/yoyo ask claude --cwd /Users/sushil/Code/yoyo/.yoyo/long-runs/adapter-claude --resume-run 20261117T153920-621a7207 'Continue the interrupted task.'", "run_id": "20261117T153920-621a7207", "resume_exit": 0, "recall": true, "named_registry_created": false}
+```
+
+Both actual deadline paths retained an answer and resumed successfully. Codex
+uses immediate group kill because the earlier SIGINT probe emitted no final
+result; Claude uses bounded SIGINT, then TERM/KILL escalation. Yoyo fatal
+signals also allow that Claude flush before recovery. Named-session registry
+was absent after both calls. No smaller recovery behavior shipped. Sessions
+remain vendor-owned; picker observations above are limited to tested versions.
+A SIGKILL of Yoyo itself cannot flush an active journal.
+
+Full remote gate output (`python3 -m py_compile bin/yoyo` was silent, exit0):
+
+```text
+boxrun: build:/data/workspace/yoyo-2c067b94/
+...................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 547 tests in 55.837s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.062s
+
+OK
+```

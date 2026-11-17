@@ -255,17 +255,21 @@ def eprint(*parts: object, **kwargs: Any) -> None:
 # Active child process groups, so a yoyo that is itself signalled or exits does
 # not orphan the nested agents it launched (which keep burning tokens).
 _ACTIVE_PGIDS: set[int] = set()
-_ACTIVE_PGIDS_LOCK = threading.Lock()
+_ACTIVE_CHILD_STOPS: dict[int, Any] = {}
+_ACTIVE_PGIDS_LOCK = threading.RLock()
 
 
-def _register_child(pgid: int) -> None:
+def _register_child(pgid: int, stop: Any = None) -> None:
     with _ACTIVE_PGIDS_LOCK:
         _ACTIVE_PGIDS.add(pgid)
+        if stop is not None:
+            _ACTIVE_CHILD_STOPS[pgid] = stop
 
 
 def _unregister_child(pgid: int) -> None:
     with _ACTIVE_PGIDS_LOCK:
         _ACTIVE_PGIDS.discard(pgid)
+        _ACTIVE_CHILD_STOPS.pop(pgid, None)
 
 
 def _kill_active_children(sig: int) -> None:
@@ -322,6 +326,12 @@ def _install_signal_handlers() -> None:
         return
 
     def handler(signum: int, _frame: Any) -> None:
+        # Let native Claude finish its transcript before recovering the last
+        # complete answer. Other children retain the immediate-kill path.
+        with _ACTIVE_PGIDS_LOCK:
+            stops = list(_ACTIVE_CHILD_STOPS.values())
+        for stop in stops:
+            stop()
         _flush_active_journals(signum)
         _flush_active_thread_turns(signum)
         _kill_active_children(signal.SIGKILL)
@@ -338,7 +348,24 @@ def _install_signal_handlers() -> None:
     _SIGNAL_HANDLERS_INSTALLED = True
 
 
-def _terminate_child(proc: subprocess.Popen, pgid: int | None) -> None:
+def _terminate_child(proc: subprocess.Popen, pgid: int | None, interrupt_grace: float = 0,
+                     terminate_grace: float = 2) -> None:
+    # Claude flushes its result and transcript on SIGINT. Keep the deadline a
+    # failure even when that graceful shutdown exits 0; kill surviving tools.
+    if interrupt_grace:
+        for sig, grace in ((signal.SIGINT, interrupt_grace),
+                           (signal.SIGTERM, terminate_grace)):
+            try:
+                if pgid is not None and os.name == "posix":
+                    os.killpg(pgid, sig)
+                else:
+                    proc.send_signal(sig)
+                proc.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                break
     if pgid is not None and os.name == "posix":
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -740,6 +767,8 @@ def read_agent_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, boo
     stream first would cut the answer off. So the stream is scanned whole,
     line by line, and only the decoded answer is capped.
     """
+    if spec.flavor == "codex":
+        return read_interrupted_stdout(spec, path, limit)
     if spec.flavor not in STREAM_JSON_FLAVORS:
         text, truncated = read_limited_text(path, limit)
         return text, truncated, ""
@@ -757,6 +786,45 @@ def read_agent_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, boo
     if len(data) <= limit:
         return answer, False, note
     return data[:limit].decode("utf-8", errors="replace") + f"\n...[truncated after {limit} bytes]\n", True, note
+
+
+def read_interrupted_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, bool, str]:
+    """Recover the last complete native message, never a stitched conversation."""
+    if spec.flavor not in ("codex", "claude"):
+        return read_agent_stdout(spec, path, limit)
+    latest = final = ""
+    saw_json = False
+    with path.open("rb") as handle:
+        for line in _bounded_lines(handle, max(STREAM_EVENT_MAX_BYTES, 4 * limit)):
+            event = _stream_event(line) if line else None
+            if event is None:
+                continue
+            saw_json = True
+            if spec.flavor == "codex" and event["type"] == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                    latest = item["text"]
+            elif spec.flavor == "claude":
+                if event["type"] == "result" and isinstance(event.get("result"), str) and event["result"].strip():
+                    final = event["result"]
+                elif event["type"] == "assistant" and not event.get("parent_tool_use_id"):
+                    message = event.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if isinstance(content, list):
+                        text = "\n".join(b["text"] for b in content if isinstance(b, dict) and
+                                         b.get("type", "text") == "text" and isinstance(b.get("text"), str))
+                        if text.strip():
+                            latest = text
+    if not saw_json:
+        text, truncated = read_limited_text(path, limit)
+        return text, truncated, ""
+    answer = final or latest
+    note = (f"{spec.name} stream ended without a result event; recovered last complete assistant message"
+            if spec.flavor == "claude" and latest and not final else "")
+    data = answer.encode("utf-8")
+    if len(data) > limit:
+        return data[:limit].decode("utf-8", errors="replace") + f"\n...[truncated after {limit} bytes]\n", True, note
+    return answer, False, note
 
 
 def read_limited_stdin(limit: int) -> tuple[str, bool, int]:
@@ -817,6 +885,8 @@ def run_to_files(
     env: dict[str, str] | None = None,
     soft_timeout: bool = False,
     timeout_state: dict[str, Any] | None = None,
+    interrupt_grace: float = 0,
+    terminate_grace: float = 2,
 ) -> subprocess.CompletedProcess[str]:
     # Metadata probes and completion checks call this without a soft policy.
     state = timeout_state if timeout_state is not None else {}
@@ -843,7 +913,8 @@ def run_to_files(
             except OSError:
                 pgid = None
         if pgid is not None:
-            _register_child(pgid)
+            stop = (lambda: _terminate_child(proc, pgid, interrupt_grace, terminate_grace)) if interrupt_grace else None
+            _register_child(pgid, stop)
 
         feeder = threading.Thread(target=_feed_stdin, args=(proc, prompt), daemon=True)
         feeder.start()
@@ -879,11 +950,11 @@ def run_to_files(
                         clock = SOFT_TIMEOUT_CLOCK if soft_timeout else HARD_TIMEOUT_CLOCK
                 if clock is not None:
                     state.update(timeout_clock=clock, timeout_s=clock_s)
-                    _terminate_child(proc, pgid)
+                    _terminate_child(proc, pgid, interrupt_grace, terminate_grace)
                     proc.wait()
                     raise subprocess.TimeoutExpired(cmd, clock_s)
                 if idle_timeout is not None and last_activity is not None and now - last_activity >= idle_timeout:
-                    _terminate_child(proc, pgid)
+                    _terminate_child(proc, pgid, interrupt_grace, terminate_grace)
                     proc.wait()
                     raise AgentIdleTimeout(round(now - last_activity, 1), size)
                 if heartbeat is not None and now - last_heartbeat >= heartbeat:
@@ -1302,6 +1373,8 @@ def command_for_agent(
                 cmd.extend(["--sandbox", "danger-full-access"])
         if codex_output_file:
             cmd.extend(["--output-last-message", codex_output_file])
+        if "--json" not in cmd:
+            cmd.append("--json")
     elif spec.flavor == "claude":
         # stream-json, as for cursor: every message and tool call lands in the
         # call's stdout capture as it happens (thread watch shows it, and a
@@ -1547,6 +1620,8 @@ def write_session_registry(registry: dict[str, Any]) -> None:
 
 
 def validate_session_request(args: argparse.Namespace, spec: AgentSpec) -> None:
+    if getattr(args, "resume_run", None):
+        resume_run_session(args, spec)
     name = getattr(args, "session", None)
     if not name:
         return
@@ -1555,10 +1630,47 @@ def validate_session_request(args: argparse.Namespace, spec: AgentSpec) -> None:
         raise YoyoError(f"agent {args.agent} does not support --session")
 
 
+def resume_run_session(args: argparse.Namespace, spec: AgentSpec) -> dict[str, Any]:
+    for flag in ("session", "thread"):
+        if getattr(args, flag, None):
+            raise YoyoError(f"--resume-run cannot be combined with --{flag}")
+    if spec.flavor not in ("codex", "claude"):
+        raise YoyoError("--resume-run requires a codex or claude agent")
+    if getattr(args, "read_only", False):
+        raise YoyoError("--resume-run requires full-access permissions")
+    run_dir = run_dir_for(str(args.resume_run))
+    meta, result = run_meta(run_dir), run_result(run_dir)
+    if run_status(meta, result) == "running":
+        raise YoyoError(f"run {args.resume_run} is still running")
+    if not meta or meta.get("agent") != args.agent or meta.get("flavor") != spec.flavor:
+        raise YoyoError("--resume-run agent/backend does not match the original run")
+    if meta.get("read_only") is not False:
+        raise YoyoError("--resume-run requires an original full-access run")
+    if meta.get("cwd") != str(resolve_cwd(args.cwd)):
+        raise YoyoError("--resume-run cwd must match the original run; pass --cwd with that directory")
+    session = (result or {}).get("session")
+    backend_id = session.get("backend_id") if isinstance(session, dict) else None
+    try:
+        uuid.UUID(str(backend_id))
+    except (ValueError, AttributeError):
+        raise YoyoError("run has no valid backend session ID to resume") from None
+    return {"backend_id": str(backend_id), "mode": "resume", "scope": "run"}
+
+
 def prepare_session(args: argparse.Namespace, spec: AgentSpec) -> None:
     args.session_info = None
+    if getattr(args, "resume_run", None):
+        args.session_info = resume_run_session(args, spec)
+        return
     name = getattr(args, "session", None)
     if not name:
+        # Internal review/research/loop calls omit command; a fresh context is
+        # part of their contract. Only a real, single-agent ask owns a session.
+        if (getattr(args, "command", None) == "ask" and not getattr(args, "read_only", False)
+                and not getattr(args, "thread", None) and "," not in str(args.agent)
+                and spec.flavor in ("codex", "claude")):
+            args.session_info = {"scope": "run", "mode": "create",
+                                 "backend_id": str(uuid.uuid4()) if spec.flavor == "claude" else None}
         return
     validate_session_request(args, spec)
     with session_registry_lock():
@@ -1622,6 +1734,9 @@ def record_codex_session(args: argparse.Namespace, backend_id: str) -> None:
     session_info = getattr(args, "session_info", None)
     if not isinstance(session_info, dict):
         return
+    if session_info.get("scope") == "run":
+        session_info["backend_id"] = backend_id
+        return
     name = str(session_info["name"])
     key = str(session_info["key"])
     created_at = str(session_info.get("created_at") or iso_utc(utc_now()))
@@ -1643,25 +1758,52 @@ def result_session(args: argparse.Namespace) -> dict[str, Any] | None:
     session_info = getattr(args, "session_info", None)
     if not isinstance(session_info, dict):
         return None
+    if session_info.get("scope") == "run":
+        return {"scope": "run", "backend_id": session_info.get("backend_id")}
     return {
         "name": session_info.get("name"),
         "backend_id": session_info.get("backend_id"),
     }
 
 
-def attach_session_result(args: argparse.Namespace, spec: AgentSpec, result: dict[str, Any]) -> None:
+def attach_session_result(args: argparse.Namespace, spec: AgentSpec, result: dict[str, Any],
+                          stdout_path: Path | None = None) -> None:
     session = result_session(args)
     if session is None:
         return
     session_info = getattr(args, "session_info", None) or {}
     if spec.flavor == "codex" and session_info.get("mode") == "create":
+        backend_id = None
+        if stdout_path is not None:
+            with stdout_path.open("rb") as handle:
+                for line in _bounded_lines(handle, STREAM_EVENT_MAX_BYTES):
+                    event = _stream_event(line) if line else None
+                    if event and event["type"] == "thread.started" and isinstance(event.get("thread_id"), str):
+                        try:
+                            uuid.UUID(event["thread_id"])
+                        except ValueError:
+                            continue
+                        backend_id = event["thread_id"]
+                        break
         match = CODEX_SESSION_ID_RE.search(str(result.get("stderr", "")))
-        if match:
-            record_codex_session(args, match.group(1))
+        if backend_id or match:
+            record_codex_session(args, backend_id or match.group(1))
             session = result_session(args)
-        else:
+        elif session_info.get("scope") != "run":
             eprint("session not recorded for codex; follow-up calls will fail")
     result["session"] = session
+
+
+def continuation_command(args: argparse.Namespace, run_dir: Path) -> str:
+    cmd = [sys.executable, str(Path(__file__).resolve()), "ask", args.agent, "--cwd", str(resolve_cwd(args.cwd)),
+           "--resume-run", run_dir.name]
+    if getattr(args, "model", None):
+        cmd.extend(["--model", args.model])
+    cmd.append("Continue the interrupted task.")
+    # Custom state/config paths must survive a paste into another shell.
+    env = [f"{name}={Path(os.environ[name]).expanduser().resolve()}"
+           for name in ("YOYO_STATE_DIR", "YOYO_CONFIG") if name in os.environ]
+    return shlex.join((["env"] + env if env else []) + cmd)
 
 
 def runs_root() -> Path:
@@ -1824,7 +1966,7 @@ def run_summary(run_dir: Path) -> dict[str, Any]:
     }
 
 
-_ACTIVE_JOURNALS_LOCK = threading.Lock()
+_ACTIVE_JOURNALS_LOCK = threading.RLock()
 _ACTIVE_JOURNALS: dict[str, dict[str, Any]] = {}
 
 
@@ -1855,6 +1997,7 @@ def journal_call_start(
     args: argparse.Namespace,
     cwd: Path,
     prompt: str,
+    flavor: str | None = None,
 ) -> Path | None:
     """Record a foreground agent call in the runs ledger as it executes.
 
@@ -1875,10 +2018,12 @@ def journal_call_start(
             "run_id": run_dir.name,
             "mode": "call",
             "agent": agent_name,
+            "flavor": flavor,
             "role": getattr(args, "role", None),
             "cwd": str(cwd),
             "trace_id": getattr(args, "trace_id", None),
             "caller": getattr(args, "caller", None),
+            "read_only": bool(getattr(args, "read_only", False)),
             "command": cmd,
             "prompt_bytes": len(prompt.encode("utf-8")),
             "pid": os.getpid(),
@@ -1903,7 +2048,7 @@ def journal_call_finish(run_dir: Path | None, payload: dict[str, Any]) -> None:
     with _ACTIVE_JOURNALS_LOCK:
         _ACTIVE_JOURNALS.pop(str(run_dir), None)
     try:
-        (run_dir / "result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(run_dir / "result.json", json.dumps(payload, ensure_ascii=False, indent=2))
     except OSError:
         pass
 
@@ -1942,6 +2087,12 @@ def _flush_active_journals(signum: int) -> None:
             "duration_s": round(time.monotonic() - entry["started"], 3),
         }
         payload.update(entry.get("timeout_state", {}))
+        recover = entry.get("recover")
+        if recover is not None:
+            try:
+                payload.update(recover(signum))
+            except (OSError, YoyoError):
+                pass  # preserve the signal even if a damaged capture cannot be read
         try:
             (entry["run_dir"] / "result.json").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -2519,6 +2670,8 @@ def render_co_cited(shared: list[dict[str, Any]]) -> str:
 
 
 def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
+    if getattr(args, "resume_run", None):
+        raise YoyoError("--resume-run needs a single agent")
     if getattr(args, "session", None):
         raise YoyoError("--session needs a single agent; fan-out calls are one-shot")
     if getattr(args, "raw", False):
@@ -2673,6 +2826,10 @@ def run_fanout(args: argparse.Namespace, names: list[str]) -> int:
 
 
 def run_agent(args: argparse.Namespace) -> int:
+    if getattr(args, "resume_run", None):
+        for flag in ("session", "thread"):
+            if getattr(args, flag, None):
+                raise YoyoError(f"--resume-run cannot be combined with --{flag}")
     thread_name = getattr(args, "thread", None)
     if thread_name:
         validate_thread_ask_flags(args)
@@ -2724,7 +2881,7 @@ def _timeout_result(
     elapsed = time.monotonic() - started
     # A killed cursor or claude run has no result event by definition, so
     # whatever it streamed before the kill is all the answer there is. Recover it.
-    stdout, stdout_truncated, stream_note = read_agent_stdout(spec, stdout_path, args.max_output_bytes)
+    stdout, stdout_truncated, stream_note = read_interrupted_stdout(spec, stdout_path, args.max_output_bytes)
     stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
     if stream_note:
         stderr = f"{stderr}\n{stream_note}" if stderr else stream_note
@@ -2794,6 +2951,10 @@ def execute_agent_call(
         known = ", ".join(sorted(agents))
         raise YoyoError(f"Unknown agent {agent_name!r}. Known agents: {known}")
     cwd = resolve_cwd(args.cwd)
+    interrupt_grace = terminate_grace = 0.0
+    if agents[agent_name].flavor == "claude":
+        interrupt_grace = positive_env_seconds("YOYO_INTERRUPT_GRACE", 10)
+        terminate_grace = positive_env_seconds("YOYO_TERMINATE_GRACE", 2)
     prepare_session(args, agents[agent_name])
     codex_output_file: str | None = None
     with _agent_temp_dir() as tmpdir:
@@ -2819,7 +2980,8 @@ def execute_agent_call(
             return result
 
         started = time.monotonic()
-        journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(agent_name, cmd, args, cwd, prompt)
+        journal_dir = None if getattr(args, "_no_journal", False) else journal_call_start(
+            agent_name, cmd, args, cwd, prompt, agents[agent_name].flavor)
         on_journal = getattr(args, "_on_call_journal", None)
         if journal_dir is not None and on_journal is not None:
             try:
@@ -2856,6 +3018,39 @@ def execute_agent_call(
             payload.update(extra)
             journal_call_finish(journal_dir, payload)
 
+        def retain_result(result: dict[str, Any]) -> dict[str, Any]:
+            args._call_run_id = journal_dir.name if journal_dir is not None else None
+            attach_session_result(args, agents[agent_name], result, stdout_path)
+            session = result.get("session") or {}
+            if (journal_dir is not None and session.get("backend_id") and not args.read_only
+                    and agents[agent_name].flavor in ("codex", "claude")
+                    and (result.get("exit_code") == 124 or result.get("killed_by_signal"))):
+                result["continue_command"] = continuation_command(args, journal_dir)
+            journal_call_answer(journal_dir, str(result.get("stdout") or ""))
+            return result
+
+        def complete_result(result: dict[str, Any], **extra: Any) -> dict[str, Any]:
+            retain_result(result)
+            # Session recovery must precede result.json: signal handling and
+            # background callers use it as the completed journal boundary.
+            saved = {key: result[key] for key in ("session", "continue_command", "killed_by_signal", "timed_out", "idle_timed_out",
+                                                 "idle_seconds", "silent_exit") if key in result}
+            finish_journal(result["exit_code"], **saved, **extra)
+            return result
+
+        def recover_signal(signum: int) -> dict[str, Any]:
+            result = _timeout_result(agent_name, agents[agent_name], cmd, args, started, stdout_path,
+                                     stderr_path, "", codex_output_file)
+            result.update(exit_code=None, killed_by_signal=signum)
+            retain_result(result)
+            return {key: result[key] for key in ("session", "continue_command") if key in result}
+
+        if journal_dir is not None:
+            with _ACTIVE_JOURNALS_LOCK:
+                entry = _ACTIVE_JOURNALS.get(str(journal_dir))
+                if entry is not None:
+                    entry["recover"] = recover_signal
+
         try:
             proc = run_to_files(
                 cmd,
@@ -2870,6 +3065,8 @@ def execute_agent_call(
                 env=delegate_env(args.trace_id, journal_dir.name if journal_dir is not None else None),
                 soft_timeout=soft_timeout,
                 timeout_state=timeout_state,
+                interrupt_grace=interrupt_grace,
+                terminate_grace=terminate_grace,
             )
         except FileNotFoundError as exc:
             finish_journal(127, error="agent command not found")
@@ -2907,7 +3104,6 @@ def execute_agent_call(
                 suffix = f"Quiet at the soft deadline after {seconds}s"
             elif clock == MAX_RUNTIME_CLOCK:
                 suffix = f"Hit YOYO_MAX_RUNTIME ceiling after {seconds}s"
-            finish_journal(124, timed_out=True)
             result = _timeout_result(
                 agent_name, agents[agent_name], cmd, args, started, stdout_path, stderr_path,
                 suffix,
@@ -2917,12 +3113,8 @@ def execute_agent_call(
             # carries no flags of its own; without these it would have to read
             # the clock off a stderr suffix an agent could have written itself.
             result.update(timeout_state, timed_out=True)
-            journal_call_answer(journal_dir, str(result.get("stdout") or ""))
-            args._call_run_id = journal_dir.name if journal_dir is not None else None
-            attach_session_result(args, agents[agent_name], result)
-            return result
+            return complete_result(result)
         except AgentIdleTimeout as exc:
-            finish_journal(124, idle_timed_out=True, idle_seconds=exc.idle_seconds)
             result = _timeout_result(
                 agent_name, agents[agent_name], cmd, args, started, stdout_path, stderr_path,
                 f"Idle timeout after {exc.idle_seconds}s with no output "
@@ -2930,11 +3122,10 @@ def execute_agent_call(
                 codex_output_file,
             )
             result.update(timeout_state, idle_timed_out=True, idle_seconds=exc.idle_seconds)
-            journal_call_answer(journal_dir, str(result.get("stdout") or ""))
-            args._call_run_id = journal_dir.name if journal_dir is not None else None
-            attach_session_result(args, agents[agent_name], result)
-            return result
+            return complete_result(result)
         stdout, stdout_truncated, stream_note = read_agent_stdout(agents[agent_name], stdout_path, args.max_output_bytes)
+        if proc.returncode < 0:
+            stdout, stdout_truncated, stream_note = read_interrupted_stdout(agents[agent_name], stdout_path, args.max_output_bytes)
         stderr, stderr_truncated = read_limited_text(stderr_path, args.max_output_bytes)
         exit_code = proc.returncode
         silent_note = agy_silent_exit_note(
@@ -2943,9 +3134,6 @@ def execute_agent_call(
         if silent_note:
             exit_code = 1
             stderr = f"{stderr.rstrip()}\n{silent_note}\n" if stderr.strip() else f"{silent_note}\n"
-            finish_journal(exit_code, error="exited 0 with no answer", silent_exit=True)
-        else:
-            finish_journal(exit_code)
         if stream_note:
             stderr = f"{stderr}\n{stream_note}" if stderr else stream_note
         stderr_plain = stderr
@@ -2958,9 +3146,6 @@ def execute_agent_call(
                     stdout_truncated = final_truncated
                     if proc.returncode == 0:
                         stderr_plain = ""
-        journal_call_answer(journal_dir, stdout)
-        args._call_run_id = journal_dir.name if journal_dir is not None else None
-
         result = {
             "agent": agent_name,
             "command": cmd,
@@ -2974,11 +3159,12 @@ def execute_agent_call(
             "stderr_truncated": stderr_truncated,
         }
         result.update(timeout_state)
+        if proc.returncode < 0:
+            result["killed_by_signal"] = -proc.returncode
         if silent_note:
             # Only a silent exit carries this, so no other outcome's shape moves.
             result["silent_exit"] = True
-        attach_session_result(args, agents[agent_name], result)
-        return result
+        return complete_result(result, **({"error": "exited 0 with no answer"} if silent_note else {}))
 
 
 def emit_dry_run_result(result: dict[str, Any], as_json: bool) -> None:
@@ -3054,6 +3240,8 @@ def emit_result(result: dict[str, Any], as_json: bool) -> None:
         eprint(stderr, end="" if stderr.endswith("\n") else "\n")
     if result.get("trace_id"):
         eprint(f"trace_id={result['trace_id']}")
+    if result.get("continue_command"):
+        eprint(f"continue: {result['continue_command']}")
 
 
 def show_run(run_id: str, as_json: bool, *, exit_with_result: bool = False) -> int:
@@ -3291,6 +3479,20 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
         advice.append("Rerun with --background so the run survives your tool's timeout: yoyo wait <id> --timeout 25 (repeat while exit 124).")
 
     notes: list[str] = []
+    continue_command = (result or {}).get("continue_command")
+    if not continue_command and mode != "call" and status != "running" and meta.get("pid"):
+        # A detached parent's stdout is its result.json. A fatal signal cannot
+        # rewrite that file safely; its call journal owns the recovered state.
+        for child in sorted(runs_root().iterdir(), reverse=True):
+            child_meta = run_meta(child)
+            if (child_meta and child_meta.get("mode") == "call" and child_meta.get("pid") == meta["pid"]
+                    and child_meta.get("pid_started") == meta.get("pid_started")
+                    and child_meta.get("trace_id") == meta.get("trace_id")):
+                continue_command = (run_result(child) or {}).get("continue_command")
+                if continue_command:
+                    break
+    if continue_command and not as_json:
+        advice.append("Continue with: " + continue_command)
     if stdout_bytes == 0 and default_buffers_output(str(agent or "")) and (result is None or result.get("exit_code") != 0):
         notes.append(f"{agent} buffers all stdout until completion: 0 bytes captured mid-run is normal, not a hang.")
 
@@ -3314,6 +3516,8 @@ def autopsy_run(run_id: str | None, as_json: bool) -> int:
         if timeout_exit:
             payload["timeout_clock"] = clock[0] if clock is not None else None
             payload["timeout_clock_s"] = clock[1] if clock is not None else None
+        if continue_command:
+            payload["continue_command"] = continue_command
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
@@ -5669,7 +5873,7 @@ THREAD_ERROR_TAIL_BYTES = 2_000
 THREAD_FINAL_STATUSES = ("answered", "failed", "timed_out", "interrupted", "recorded")
 
 _ACTIVE_THREAD_TURNS: dict[str, dict[str, Any]] = {}
-_ACTIVE_THREAD_TURNS_LOCK = threading.Lock()
+_ACTIVE_THREAD_TURNS_LOCK = threading.RLock()
 
 
 def threads_root() -> Path:
@@ -6669,6 +6873,21 @@ class _CodexActivity:
         self.expect_first = False
 
     def feed(self, line: str) -> list[str]:
+        event = _stream_event(line)
+        if event is not None:
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return []
+            kind = item.get("type")
+            if event["type"] == "item.started" and kind == "command_execution":
+                return ["$ " + _clip(str(item.get("command") or "command"))]
+            if event["type"] == "item.completed" and kind == "command_execution":
+                code = item.get("exit_code")
+                return [f"  (exited {code})"] if code not in (None, 0) else []
+            if event["type"] == "item.completed" and kind == "agent_message":
+                first = _first_text_line(item.get("text"))
+                return ["codex: " + _clip(first)] if first else []
+            return []
         stripped = line.strip()
         if stripped in CODEX_LOG_HEADERS:
             self.section = stripped
@@ -6776,9 +6995,8 @@ class _ClaudeActivity:
         return lines
 
 
-# Where each flavor writes the log the watch condenses: codex narrates on
-# stderr; claude's stdout is its stream-json.
-_LIVE_ACTIVITY_SOURCES = {"codex": "stderr.txt", "claude": "stdout.txt"}
+# Codex now streams JSON on stdout; keep reading stderr for older journals.
+_LIVE_ACTIVITY_SOURCES = {"codex": ("stdout.txt", "stderr.txt"), "claude": ("stdout.txt",)}
 
 
 class _TurnActivity:
@@ -6787,16 +7005,14 @@ class _TurnActivity:
     def __init__(self, turn: dict[str, Any], now: float, cwd: str | None = None) -> None:
         self.agent = str(turn.get("agent") or "agent")
         flavor = turn.get("flavor")
-        self.source = _LIVE_ACTIVITY_SOURCES.get(str(flavor))
+        sources = _LIVE_ACTIVITY_SOURCES.get(str(flavor), ())
+        self.streams = {name: {"offset": 0, "partial": b"", "skipping": False} for name in sources}
         self.condenser: _CodexActivity | _ClaudeActivity | None = None
         if flavor == "codex":
             self.condenser = _CodexActivity()
         elif flavor == "claude":
             self.condenser = _ClaudeActivity(self.agent, cwd)
         self.journal: Path | None = None
-        self.offset = 0
-        self.partial = b""
-        self.skipping = False
         self.last_line = now
         self.update(turn)
 
@@ -6809,25 +7025,31 @@ class _TurnActivity:
                 pass
 
     def _new_lines(self) -> list[str]:
-        if self.condenser is None or self.journal is None or self.source is None:
+        if self.condenser is None or self.journal is None:
             return []
+        lines: list[str] = []
+        for source, state in self.streams.items():
+            lines += self._stream_lines(source, state)
+        return lines
+
+    def _stream_lines(self, source: str, state: dict[str, Any]) -> list[str]:
         try:
-            with (self.journal / self.source).open("rb") as handle:
-                handle.seek(self.offset)
+            with (self.journal / source).open("rb") as handle:
+                handle.seek(state["offset"])
                 chunk = handle.read(THREAD_WATCH_READ_BYTES)
         except OSError:
             return []
-        self.offset += len(chunk)
-        data = self.partial + chunk
-        *complete, self.partial = data.split(b"\n")
-        if self.skipping and complete:
+        state["offset"] += len(chunk)
+        data = state["partial"] + chunk
+        *complete, state["partial"] = data.split(b"\n")
+        if state["skipping"] and complete:
             # The first complete piece is the tail of the line being skipped.
             complete = complete[1:]
-            self.skipping = False
-        if len(self.partial) > THREAD_WATCH_MAX_LINE_BYTES:
+            state["skipping"] = False
+        if len(state["partial"]) > THREAD_WATCH_MAX_LINE_BYTES:
             # Only bulk tool output (a whole file) runs this long; never hold it.
-            self.partial = b""
-            self.skipping = True
+            state["partial"] = b""
+            state["skipping"] = True
         lines: list[str] = []
         for raw in complete:
             # The same limit for a line completed within one read, so whether
@@ -8240,6 +8462,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--write", action="store_false", dest="read_only", help="Full access: the default outside --thread; a --thread turn needs it to edit, for that turn only")
     ask.add_argument("--agent-arg", action="append", help="Append a raw argument to the target agent command")
     ask.add_argument("--session", help="Use or create a named durable backend session")
+    ask.add_argument("--resume-run", help="Continue a full-access codex/claude run in its original backend session and cwd")
     ask.add_argument("--thread", help="Take one turn in a yoyo thread: the agent (a member) gets the thread's bounded history and its answer is recorded there. See `yoyo thread`")
     ask.add_argument("--history-bytes", type=int, default=None, help=f"With --thread: UTF-8 budget for the packed history (default {DEFAULT_THREAD_HISTORY_BYTES}, or YOYO_THREAD_HISTORY_BYTES)")
     ask.add_argument("--json", action="store_true", help="Emit a JSON result envelope")

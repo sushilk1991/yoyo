@@ -7947,7 +7947,7 @@ class ThreadTests(CliTestCase):
             with stdout.open("a", encoding="utf-8") as handle:
                 handle.write("y" * 500)  # a whole file in one tool result, far past the cap
             self.assertEqual(activity.pump(2.0, 2), [])
-            self.assertLessEqual(len(activity.partial), 200)
+            self.assertTrue(all(len(stream["partial"]) <= 200 for stream in activity.streams.values()))
             with stdout.open("a", encoding="utf-8") as handle:
                 handle.write('"}]}}\n' + tool_use("Edit", "/w/b.py"))
             self.assertEqual(activity.pump(3.0, 3), ["edit b.py"])
@@ -8368,6 +8368,264 @@ class ThreadTests(CliTestCase):
         code, _, stderr = self.cli(["thread", "export", "empty", "--format", "brief"])
         self.assertEqual(code, 2)
         self.assertIn("no turns to hand off", stderr)
+
+
+class InterruptedRunTests(CliTestCase):
+    def _native(self, vendor, script):
+        config = Path(self._state_guard.name) / 'agents.json'
+        config.write_text(json.dumps({'agents': {'native': {
+            'kind': vendor, 'command': ['python3', '-u', '-c', script]}}}))
+        return {'YOYO_CONFIG': str(config), 'YOYO_INTERRUPT_GRACE': '0.15'}
+
+    def _script(self, vendor):
+        backend = '11111111-1111-4111-8111-111111111111'
+        if vendor == 'codex':
+            events = [{'type': 'thread.started', 'thread_id': backend},
+                      {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'earlier message'}},
+                      {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'latest complete message'}}]
+        else:
+            events = [{'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}
+                      for text in ('earlier message', 'latest complete message')]
+        return 'import json,time; ' + '; '.join('print(' + repr(json.dumps(e)) + ',flush=True)' for e in events) + '; time.sleep(30)'
+
+    def test_killed_native_runs_keep_last_message_and_per_run_continuation(self):
+        for vendor in ('codex', 'claude'):
+            with self.subTest(vendor=vendor):
+                env = self._native(vendor, self._script(vendor))
+                before = set((Path(self._state_guard.name) / 'runs').glob('*'))
+                code, stdout, stderr = self.run_cli(['ask', 'native', '--json', '--timeout', '1', 'work'], env=env)
+                self.assertEqual(code, 124, stderr)
+                result = json.loads(stdout)
+                self.assertEqual(result['stdout'], 'latest complete message', result)
+                self.assertIn('--resume-run', result['continue_command'])
+                runs = set((Path(self._state_guard.name) / 'runs').iterdir()) - before
+                self.assertEqual(len(runs), 1)
+                record = runs.pop()
+                self.assertEqual((record/'answer.txt').read_text(), 'latest complete message')
+                saved = json.loads((record/'result.json').read_text())
+                self.assertTrue(saved['session']['backend_id'])
+                self.assertFalse((Path(self._state_guard.name)/'sessions.json').exists())
+                code, out, err = self.run_cli(['runs', 'autopsy', record.name], env=env)
+                self.assertEqual(code, 0, err)
+                self.assertIn(saved['continue_command'], out)
+                code, out, err = self.run_cli(['ask', 'native', '--resume-run', record.name, '--dry-run', '--json', 'continue'], env=env)
+                self.assertEqual(code, 0, err)
+                cmd = json.loads(out)['command']
+                self.assertIn(saved['session']['backend_id'], cmd)
+                self.assertIn('resume' if vendor == 'codex' else '--resume', cmd)
+
+    def test_full_access_native_sessions_are_automatic_but_read_only_stays_ephemeral(self):
+        for vendor, flag in (('codex', '--ephemeral'), ('claude', '--no-session-persistence')):
+            code, out, err = self.run_cli(['ask', vendor, '--dry-run', '--json', 'work'])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn(flag, json.loads(out)['command'])
+            code, out, err = self.run_cli(['ask', vendor, '--read-only', '--dry-run', '--json', 'review'])
+            self.assertEqual(code, 0, err)
+            self.assertIn(flag, json.loads(out)['command'])
+
+    def test_claude_interrupt_can_flush_final_result(self):
+        script = ('import signal,json,time,sys; '
+                  'signal.signal(signal.SIGINT,lambda *_:(print(json.dumps({"type":"result","result":"interrupted final"}),flush=True),sys.exit(0))); '
+                  'print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}),flush=True); time.sleep(30)')
+        env = self._native('claude', script)
+        code, out, err = self.run_cli(['ask', 'native', '--timeout', '1', '--json', 'work'], env=env)
+        self.assertEqual(code, 124, err)
+        self.assertEqual(json.loads(out)['stdout'], 'interrupted final')
+
+    def test_yoyo_signal_preserves_answer_and_continuation(self):
+        env = self._native('codex', self._script('codex'))
+        env = {**os.environ, **env, 'YOYO_STATE_DIR': self._state_guard.name, 'YOYO_DEFAULT_SKILLS': ''}
+        proc = subprocess.Popen([sys.executable, str(YOYO_PATH), 'ask', 'native', '--json', 'work'], env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            record = None
+            while time.monotonic() < deadline:
+                candidates = list((Path(self._state_guard.name)/'runs').glob('*/stdout.txt'))
+                if candidates and 'latest complete message' in candidates[0].read_text():
+                    record = candidates[0].parent
+                    break
+                time.sleep(.02)
+            self.assertIsNotNone(record)
+            proc.terminate()
+            proc.communicate(timeout=5)
+            self.assertEqual((record/'answer.txt').read_text(), 'latest complete message')
+            result = json.loads((record/'result.json').read_text())
+            self.assertTrue(result['continue_command'])
+            self.assertEqual(result['killed_by_signal'], 15)
+        finally:
+            if proc.poll() is None:
+                proc.kill(); proc.communicate()
+
+
+    def test_resume_run_validates_identity_permissions_and_flags(self):
+        record = Path(self._state_guard.name) / 'runs' / '20261117T120000-aabbccdd'
+        record.mkdir(parents=True)
+        meta = {'agent': 'codex', 'flavor': 'codex', 'cwd': str(ROOT), 'read_only': False, 'mode': 'call', 'pid': os.getpid()}
+        result = {'exit_code': 124, 'session': {'backend_id': '11111111-1111-4111-8111-111111111111', 'scope': 'run'}}
+        (record/'meta.json').write_text(json.dumps(meta))
+        (record/'result.json').write_text(json.dumps(result))
+        base = ['ask', 'codex', '--resume-run', record.name, '--dry-run', '--json']
+        code, out, err = self.run_cli(base + ['continue'])
+        self.assertEqual(code, 0, err)
+        for flags, message in ((['--read-only'], 'full-access'), (['--session', 'named'], '--session'),
+                               (['--thread', 't'], '--thread'), (['--cwd', '/tmp'], 'cwd')):
+            with self.subTest(flags=flags):
+                code, out, err = self.run_cli(base + flags + ['continue'])
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+        code, out, err = self.run_cli(['ask', 'claude', '--resume-run', record.name, '--dry-run', 'continue'])
+        self.assertEqual(code, 2)
+        self.assertIn('agent', err)
+        code, out, err = self.run_cli(['ask', 'codex,claude', '--resume-run', record.name, '--dry-run', 'continue'])
+        self.assertEqual(code, 2)
+        self.assertIn('single agent', err)
+        result['session']['backend_id'] = 'invalid backend id'
+        (record/'result.json').write_text(json.dumps(result))
+        code, out, err = self.run_cli(base + ['continue'])
+        self.assertEqual(code, 2)
+        self.assertIn('backend', err)
+        (record/'result.json').unlink()
+        code, out, err = self.run_cli(base + ['continue'])
+        self.assertEqual(code, 2)
+        self.assertIn('still running', err)
+        meta['pid'] = 99999999
+        (record/'meta.json').write_text(json.dumps(meta))
+        code, out, err = self.run_cli(base + ['continue'])
+        self.assertEqual(code, 2)
+        self.assertIn('session', err)
+
+    def test_background_timeout_wait_and_autopsy_keep_continuation(self):
+        env = self._native('codex', self._script('codex'))
+        code, out, err = self.run_cli(['ask', 'native', '--timeout', '1', '--background', 'work'], env=env)
+        self.assertEqual(code, 0, err)
+        run_id = out.strip()
+        code, out, err = self.run_cli(['wait', run_id, '--json', '--timeout', '5', '--poll', '.02'], env=env)
+        self.assertEqual(code, 1, out + err)  # wait reserves 124 for a live poll
+        result = json.loads(out)
+        self.assertEqual(result['exit_code'], 124)
+        self.assertEqual(result['stdout'], 'latest complete message', result)
+        self.assertIn('--resume-run', result['continue_command'])
+        code, out, err = self.run_cli(['runs', 'autopsy', run_id], env=env)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count(result['continue_command']), 1)
+
+    def test_synthesized_calls_do_not_auto_persist_sessions(self):
+        for vendor, flag in (('codex', '--ephemeral'), ('claude', '--no-session-persistence')):
+            code, out, err = self.run_cli(['ask', vendor, '--dry-run', '--json', 'work'])
+            self.assertEqual(code, 0, err)
+            command = json.loads(out)['command']
+            self.assertNotIn(flag, command)
+            args = argparse.Namespace(agent=vendor, cwd=str(ROOT), read_only=False, model=None, agent_arg=[], dry_run=True,
+                                      trace_id='test', timeout=60, max_output_bytes=1024)
+            result = yoyo.execute_agent_call(vendor, args, 'work', yoyo.DEFAULT_AGENTS)
+            self.assertIn(flag, result['command'])
+
+    def test_codex_json_watch_keeps_historical_log_support(self):
+        activity = yoyo._CodexActivity()
+        event = {'type': 'item.started', 'item': {'type': 'command_execution', 'command': 'python3 check.py'}}
+        self.assertEqual(activity.feed(json.dumps(event)), ['$ python3 check.py'])
+        event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'Finished the check'}}
+        self.assertEqual(activity.feed(json.dumps(event)), ['codex: Finished the check'])
+        record = Path(self._state_guard.name) / 'runs' / '20261117T120000-aabbccdd'
+        record.mkdir(parents=True)
+        (record/'stdout.txt').write_text(json.dumps(event) + '\n')
+        turn = yoyo._TurnActivity({'agent': 'codex', 'flavor': 'codex', 'run_id': record.name}, 0)
+        with mock.patch.dict(os.environ, {'YOYO_STATE_DIR': self._state_guard.name}):
+            turn.journal = record
+            self.assertEqual(turn.pump(1, 1), ['codex: Finished the check'])
+
+
+    def test_agent_signal_death_recovers_last_complete_message(self):
+        for vendor in ('codex', 'claude'):
+            with self.subTest(vendor=vendor):
+                script = self._script(vendor).replace('time.sleep(30)', 'import os,signal; os.kill(os.getpid(),signal.SIGTERM)')
+                env = self._native(vendor, script)
+                code, out, err = self.run_cli(['ask', 'native', '--json', 'work'], env=env)
+                self.assertEqual(code, -15, err)
+                result = json.loads(out)
+                self.assertEqual(result['stdout'], 'latest complete message')
+                self.assertEqual(result['killed_by_signal'], 15)
+                self.assertIn('--resume-run', result['continue_command'])
+                command = shlex.split(result['continue_command'])
+                self.assertIn(str(YOYO_PATH), command)
+                self.assertIn(sys.executable, command)
+
+    def test_invalid_shutdown_grace_does_not_launch_agent(self):
+        for clock in ('YOYO_INTERRUPT_GRACE', 'YOYO_TERMINATE_GRACE'):
+            with self.subTest(clock=clock), mock.patch.object(yoyo.subprocess, 'Popen') as spawn:
+                env = self._native('claude', self._script('claude'))
+                env[clock] = 'not-a-duration'
+                code, out, err = self.run_cli(['ask', 'native', 'work'], env=env)
+                self.assertEqual(code, 2)
+                self.assertIn(clock, err)
+                spawn.assert_not_called()
+
+
+    def test_signalled_background_parent_autopsy_finds_call_continuation(self):
+        env = self._native('codex', self._script('codex'))
+        code, out, err = self.run_cli(['ask', 'native', '--background', 'work'], env=env)
+        self.assertEqual(code, 0, err)
+        parent = Path(self._state_guard.name) / 'runs' / out.strip()
+        pid = json.loads((parent/'meta.json').read_text())['pid']
+        try:
+            deadline = time.monotonic() + 5
+            record = None
+            while time.monotonic() < deadline:
+                candidates = list(parent.parent.glob('*/stdout.txt'))
+                if candidates and 'latest complete message' in candidates[0].read_text():
+                    record = candidates[0].parent
+                    break
+                time.sleep(.02)
+            self.assertIsNotNone(record)
+            os.kill(pid, 15)
+            while time.monotonic() < deadline:
+                try:
+                    reaped, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if reaped:
+                    break
+                time.sleep(.02)
+            saved = json.loads((record/'result.json').read_text())
+            self.assertEqual(saved['killed_by_signal'], 15)
+            self.assertEqual((parent/'result.json').read_text(), '')
+            code, out, err = self.run_cli(['runs', 'autopsy', parent.name, '--json'], env=env)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(out)['continue_command'], saved['continue_command'])
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+    def test_yoyo_signal_allows_claude_to_flush_final_result(self):
+        script = ('import signal,json,time,sys; '
+                  'signal.signal(signal.SIGINT,lambda *_:(print(json.dumps({"type":"result","result":"signal final"}),flush=True),sys.exit(0))); '
+                  'print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"ready"}]}}),flush=True); time.sleep(30)')
+        env = {**os.environ, **self._native('claude', script), 'YOYO_STATE_DIR': self._state_guard.name, 'YOYO_DEFAULT_SKILLS': ''}
+        proc = subprocess.Popen([sys.executable, str(YOYO_PATH), 'ask', 'native', '--json', 'work'], env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            record = None
+            while time.monotonic() < deadline:
+                candidates = list((Path(self._state_guard.name)/'runs').glob('*/stdout.txt'))
+                if candidates and 'ready' in candidates[0].read_text():
+                    record = candidates[0].parent
+                    break
+                time.sleep(.02)
+            self.assertIsNotNone(record)
+            proc.terminate()
+            proc.communicate(timeout=5)
+            self.assertEqual((record/'answer.txt').read_text(), 'signal final')
+            result = json.loads((record/'result.json').read_text())
+            self.assertEqual(result['killed_by_signal'], 15)
+            self.assertIn('--resume-run', result['continue_command'])
+        finally:
+            if proc.poll() is None:
+                proc.kill(); proc.communicate()
 
 
 if __name__ == "__main__":

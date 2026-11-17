@@ -26,6 +26,8 @@ yoyo wait "$run_id" --timeout 25    # 124 = still running, call wait again
 
 `--background` works on `ask`, `loop`, `research`, and `review`.
 
+Full-access Codex and Claude asks keep a native session in the run ledger, without adding a named session. On a Yoyo deadline or fatal signal, `answer.txt` keeps the last complete message (Claude's flushed final result and Codex's final-message file take precedence). A timeout still fails with exit 124; the envelope, text output and `yoyo runs autopsy RUN_ID` print one `continue_command` you can paste. Background `wait` carries it too. Use `yoyo ask AGENT --cwd ORIGINAL_CWD --resume-run RUN_ID "Continue the interrupted task."`; the original agent/backend, cwd and full-access permissions must match. Do not combine it with `--session`, `--thread` or fan-out, or resume a running run. Read-only calls and internal fresh-context calls remain ephemeral. Claude gets SIGINT grace before TERM/KILL at a deadline or fatal Yoyo signal; `YOYO_INTERRUPT_GRACE` (10s) and `YOYO_TERMINATE_GRACE` (2s) override those positive finite clocks. SIGKILL cannot flush a journal.
+
 ### The two timeouts are not the same flag
 
 `yoyo wait --timeout 25` bounds **your poll**. It is safe: 124 means still running, and you call it again. `yoyo ask --timeout N` bounds **the agent's entire task**, and at N seconds kills it mid-thought.
