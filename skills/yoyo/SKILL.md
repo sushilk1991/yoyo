@@ -30,9 +30,11 @@ yoyo wait "$run_id" --timeout 25    # 124 = still running, call wait again
 
 `yoyo wait --timeout 25` bounds **your poll**. It is safe: 124 means still running, and you call it again. `yoyo ask --timeout N` bounds **the agent's entire task**, and at N seconds kills it mid-thought.
 
-So do not pass `--timeout` or `--idle-timeout` to `ask`, `review`, or `research`. Their defaults sit deliberately far above any real call. In this machine's run ledger 145 of the 186 killed calls died on a hard `--timeout` a caller had typed — 300s, 180s, 600s, 900s, always a round number — and not one died on the default. Against a p90 call length of 13 minutes, a 5-minute budget is not a safety net, it is the failure.
+So do not pass `--timeout` or `--idle-timeout` to `ask`, `review`, or `research`. Their defaults sit deliberately far above any real call. In an earlier sample of this machine's run ledger, 145 of the 186 killed calls died on a hard `--timeout` a caller had typed — 300s, 180s, 600s, 900s, always a round number — and not one died on the default. Against a p90 call length of 13 minutes, a 5-minute budget is not a safety net, it is the failure.
 
 `--background` does not protect you from this: the detached child inherits the `--timeout` you passed and dies on schedule, having captured nothing.
+
+With no `--timeout` or `YOYO_TIMEOUT`, the four-hour default is a soft deadline: captured output within the last 30 minutes earns a one-hour extension, up to `YOYO_MAX_RUNTIME` (12 hours by default). Each extension is printed and recorded as `timeout_extensions`. Output shows activity, not progress. Buffered agents keep the hard default. Explicit budgets stay hard in foreground, background, reviews, research and loop iterations. Autopsy/audit name quiet soft deadlines and the absolute ceiling separately. `YOYO_SOFT_TIMEOUT`, `YOYO_SOFT_EXTENSION` and `YOYO_SOFT_ACTIVITY_WINDOW` override those seconds; use isolated state when testing short clocks.
 
 If an outer contract genuinely forces a bound, put it above the p99 — 1800s or more — and never below it because the call "should be quick".
 
@@ -189,7 +191,7 @@ Share context instead of paying for it repeatedly: write a dense repo brief once
 
 It stops on `STATUS: DONE` in the state file, a `STOP` file, `--max-iter`, or `--max-fail` consecutive crashed iterations (which exits 1 — a human should look).
 
-A loop is the one place a runtime bound earns its keep: `--timeout` bounds a single iteration, and without one a wedged iteration holds the whole run for the four-hour default while `--max-fail` waits on a return that never comes. Set it well above a normal iteration — 1800s or more — never at one.
+A loop is the one place a runtime bound earns its keep: `--timeout` bounds a single iteration, and without one a silent wedged iteration holds the whole run until the four-hour default soft deadline while `--max-fail` waits on a return that never comes. Set it well above a normal iteration — 1800s or more — never at one.
 
 Three files shape a good loop, and each earns its place:
 

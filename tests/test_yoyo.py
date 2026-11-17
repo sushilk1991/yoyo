@@ -4229,6 +4229,274 @@ class TimeoutHelpGuardTests(CliTestCase):
         self.assertNotIn("use --timeout", self.flag_help("ask", "--idle-timeout").lower())
 
 
+class SoftTimeoutTests(CliTestCase):
+    """The default deadline renews while captured output grows (plan item 1).
+
+    Every clock is shrunk to seconds through the environment: the soft
+    deadline, its extension and activity window, and the YOYO_MAX_RUNTIME
+    ceiling. An explicit --timeout or YOYO_TIMEOUT stays a hard kill, and a
+    buffering agent keeps the hard default because it cannot show activity.
+    """
+
+    def _script_agent(self, tmp, body, name="agent.py"):
+        path = Path(tmp) / name
+        path.write_text(body, encoding="utf-8")
+        return f"python3 {path}"
+
+    def _chatty_agent(self, tmp, duration, name="chatty.py"):
+        body = (
+            "import sys, time\n"
+            "sys.stdin.read()\n"
+            f"end = time.monotonic() + {duration}\n"
+            "while time.monotonic() < end:\n"
+            "    print('tick', flush=True)\n"
+            "    time.sleep(0.1)\n"
+            "print('final-answer', flush=True)\n"
+        )
+        return self._script_agent(tmp, body, name)
+
+    def _quiet_agent(self, tmp, name="quiet.py"):
+        body = (
+            "import sys, time\n"
+            "sys.stdin.read()\n"
+            "print('started', flush=True)\n"
+            "time.sleep(6)\n"
+            "print('final-answer', flush=True)\n"
+        )
+        return self._script_agent(tmp, body, name)
+
+    def _soft_env(self, tmp, agent_env, **overrides):
+        env = {
+            "YOYO_STATE_DIR": tmp,
+            "YOYO_TIMEOUT": None,
+            "YOYO_SOFT_TIMEOUT": "0.6",
+            "YOYO_SOFT_EXTENSION": "0.6",
+            "YOYO_SOFT_ACTIVITY_WINDOW": "0.4",
+            "YOYO_MAX_RUNTIME": "60",
+        }
+        env.update(agent_env)
+        env.update(overrides)
+        return env
+
+    def _latest_call_result(self, state_dir):
+        candidates = []
+        for run_dir in (Path(state_dir) / "runs").iterdir():
+            meta_path, result_path = run_dir / "meta.json", run_dir / "result.json"
+            if meta_path.exists() and result_path.exists():
+                if json.loads(meta_path.read_text(encoding="utf-8")).get("mode") == "call":
+                    candidates.append(result_path)
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        return json.loads(latest.read_text(encoding="utf-8"))
+
+    def test_chatty_agent_outlives_soft_deadline_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(tmp, {"YOYO_AGENT_CHATTY": self._chatty_agent(tmp, 1.5)})
+
+            code, stdout, stderr = self.run_cli(["ask", "chatty", "--json", "hello"], env=env)
+
+            self.assertEqual(code, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertIn("final-answer", payload["stdout"])
+            self.assertGreaterEqual(payload["timeout_extensions"], 1)
+            self.assertIn("soft deadline extended", stderr)
+            recorded = self._latest_call_result(tmp)
+            self.assertGreaterEqual(recorded["timeout_extensions"], 1)
+
+    def test_chatty_agent_outlives_soft_deadline_in_background(self):
+        # The runs this feature exists for were launched detached, so the
+        # renewal has to survive background argv synthesis and `yoyo wait`.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(tmp, {"YOYO_AGENT_CHATTY": self._chatty_agent(tmp, 1.5)})
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "chatty", "--background", "--json", "hello"], env=env
+            )
+            self.assertEqual(code, 0, stderr)
+            launched = json.loads(stdout)
+
+            code, stdout, stderr = self.run_cli(
+                ["wait", launched["run_id"], "--timeout", "10", "--poll", "0.05"], env=env
+            )
+            self.assertEqual(code, 0, stderr)
+            recorded = json.loads(
+                (Path(launched["run_dir"]) / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertGreaterEqual(recorded["timeout_extensions"], 1)
+
+    def test_quiet_agent_is_killed_at_soft_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(
+                tmp,
+                {"YOYO_AGENT_QUIET": self._quiet_agent(tmp)},
+                YOYO_SOFT_TIMEOUT="0.8",
+            )
+
+            code, stdout, stderr = self.run_cli(["ask", "quiet", "--json", "hello"], env=env)
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertTrue(payload["timed_out"])
+            self.assertEqual(payload["timeout_clock"], "soft-timeout")
+            self.assertEqual(payload["timeout_extensions"], 0)
+            self.assertAlmostEqual(payload["timeout_s"], 0.8)
+            self.assertIn("soft deadline", payload["stderr"])
+            self.assertLess(payload["duration_s"], 5)
+            recorded = self._latest_call_result(tmp)
+            self.assertEqual(recorded["timeout_clock"], "soft-timeout")
+            self.assertEqual(recorded["timeout_extensions"], 0)
+
+            code, stdout, stderr = self.run_cli(["runs", "autopsy", "--json"], env=env)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(json.loads(stdout)["timeout_clock"], "soft-timeout")
+
+    def test_chatty_agent_is_stopped_at_max_runtime_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(
+                tmp,
+                {"YOYO_AGENT_CHATTY": self._chatty_agent(tmp, 6)},
+                YOYO_MAX_RUNTIME="1.5",
+            )
+
+            code, stdout, stderr = self.run_cli(["ask", "chatty", "--json", "hello"], env=env)
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertTrue(payload["timed_out"])
+            self.assertEqual(payload["timeout_clock"], "max-runtime")
+            self.assertGreaterEqual(payload["timeout_extensions"], 1)
+            self.assertAlmostEqual(payload["timeout_s"], 1.5)
+            self.assertIn("YOYO_MAX_RUNTIME", payload["stderr"])
+            self.assertLess(payload["duration_s"], 5)
+            recorded = self._latest_call_result(tmp)
+            self.assertEqual(recorded["timeout_clock"], "max-runtime")
+
+    def test_explicit_timeout_flag_kills_chatty_agent_without_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(tmp, {"YOYO_AGENT_CHATTY": self._chatty_agent(tmp, 6)})
+
+            code, stdout, stderr = self.run_cli(
+                ["ask", "chatty", "--json", "--timeout", "0.5", "hello"], env=env
+            )
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--timeout")
+            self.assertEqual(payload.get("timeout_extensions", 0), 0)
+            self.assertAlmostEqual(payload["timeout_s"], 0.5)
+            self.assertNotIn("soft deadline extended", stderr)
+            self.assertLess(payload["duration_s"], 3)
+
+    def test_yoyo_timeout_env_is_hard_without_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(
+                tmp,
+                {"YOYO_AGENT_CHATTY": self._chatty_agent(tmp, 6)},
+                YOYO_TIMEOUT="0.5",
+            )
+
+            code, stdout, stderr = self.run_cli(["ask", "chatty", "--json", "hello"], env=env)
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--timeout")
+            self.assertEqual(payload.get("timeout_extensions", 0), 0)
+            self.assertLess(payload["duration_s"], 3)
+
+    def test_buffering_agent_keeps_hard_default_deadline(self):
+        # pi buffers its output until it exits, so it can never show the
+        # growth a renewal is granted for; the default stays a hard kill
+        # even when this stand-in happens to write bytes early.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._soft_env(tmp, {"YOYO_AGENT_PI": self._chatty_agent(tmp, 6)})
+
+            code, stdout, stderr = self.run_cli(["ask", "pi", "--json", "hello"], env=env)
+
+            self.assertEqual(code, 124, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["timeout_clock"], "--timeout")
+            self.assertEqual(payload.get("timeout_extensions", 0), 0)
+            self.assertAlmostEqual(payload["timeout_s"], 0.6)
+            self.assertLess(payload["duration_s"], 3)
+
+    def test_audit_distinguishes_soft_and_ceiling_clocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for run_id, clock in (
+                ("20260101T000001-aaaa", "soft-timeout"),
+                ("20260101T000002-bbbb", "max-runtime"),
+            ):
+                run_dir = Path(tmp) / "runs" / run_id
+                run_dir.mkdir(parents=True)
+                meta = {
+                    "run_id": run_id,
+                    "mode": "call",
+                    "agent": "codex",
+                    "started_at": yoyo.iso_utc(yoyo.utc_now()),
+                }
+                result = {
+                    "exit_code": 124,
+                    "duration_s": 10.0,
+                    "timed_out": True,
+                    "timeout_s": 10.0,
+                    "timeout_clock": clock,
+                    "timeout_extensions": 2,
+                }
+                (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+                (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+
+            code, stdout, stderr = self.run_cli(
+                ["runs", "audit", "--json"], env={"YOYO_STATE_DIR": tmp}
+            )
+            self.assertEqual(code, 0, stderr)
+            outcomes = json.loads(stdout)["agents"][0]["outcomes"]
+            self.assertEqual(outcomes["soft-timeout"], 1)
+            self.assertEqual(outcomes["max-runtime"], 1)
+            self.assertEqual(outcomes["hard-timeout"], 0)
+
+    def test_explicit_timeout_survives_synthesized_args_and_background_argv(self):
+        # Review/research/loop rebuild the call args and background runs
+        # rebuild argv; "the caller chose this timeout" must survive both,
+        # or an explicit budget quietly becomes renewable.
+        base = argparse.Namespace(
+            cwd=".", agent="echo", caller="test", trace_id="t1", timeout=5.0,
+            max_input_bytes=1024, max_output_bytes=1024, model=None,
+            dry_run=False, quiet=True, read_only=False, idle_timeout=None,
+            agent_arg=[], skill=[], max_iter=3, verify=None,
+            _raw_argv=["ask", "echo", "--timeout", "5", "hi"],
+        )
+        base._timeout_explicit = yoyo.timeout_is_explicit(base)
+        self.assertTrue(base._timeout_explicit)
+        self.assertTrue(
+            yoyo.timeout_is_explicit(yoyo.review_call_args(base, "echo", "review", "p", "r"))
+        )
+        self.assertTrue(
+            yoyo.timeout_is_explicit(yoyo.research_call_args(base, "echo", "p", "r"))
+        )
+        self.assertTrue(
+            yoyo.timeout_is_explicit(
+                yoyo.loop_iteration_args(base, 1, yoyo.DEFAULT_AGENTS["codex"], "task", Path("state.md"))
+            )
+        )
+        child = yoyo.background_child_argv(base)
+        self.assertIn("--timeout", child)
+        self.assertTrue(
+            yoyo.timeout_is_explicit(argparse.Namespace(_raw_argv=child))
+        )
+
+        implicit = argparse.Namespace(
+            cwd=".", _raw_argv=["ask", "echo", "hi"],
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOYO_TIMEOUT", None)
+            self.assertFalse(yoyo.timeout_is_explicit(implicit))
+            implicit_child = yoyo.background_child_argv(
+                argparse.Namespace(cwd=".", trace_id="t2", _raw_argv=["ask", "echo", "hi"])
+            )
+            self.assertNotIn("--timeout", implicit_child)
+            self.assertFalse(
+                yoyo.timeout_is_explicit(argparse.Namespace(_raw_argv=implicit_child))
+            )
+
+
 class CliCompatibilityTests(CliTestCase):
     """Exercise native launches and caller guidance without vendor inference."""
 
@@ -4909,7 +5177,9 @@ class SkillGuardTests(CliTestCase):
                 "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
             }
 
-            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            # This checks skill integrity, independently of installed vendor CLIs.
+            with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
             self.assertEqual(code, 0, stderr + stdout)
             self.assertIn("skill yoyo: in sync (1 homes)", stdout)
 
@@ -4999,7 +5269,9 @@ class SkillGuardTests(CliTestCase):
                 "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
             }
 
-            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            # This checks skill integrity, independently of installed vendor CLIs.
+            with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
             self.assertEqual(code, 0, stderr + stdout)
             self.assertNotIn("no-ai-slop", stdout)
 
@@ -6209,7 +6481,9 @@ class ReviewFixTests(CliTestCase):
                 "YOYO_CONFIG": str(Path(tmp) / "missing.json"),
             }
 
-            code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
+            # This checks skill integrity, independently of installed vendor CLIs.
+            with mock.patch.object(yoyo.shutil, "which", return_value="/fake/agent"):
+                code, stdout, stderr = self.run_cli(["doctor", "--strict"], env=env)
             self.assertEqual(code, 0, stderr + stdout)
             self.assertNotIn("yoyodyne", stdout)
             self.assertNotIn("yoyo2", stdout)
