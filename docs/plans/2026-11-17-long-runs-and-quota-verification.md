@@ -3,7 +3,8 @@
 Branch: `feat/long-runs-and-quota`. No push, tag, release or installation.
 
 All tests and trials use isolated `YOYO_STATE_DIR` directories. Linux suites
-run through `boxrun` on retained Instabox `build`, scheduled by remote Baton.
+run through `boxrun` on retained Instabox `build` (items1–3) and `masonry`
+(items4–6), scheduled by remote Baton.
 Native vendor probes run locally against the installed authenticated CLIs;
 credentials are not copied to the test box. Raw captures remain in the ignored
 `.yoyo/long-runs/evidence/` directory. No retention or prune touches the real ledger.
@@ -231,6 +232,59 @@ OK
 .........
 ----------------------------------------------------------------------
 Ran 9 tests in 0.057s
+
+OK
+```
+
+
+## Item 5 - reported tokens and audit percentiles
+
+Tests added: `TokenUsageTests` (6) and `TokenAuditTests` (3). They cover final
+Claude usage with both cache components; Codex structured usage and grouped
+human trailers; absent/invalid/zero usage; interrupted journals; finite bounded
+stream snapshots; provider-model precedence; agent/model percentiles; sample
+denominators; and no parent/mirror double counting. Initial parser red:4 tests,
+3 errors; initial audit red:3 tests, 3 errors. Combined focused green, including
+12 existing audit tests:21 tests,1.256s, OK.
+
+Actual isolated read-only Yoyo calls, one per native vendor, comparing both the
+JSON envelope and saved result against the native final usage:
+
+```json
+{"vendor": "codex", "exit_code": 0, "native_usage": {"input_tokens": 36622, "cached_input_tokens": 7040, "cache_write_input_tokens": 0, "output_tokens": 6, "reasoning_output_tokens": 0}, "recorded_tokens": {"input": 36622, "output": 6, "cached": 7040, "total": 36628}, "expected_total": 36628, "matches": true, "journal_matches": true}
+{"vendor": "claude", "exit_code": 0, "native_usage": {"input_tokens": 2, "cache_creation_input_tokens": 14266, "cache_read_input_tokens": 3223, "output_tokens": 12, "output_tokens_details": {"thinking_tokens": 0}, "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0}, "service_tier": "standard", "cache_creation": {"ephemeral_1h_input_tokens": 14266, "ephemeral_5m_input_tokens": 0}, "inference_geo": "global", "iterations": [{"input_tokens": 2, "output_tokens": 12, "cache_read_input_tokens": 3223, "cache_creation_input_tokens": 14266, "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 14266}, "type": "message"}], "speed": "standard", "fallback_credit": null}, "recorded_tokens": {"input": 17491, "output": 12, "cached": 3223, "total": 17503}, "expected_total": 17503, "matches": true, "journal_matches": true}
+```
+
+Both totals matched: Codex36,628 and Claude17,503. Claude input includes cache
+creation and reads; cached reads are a subset and are not added to total twice.
+No inference is made for an unreported model or token component. No dollar
+figures are recorded.
+
+These are CLI-reported usage snapshots, not a promise of exact per-call billing.
+The [current Codex implementation](https://github.com/openai/codex/blob/main/codex-rs/exec/src/event_processor_with_jsonl_output.rs)
+uses cumulative totals, so the latest completion wins and resumed counts can
+include earlier thread usage. Claude's [result usage definition](https://code.claude.com/docs/en/agent-sdk/cost-tracking#get-the-total-cost-of-a-query)
+covers its main loop and excludes subagents. The implementation follows the
+brief's named final events and documents those provider limits. Answer-size
+limits do not truncate usage parsing; unflushed interrupted usage stays unknown.
+
+Full remote gate output (`python3 -m py_compile bin/yoyo`: silent, exit0):
+
+```text
+boxrun: masonry:/data/workspace/yoyo-2c067b94/
+.....................
+----------------------------------------------------------------------
+Ran 21 tests in 1.256s
+
+OK
+.............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 589 tests in 59.349s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.064s
 
 OK
 ```

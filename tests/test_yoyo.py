@@ -9120,5 +9120,168 @@ class RouteDoctorTests(CliTestCase):
         probe.assert_not_called()
 
 
+# Usage samples captured from codex-cli 0.169.0 and Claude Code 2.1.326 on 2026-11-17.
+class TokenUsageTests(CliTestCase):
+    def _sample(self,vendor,events,stderr=''):
+        config=Path(self._state_guard.name)/'agents.json'
+        script='import sys; '+('; '.join('print('+repr(json.dumps(e))+')' for e in events) if events else "print('plain answer')")
+        if stderr:script+='; print('+repr(stderr)+',file=sys.stderr)'
+        config.write_text(json.dumps({'agents':{'native':{'kind':vendor,'command':['python3','-c',script]}}}))
+        code,out,err=self.run_cli(['ask','native','--json','--model','chosen-model','work'],env={'YOYO_CONFIG':str(config)})
+        self.assertEqual(code,0,err)
+        return json.loads(out)
+
+    def test_claude_usage_includes_cache_creation_and_read_input(self):
+        row=self._sample('claude',[{'type':'system','subtype':'init','model':'provider-reported-model'},
+                                  {'type':'assistant','message':{'usage':{'input_tokens':999999}}},
+                                  {'type':'result','result':'earlier','usage':{'input_tokens':1,'output_tokens':1}},
+                                  {'type':'result','result':'answer','usage':{
+            'input_tokens':2,'cache_creation_input_tokens':4491,'cache_read_input_tokens':2290,'output_tokens':452}}])
+        self.assertEqual(row['tokens'],{'input':6783,'output':452,'cached':2290,'total':7235})
+        self.assertEqual(row['model'],'provider-reported-model')
+        record=sorted((Path(self._state_guard.name)/'runs').iterdir())[-1]
+        self.assertEqual(json.loads((record/'result.json').read_text())['tokens'],row['tokens'])
+        self.assertEqual(json.loads((record/'result.json').read_text())['model'],'provider-reported-model')
+        self.assertEqual(json.loads((record/'meta.json').read_text())['model'],'chosen-model')
+        for cache,expected_input in (({},5),({'cache_creation_input_tokens':None},None),
+                                     ({'cache_read_input_tokens':True},None)):
+            with self.subTest(cache=cache):
+                row=self._sample('claude',[{'type':'result','result':'answer','usage':{'input_tokens':5,'output_tokens':3,**cache}}])
+                self.assertEqual(row['tokens']['input'],expected_input)
+                self.assertEqual(row['tokens']['total'],8 if expected_input is not None else None)
+                self.assertIsNone(row['tokens']['cached'])
+
+    def test_codex_completed_usage_counts_cached_as_subset(self):
+        row=self._sample('codex',[{'type':'item.completed','item':{'type':'agent_message','text':'answer'}},
+                                 {'type':'turn.completed','usage':{'input_tokens':100,'cached_input_tokens':20,'output_tokens':5}},
+                                 {'type':'turn.completed','usage':{'input_tokens':75295,'cached_input_tokens':49792,'output_tokens':78}}],
+                         stderr='tokens used\n999999')
+        self.assertEqual(row['tokens'],{'input':75295,'output':78,'cached':49792,'total':75373})
+        self.assertNotIn('model',row)
+        row=self._sample('codex',[{'type':'turn.completed','usage':{'input_tokens':0,'output_tokens':0}}])
+        self.assertEqual(row['tokens'],{'input':0,'output':0,'cached':None,'total':0})
+
+    def test_codex_tokens_used_trailer_preserves_unknown_breakdown(self):
+        row=self._sample('codex',[],stderr='tokens used\n1,51,040')
+        self.assertEqual(row['tokens'],{'input':None,'output':None,'cached':None,'total':151040})
+        for trailer,total in (('1,234,567',1234567),('1234567',1234567),('0',0)):
+            with self.subTest(trailer=trailer):
+                row=self._sample('codex',[],stderr='tokens used\n'+trailer)
+                self.assertEqual(row['tokens']['total'],total)
+        for trailer in ('1,,000','tokens used\n100\nlater error','1.5','9'*5000):
+            with self.subTest(trailer=trailer[:40]):
+                row=self._sample('codex',[],stderr='tokens used\n'+trailer)
+                self.assertNotIn('tokens',row)
+
+    def test_absent_usage_stays_absent(self):
+        for vendor,terminal in (('claude','result'),('codex','turn.completed')):
+            for usage in (None,{},'bad',{'input_tokens':True,'output_tokens':-1},
+                          {'input_tokens':1.5,'output_tokens':'3'},{'input_tokens':float('nan')},
+                          {'input_tokens':None,'output_tokens':None}):
+                with self.subTest(vendor=vendor,usage=usage):
+                    row=self._sample(vendor,[{'type':terminal,'result':'answer','usage':usage}])
+                    self.assertNotIn('tokens',row)
+
+    def test_usage_read_is_bounded_and_ignores_nested_or_incomplete_events(self):
+        state=Path(self._state_guard.name)
+        stdout=state/'usage-stdout';stderr=state/'usage-stderr';stderr.write_text('')
+        event={'type':'result','usage':{'input_tokens':7,'output_tokens':3}}
+        nested={'type':'result','parent_tool_use_id':'child','usage':{'input_tokens':999,'output_tokens':999}}
+        stdout.write_text('x'*2000+'\n'+json.dumps(event)+'\n'+json.dumps(nested)+'\n{"type":"result"')
+        agent=yoyo.AgentSpec(name='native',command=['claude'],flavor='claude')
+        with mock.patch.object(yoyo,'STREAM_EVENT_MAX_BYTES',256):
+            row=yoyo.read_call_usage(agent,stdout,stderr)
+        self.assertEqual(row['tokens']['total'],10)
+        stdout.write_text(json.dumps(event)+'\n')
+        decode=yoyo._stream_event
+        def append_while_reading(line):
+            with stdout.open('a') as handle:
+                handle.write(json.dumps({'type':'result','usage':{'input_tokens':999,'output_tokens':999}})+'\n')
+            return decode(line)
+        with mock.patch.object(yoyo,'_stream_event',side_effect=append_while_reading) as parse:
+            self.assertEqual(yoyo.read_call_usage(agent,stdout,stderr)['tokens']['total'],10)
+            self.assertEqual(parse.call_count,1)
+        handle=io.BytesIO(b'x'*3000+b'\nlate appended data\n')
+        self.assertEqual(list(yoyo._bounded_lines(handle,128,end=3000)),[None])
+        self.assertEqual(handle.tell(),3000)
+        stdout.write_text(json.dumps({'type':'assistant','message':{'usage':{'input_tokens':100,'output_tokens':10}}})+'\n')
+        self.assertNotIn('tokens',yoyo.read_call_usage(agent,stdout,stderr))
+
+    def test_interrupted_run_keeps_flushed_usage_in_result_and_journal(self):
+        config=Path(self._state_guard.name)/'agents.json'
+        for vendor,terminal in (('claude','result'),('codex','turn.completed')):
+            with self.subTest(vendor=vendor):
+                event={'type':terminal,'result':'answer','usage':{'input_tokens':7,'output_tokens':3}}
+                script='import time; print('+repr(json.dumps(event))+',flush=True); time.sleep(5)'
+                config.write_text(json.dumps({'agents':{'native':{'kind':vendor,'command':['python3','-c',script]}}}))
+                code,out,err=self.run_cli(['ask','native','--timeout','.1','--json','work'],env={'YOYO_CONFIG':str(config)})
+                self.assertEqual(code,124,err);row=json.loads(out)
+                self.assertEqual(row['tokens']['total'],10)
+                run=next(path.parent for path in (Path(self._state_guard.name)/'runs').glob('*/meta.json')
+                         if json.loads(path.read_text()).get('trace_id')==row['trace_id'])
+                self.assertEqual(json.loads((run/'result.json').read_text())['tokens'],row['tokens'])
+
+
+
+class TokenAuditTests(CliTestCase):
+    def _record(self, *, agent="codex", model=None, result_model=None, tokens=None, mode="call", **extra):
+        root = Path(self._state_guard.name) / "runs"
+        root.mkdir(exist_ok=True)
+        run = root / f"20261117T170000-{len(list(root.iterdir())):08x}"
+        run.mkdir()
+        meta = {"agent": agent, "model": model, "mode": mode, "started_at": yoyo.iso_utc(yoyo.utc_now())}
+        meta.update(extra)
+        result = {"exit_code": 0, "duration_s": 1}
+        if result_model is not None:
+            result["model"] = result_model
+        if tokens is not None:
+            result["tokens"] = tokens
+        (run / "meta.json").write_text(json.dumps(meta))
+        (run / "result.json").write_text(json.dumps(result))
+
+    def test_audit_token_percentiles_by_agent_and_reported_model(self):
+        for total in (100, 200):
+            self._record(model="requested", result_model="reported", tokens={"total": total})
+        code, out, err = self.run_cli(["runs", "audit", "--json"])
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        row = report["agents"][0]
+        self.assertEqual((row["p50_tokens"], row["p90_tokens"], row["token_calls"]), (100, 200, 2))
+        self.assertEqual(report["models"][0]["model"], "reported")
+        self.assertEqual(report["models"][0]["p90_tokens"], 200)
+        code, out, err = self.run_cli(["runs", "audit"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("token totals", out)
+        self.assertIn("reported", out)
+
+    def test_unknown_or_invalid_totals_do_not_become_zero_samples(self):
+        for total in (None, True, -1, 1.5, "20", float("nan")):
+            self._record(tokens={"total": total})
+        self._record()
+        for total in (0, 20):
+            self._record(tokens={"total": total})
+        code, out, err = self.run_cli(["runs", "audit", "--json"])
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        row = report["agents"][0]
+        self.assertEqual((row["calls"], row["token_calls"]), (9, 2))
+        self.assertEqual((row["p50_tokens"], row["p90_tokens"]), (0, 20))
+        self.assertEqual(report["models"][0]["model"], "unknown")
+
+    def test_token_audit_counts_calls_once_and_keeps_vendor_models_separate(self):
+        self._record(model="shared-name", tokens={"total": 10})
+        self._record(agent="claude", model="shared-name", tokens={"total": 30})
+        self._record(model="shared-name", tokens={"total": 999999}, mode="ask", argv=["ask", "codex"])
+        self._record(model="shared-name", tokens={"total": 999999}, mode="loop", loop_id="loop")
+        code, out, err = self.run_cli(["runs", "audit", "--json"])
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertEqual(sum(row["token_calls"] for row in report["agents"]), 2)
+        rows = {(row["agent"], row["model"]): row for row in report["models"]}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[("codex", "shared-name")]["p90_tokens"], 10)
+        self.assertEqual(rows[("claude", "shared-name")]["p90_tokens"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()

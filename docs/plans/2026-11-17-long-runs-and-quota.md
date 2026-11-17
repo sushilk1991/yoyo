@@ -72,7 +72,7 @@ The goal is that a long delegated run is never lost to a clock while it is worki
   - yoyo never substitutes a model the caller or the alias did not name.
   - Proof: tests that a fake agent failing with a quota message falls back, that one failing any other way does not, and that an alias skips a blocked entry.
 
-- [ ] **5. Token use is recorded per run.**
+- [x] **5. Token use is recorded per run.**
   - Store input, output, cached and total tokens in `result.json`: from the `usage` object of Claude's final `result` event, and for Codex from the "tokens used" trailer it prints or the `turn.completed.usage` event of `codex exec --json`. Leave the field out when an agent reports nothing. No dollar figures.
   - `yoyo runs audit` shows token p50 and p90 per agent and per model.
   - Proof: tests with a captured sample of each format; one real run per vendor whose recorded total matches what the CLI printed.

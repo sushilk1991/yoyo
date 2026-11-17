@@ -142,6 +142,16 @@ Yoyo never invents a replacement model. A direct `--model` is forwarded unchange
 
 `yoyo doctor`, including `doctor --live`, checks configured alias model IDs against the native catalog once per distinct agent, accepting Claude's alias or resolved ID. It warns about missing models; an unavailable or custom catalog warns that it cannot verify the model. `--strict` exits nonzero for these warnings. Live JSON retains its probe-array format and writes alias warnings to stderr. `YOYO_MODEL_PROBE_TIMEOUT` sets this metadata deadline in seconds (default 20). No alias file means no catalog probes.
 
+## Token use
+
+Codex and Claude calls save reported token counts in the result envelope and `result.json` as `tokens: {input, output, cached, total}`. Values are nonnegative integers or null when the breakdown is unknown. Calls without reported usage omit `tokens`; Yoyo records no dollar figures.
+
+Claude uses the latest top-level final `result.usage`, counting `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` as input, `output_tokens` as output, and cache reads as the cached subset. Omitted optional cache components add zero to the input sum; explicit null or invalid components leave that sum unknown. Assistant-step usage and `modelUsage` are not added again. The [Claude SDK usage definition](https://code.claude.com/docs/en/agent-sdk/cost-tracking#get-the-total-cost-of-a-query) covers the main agent loop and excludes subagent usage, so these counts are not whole-tree billing totals.
+
+Codex uses the latest valid `turn.completed.usage`: input already includes cached input, output is separate, and total is input plus output. Current [Codex output code](https://github.com/openai/codex/blob/main/codex-rs/exec/src/event_processor_with_jsonl_output.rs) emits cumulative snapshots; Yoyo does not sum successive completions, and resumed runs can report earlier thread usage. If structured usage is absent, a final `tokens used` stderr trailer supplies only the total; both `151,040` and `1,51,040` are accepted. Reads use bounded lines and a finite file snapshot, independently of answer truncation. A timeout or signal retains usage only when the CLI has already flushed a completed usage event or trailer.
+
+Call metadata keeps an explicitly requested `model`. Claude's reported initialization model is also saved in `result.json`. `runs audit` groups token totals by agent and by `(agent, model)`, preferring the reported model, then the explicit choice, then `unknown`. It shows p50/p90 token totals and `token_calls` (the number of calls reporting a valid total). Unknown totals are excluded, while a reported zero is included. Yoyo does not query a catalog to guess the configured model.
+
 ## Local advice
 
 `yoyo advise --file evidence.json` returns JSON suggestions for suspected repeated attempts, failure categories, and possible duplicate review findings. It accepts focused evidence from any CLI; it does not select a coding model or change delegation behavior. The optional Apple Silicon backend uses Decider 0.8B with 4-bit MLX weights. [Setup, schema, examples, and benchmark limits](../extras/README.md).

@@ -743,16 +743,20 @@ def decode_agent_stdout(spec: AgentSpec, raw: str) -> tuple[str, str]:
 STREAM_EVENT_MAX_BYTES = 8 * 1024 * 1024
 
 
-def _bounded_lines(handle: Any, cap: int) -> Iterator[str | None]:
+def _bounded_lines(handle: Any, cap: int, end: int | None = None) -> Iterator[str | None]:
     """Each line of a binary file, decoded; None for a line over cap bytes,
     which is read past in pieces and never held whole."""
+    def readline(limit: int) -> bytes:
+        remaining = limit if end is None else min(limit, max(0, end - handle.tell()))
+        return handle.readline(remaining) if remaining else b""
+
     while True:
-        line = handle.readline(cap + 1)
+        line = readline(cap + 1)
         if not line:
             return
         if len(line) > cap and not line.endswith(b"\n"):
             while line and not line.endswith(b"\n"):
-                line = handle.readline(1024 * 1024)
+                line = readline(1024 * 1024)
             yield None
             continue
         yield line.decode("utf-8", errors="replace")
@@ -786,6 +790,65 @@ def read_agent_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, boo
     if len(data) <= limit:
         return answer, False, note
     return data[:limit].decode("utf-8", errors="replace") + f"\n...[truncated after {limit} bytes]\n", True, note
+
+
+def normalize_tokens(usage: Any, flavor: str) -> dict[str, int | None] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    def count(key: str, default: int | None = None) -> int | None:
+        value = usage.get(key, default)
+        return value if type(value) is int and value >= 0 else None
+
+    input_tokens = count("input_tokens")
+    output_tokens = count("output_tokens")
+    cached = count("cache_read_input_tokens" if flavor == "claude" else "cached_input_tokens")
+    if flavor == "claude":
+        # Claude's input excludes both cache writes and reads. Omitted
+        # optional cache fields add nothing; explicit null/invalid is unknown.
+        parts = [input_tokens, count("cache_creation_input_tokens", 0), count("cache_read_input_tokens", 0)]
+        input_tokens = sum(parts) if all(value is not None for value in parts) else None
+    total = input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None
+    tokens = {"input": input_tokens, "output": output_tokens, "cached": cached, "total": total}
+    return tokens if any(value is not None for value in tokens.values()) else None
+
+
+def read_call_usage(spec: AgentSpec, stdout_path: Path, stderr_path: Path) -> dict[str, Any]:
+    if spec.flavor not in ("codex", "claude"):
+        return {}
+    result: dict[str, Any] = {}
+    try:
+        fd = os.open(stdout_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return result
+            for line in _bounded_lines(handle, STREAM_EVENT_MAX_BYTES, info.st_size):
+                event = _stream_event(line) if line else None
+                if event is None or event.get("parent_tool_use_id"):
+                    continue
+                if spec.flavor == "claude" and event["type"] == "system" and event.get("subtype") == "init":
+                    model = event.get("model")
+                    if isinstance(model, str) and model.strip() and len(model) <= 256:
+                        result["model"] = model
+                terminal = "result" if spec.flavor == "claude" else "turn.completed"
+                if event["type"] == terminal:
+                    tokens = normalize_tokens(event.get("usage"), spec.flavor)
+                    if tokens is not None:
+                        # Both protocols can carry cumulative snapshots. The
+                        # latest reported completion supersedes earlier ones.
+                        result["tokens"] = tokens
+    except OSError:
+        pass
+    if spec.flavor == "codex" and "tokens" not in result:
+        # Historical human output has only a total, with Western or Indian
+        # grouping. Match the final trailer, never a quoted earlier message.
+        tail = _watch_read(stderr_path, 65536, "tail")
+        match = re.search(r"(?:^|\n)tokens used\r?\n[ \t]*([0-9]+|[0-9]{1,3}(?:,[0-9]{2,3})*,[0-9]{3})\s*\Z", tail)
+        if match and len(match.group(1)) <= 128:
+            result["tokens"] = {"input": None, "output": None, "cached": None,
+                                "total": int(match.group(1).replace(",", ""))}
+    return result
 
 
 def read_interrupted_stdout(spec: AgentSpec, path: Path, limit: int) -> tuple[str, bool, str]:
@@ -2022,6 +2085,7 @@ def journal_call_start(
             "flavor": flavor,
             "native_adapter": native_adapter,
             "role": getattr(args, "role", None),
+            "model": getattr(args, "model", None),
             "cwd": str(cwd),
             "trace_id": getattr(args, "trace_id", None),
             "caller": getattr(args, "caller", None),
@@ -3150,6 +3214,7 @@ def execute_agent_call(
         def retain_result(result: dict[str, Any]) -> dict[str, Any]:
             args._call_run_id = journal_dir.name if journal_dir is not None else None
             attach_session_result(args, agents[agent_name], result, stdout_path)
+            result.update(read_call_usage(agents[agent_name], stdout_path, stderr_path))
             if agents[agent_name].flavor == "claude":
                 quota = read_claude_quota(stdout_path, agent_name)
                 if quota is not None:
@@ -3168,7 +3233,7 @@ def execute_agent_call(
             # Session recovery must precede result.json: signal handling and
             # background callers use it as the completed journal boundary.
             saved = {key: result[key] for key in ("session", "continue_command", "killed_by_signal", "timed_out", "idle_timed_out",
-                                                 "idle_seconds", "silent_exit", "quota", "failure_kind", "quota_resets_at") if key in result}
+                                                 "idle_seconds", "silent_exit", "quota", "failure_kind", "quota_resets_at", "tokens", "model") if key in result}
             finish_journal(result["exit_code"], **saved, **extra)
             return result
 
@@ -3177,7 +3242,7 @@ def execute_agent_call(
                                      stderr_path, "", codex_output_file)
             result.update(exit_code=None, killed_by_signal=signum)
             retain_result(result)
-            return {key: result[key] for key in ("session", "continue_command", "quota") if key in result}
+            return {key: result[key] for key in ("session", "continue_command", "quota", "tokens", "model") if key in result}
 
         if journal_dir is not None:
             with _ACTIVE_JOURNALS_LOCK:
@@ -4257,6 +4322,12 @@ def percentile(values: list[float], percent: int) -> float | None:
     return values[rank - 1]
 
 
+def token_percentiles(values: list[int]) -> dict[str, Any]:
+    values = sorted(values)
+    return {"token_calls": len(values), "p50_tokens": percentile(values, 50),
+            "p90_tokens": percentile(values, 90)}
+
+
 def collect_audit(days: int) -> dict[str, Any]:
     """Aggregate the run ledger without re-deriving anything it did not record.
 
@@ -4268,6 +4339,7 @@ def collect_audit(days: int) -> dict[str, Any]:
     cutoff = utc_now().timestamp() - (days * 86400)
     cohorts: dict[str, int] = {name: 0 for name in (CALL_RECORD, PARENT_RECORD, LOOP_RECORD, OTHER_RECORD)}
     by_agent: dict[str, dict[str, Any]] = {}
+    by_model: dict[tuple[str, str], dict[str, Any]] = {}
     no_meta = 0
     zero_stdout = 0
     sized = 0
@@ -4299,12 +4371,27 @@ def collect_audit(days: int) -> dict[str, Any]:
         outcome = run_outcome(result, recorded, live)
 
         agent = str(meta.get("agent") or "unknown")
-        row = by_agent.setdefault(agent, {"agent": agent, "calls": 0, "outcomes": {name: 0 for name in AUDIT_OUTCOMES}, "durations": []})
+        row = by_agent.setdefault(agent, {"agent": agent, "calls": 0, "outcomes": {name: 0 for name in AUDIT_OUTCOMES},
+                                          "durations": [], "token_totals": []})
         row["calls"] += 1
         row["outcomes"][outcome] += 1
+        model = (result or {}).get("model")
+        if not isinstance(model, str) or not model.strip():
+            model = meta.get("model")
+        if not isinstance(model, str) or not model.strip():
+            model = "unknown"
+        model_row = by_model.setdefault((agent, model), {"agent": agent, "model": model, "calls": 0, "token_totals": []})
+        model_row["calls"] += 1
 
         if result is None:
             continue
+        tokens = result.get("tokens")
+        total = tokens.get("total") if isinstance(tokens, dict) else None
+        # Unknown usage is not a zero. Keep the reported-sample denominator,
+        # including genuine zero totals, separate from the number of calls.
+        if type(total) is int and total >= 0:
+            row["token_totals"].append(total)
+            model_row["token_totals"].append(total)
         try:
             row["durations"].append(float(result["duration_s"]))
         except (KeyError, TypeError, ValueError):
@@ -4322,7 +4409,13 @@ def collect_audit(days: int) -> dict[str, Any]:
         row["p50_s"] = percentile(durations, 50)
         row["p90_s"] = percentile(durations, 90)
         row["timed_calls"] = len(durations)
+        row.update(token_percentiles(row.pop("token_totals")))
         agents.append(row)
+
+    models = []
+    for row in sorted(by_model.values(), key=lambda item: (-item["calls"], item["agent"], item["model"])):
+        row.update(token_percentiles(row.pop("token_totals")))
+        models.append(row)
 
     return {
         "days": days,
@@ -4330,6 +4423,7 @@ def collect_audit(days: int) -> dict[str, Any]:
         "cohorts": cohorts,
         "records_without_meta": no_meta,
         "agents": agents,
+        "models": models,
         "zero_stdout_bytes": {"count": zero_stdout, "of_sized_calls": sized},
     }
 
@@ -4363,12 +4457,24 @@ def audit_runs(args: argparse.Namespace) -> int:
     agent_width = max(6, *(len(row["agent"]) for row in report["agents"]))
 
     header = f"{'agent':<{agent_width}}  {'calls':>5}  " + "  ".join(f"{name:>{widths[name]}}" for name in columns)
-    print(header + f"  {'p50':>8}  {'p90':>8}")
+    print(header + f"  {'p50':>8}  {'p90':>8}  {'token n':>7}  {'tok p50':>10}  {'tok p90':>10}")
     for row in report["agents"]:
         counts = "  ".join(f"{row['outcomes'][name]:>{widths[name]}}" for name in columns)
         p50 = "-" if row["p50_s"] is None else f"{row['p50_s']:.1f}s"
         p90 = "-" if row["p90_s"] is None else f"{row['p90_s']:.1f}s"
-        print(f"{row['agent']:<{agent_width}}  {row['calls']:>5}  {counts}  {p50:>8}  {p90:>8}")
+        token_p50 = "-" if row["p50_tokens"] is None else f"{row['p50_tokens']:,}"
+        token_p90 = "-" if row["p90_tokens"] is None else f"{row['p90_tokens']:,}"
+        print(f"{row['agent']:<{agent_width}}  {row['calls']:>5}  {counts}  {p50:>8}  {p90:>8}"
+              f"  {row['token_calls']:>7}  {token_p50:>10}  {token_p90:>10}")
+
+    print("\nmodel token totals (CLI-reported; token n = reporting calls):")
+    model_width = max(5, *(len(row["model"]) for row in report["models"]))
+    print(f"{'agent':<{agent_width}}  {'model':<{model_width}}  {'calls':>5}  {'token n':>7}  {'p50':>10}  {'p90':>10}")
+    for row in report["models"]:
+        p50 = "-" if row["p50_tokens"] is None else f"{row['p50_tokens']:,}"
+        p90 = "-" if row["p90_tokens"] is None else f"{row['p90_tokens']:,}"
+        print(f"{row['agent']:<{agent_width}}  {row['model']:<{model_width}}  {row['calls']:>5}"
+              f"  {row['token_calls']:>7}  {p50:>10}  {p90:>10}")
 
     sized = report["zero_stdout_bytes"]
     print()

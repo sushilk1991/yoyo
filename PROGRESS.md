@@ -15,12 +15,14 @@ Done:
 Done: item4 fallback/aliases and doctor catalogs; remote580 tests, compile0,
 SkillGuard9 all passed.
 
-Next: item5 token recording and audit percentiles. Native deadline worker owns token parser/persistence/metadata, TokenUsageTests
-and docs. Parent owns collect_audit/audit_runs, TokenAuditTests, checklist,
-report and commits. Canonical tokens integer/null input/output/cached/total;
-absent usage omitted. Models prefer provider result, explicit meta, else unknown. Prospective
-item5-6 tests in ignored `.yoyo/long-runs/`; adapt before applying. No version
-change until item6. No code for later items before the preceding commit.
+Done: item5 token recording and audit percentiles; remote589 tests,
+compile0, SkillGuard9 all passed. Native Codex36,628 and Claude17,503 totals
+match both JSON envelope and journal. Latest provider snapshots are used;
+resumed Codex can include earlier thread usage, Claude excludes subagents.
+
+Next: item6 automatic raw-stream retention. Parent owns report, plan and
+commit; implementation ownership will be assigned after item5 is committed.
+Bump VERSION to0.35.0 only in item6 with its expected-version test.
 
 All suites stay REMOTE, explicitly confirmed by user. Use:
 `boxrun --box masonry --lane build --mem 2G -- 'env -u XDG_CONFIG_HOME ...'`.
