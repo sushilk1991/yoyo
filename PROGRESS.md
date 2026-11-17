@@ -39,3 +39,16 @@ Evidence: ignored `.yoyo/long-runs/evidence/`; committed report:
 Next: no required implementation or verification work remains. No publishing.
 Python3.9-specific pathlib API regression passed under3.13; an actual3.9
 interpreter run was not performed. Test/source/skill SHA256 matched remote.
+
+Follow-up complete: user requested committing and testing once with Muse.
+Six implementation commits were already clean through4f256c9. Fresh Masonry
+verification: compile0, full601 in57.290s, SkillGuard9, version1, help0;
+CLI/test/skill hashes match. Muse read-only review20261117T165926-4d6d0785
+exited0 with no material findings after reading code and completed evidence.
+Parent ran remote commands because Muse's sandbox cannot create boxrun's
+outside-workspace lock; no sandbox bypass. All review points inspected.
+Raw --agent-arg flags are not replayed in continuation commands, and custom
+profile continuation remains unverified; no speculative flag replay patch.
+Evidence `.yoyo/muse-final/evidence`; full output and boundaries recorded in
+verification report. Program/test/skill unchanged. Remote Baton idle; no
+owned jobs/copies remain. Next: no outstanding task work. No publishing.

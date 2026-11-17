@@ -366,3 +366,72 @@ native workspaces were removed. Claude transcripts and isolated raw captures
 remain as verification evidence. No global Claude configuration was rewritten.
 
 The branch remains local: no push, tag, release or installation occurred.
+
+
+## Follow-up - Muse review and repeat gates
+
+User requested committing the changes and testing everything once with Muse.
+All six implementation commits were already present with a clean working tree,
+ending at `4f256c987bb6701713264144ee642e1077442c44`.
+
+Fresh verification ran once on retained Masonry, scheduled by remote Baton:
+`python3 -m py_compile bin/yoyo`, full unittest discovery, SkillGuardTests,
+the expected-version test, CLI help, and SHA256 correspondence for the CLI,
+tests and skill. Compilation and help were silent successes; the shell used
+`set -eu`, and the complete command exited0. Full output follows:
+
+```text
+boxrun: masonry:/data/workspace/yoyo-2c067b94/
+.........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 601 tests in 57.290s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.058s
+
+OK
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.005s
+
+OK
+0709e67c46aeb064fdb35860ede515afabdcdf4e31f78ccf86a2133efec06b7a  bin/yoyo
+26723260361224592bea0b2a0bebf321e8519b29a47e23bd4370dae4cb082a84  tests/test_yoyo.py
+14e5ed4a4220a98aca6cdc0dae916ee792cad26e38152bac5c8cbcd59e3836ea  skills/yoyo/SKILL.md
+ALL_REMOTE_GATES_PASSED
+```
+
+Muse reviewed the full six-commit diff, current callers/tests, the completed
+verification manifest and full gate output. The isolated read-only review
+`20261117T165926-4d6d0785` exited0 after359.189s. Its verdict was **No material
+findings.** It traced deadlines and detached arguments; interrupted messages,
+signals and session validation; sanitized quota and terminal errors; explicit
+routing; token snapshots/audit; and retention locking, PID identity and file
+safety. Raw answer and manifest are retained in
+`.yoyo/muse-final/evidence/{muse-review.txt,muse-verdict.json,verification.json}`.
+
+The parent executed the remote commands; Muse independently inspected their
+results and code. Muse's workspace sandbox cannot create boxrun's lock outside
+the workspace. Its sandbox stayed enabled, with file reads/search only and
+no shell or writes; no YOLO or weaker policy was used. This is consistent with
+[Muse's documented sandbox boundaries](https://dev.meta.ai/docs/muse-code/permissions).
+
+Parent inspected all residual review points. Fan-out leaf calls retaining
+sessions is consistent with the per-call full-access ask contract. Possible
+plain-text error precedence and multi-window expiry cases lacked a concrete
+vendor failure in this repeat, so no speculative patch was made. One confirmed
+coverage boundary: generated continuation commands preserve state/config paths
+and model but do not replay raw `--agent-arg` flags. Custom-profile continuation
+was not live-tested and may require native resume configuration; the installed
+Codex CLI exposes different options for initial exec and resume, so blindly
+replaying profile flags is not established as valid. No guarantee is made for
+that unverified configuration.
+
+This repeat added no live vendor probes or real multi-hour runs, induced no
+quota exhaustion, and did not run a Python3.9 interpreter. Existing native
+probe evidence and provider-usage caveats above still apply. Final remote Baton
+readback has zero running or queued jobs; no detached copies, containers or
+ports were created. Program, test and skill source remain unchanged after the
+review. No push, tag, release or installation occurred.
