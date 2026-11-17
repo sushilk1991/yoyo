@@ -77,7 +77,7 @@ The goal is that a long delegated run is never lost to a clock while it is worki
   - `yoyo runs audit` shows token p50 and p90 per agent and per model.
   - Proof: tests with a captured sample of each format; one real run per vendor whose recorded total matches what the CLI printed.
 
-- [ ] **6. The ledger stops growing without bound.**
+- [x] **6. The ledger stops growing without bound.**
   One Claude run stores 4.8 MB of stream, 95% of it echoed tool results, and pruning is manual.
   - At most once a day, a finishing run removes `stdout.txt` and `stderr.txt` from run directories older than `YOYO_RETENTION_DAYS` (default 30, 0 disables). `meta.json`, `result.json`, `answer.txt` and `prompt.txt` stay, so `yoyo runs audit` keeps its history. A run that is still going is never touched.
   - Proof: tests that old streams go and the small files stay, that a running run is skipped, that 0 disables it, and that a second pass the same day does nothing.

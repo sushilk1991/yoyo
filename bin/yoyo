@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-VERSION = "0.34.0"
+VERSION = "0.35.0"
 # The implicit deadline renews on captured activity, bounded by an absolute
 # ceiling. Caller-chosen task budgets and buffered agents remain hard kills.
 DEFAULT_TIMEOUT_SECONDS = 14400
@@ -2108,6 +2108,119 @@ def journal_call_start(
     return run_dir
 
 
+def _retention_json(directory: int, name: str) -> dict[str, Any] | None:
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        raw = handle.read(65537)
+    if len(raw) > 65536:
+        return None
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _prune_run_streams(root: int, name: str, cutoff: float) -> None:
+    directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+    try:
+        meta = _retention_json(directory, "meta.json")
+        if meta is None or meta.get("run_id", name) != name:
+            return
+        raw_started = meta.get("started_at")
+        if not isinstance(raw_started, str):
+            return
+        started = datetime.fromisoformat(raw_started.replace("Z", "+00:00"))
+        if started.tzinfo is None or started.timestamp() >= cutoff:
+            return
+        if "pid" in meta:
+            pid, identity = meta["pid"], meta.get("pid_started")
+            if type(pid) is not int or pid <= 0:
+                return
+            if identity is not None and identity != "":
+                if not isinstance(identity, str):
+                    return
+                datetime.strptime(identity, "%a %b %d %H:%M:%S %Y")
+            # A final result does not prove the owning process has stopped.
+            # Legacy records without a start identity conservatively use PID.
+            if pid_is_running(pid, identity):
+                return
+        else:
+            result = _retention_json(directory, "result.json") or {}
+            signum = result.get("killed_by_signal")
+            if type(result.get("exit_code")) is not int and not (type(signum) is int and signum > 0):
+                return  # no process identity and no terminal evidence
+        held = os.fstat(directory)
+        for stream in ("stdout.txt", "stderr.txt"):
+            try:
+                current = os.stat(name, dir_fd=root, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                    return
+                info = os.stat(stream, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    os.unlink(stream, dir_fd=directory)
+            except OSError:
+                pass
+    finally:
+        os.close(directory)
+
+
+def prune_old_streams() -> None:
+    """Once per UTC day, remove only old, inactive runs' regular captures."""
+    try:
+        days = int(os.environ.get("YOYO_RETENTION_DAYS", "30"))
+        if days <= 0:
+            return
+        now = utc_now()
+        day = now.astimezone(timezone.utc).date().isoformat()
+        cutoff = now.timestamp() - days * 86400
+        state = state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        lock = state / "retention.lock"
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+        try:
+            held = os.fstat(fd)
+            if not stat.S_ISREG(held.st_mode):
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return
+            current = lock.lstat()
+            if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                return
+            marker = state / "retention.json"
+            try:
+                if not stat.S_ISREG(marker.lstat().st_mode):
+                    return
+            except FileNotFoundError:
+                pass
+            checked = _watch_json(marker)
+            if checked and checked.get("checked_date") == day:
+                return
+            # Mark before scanning: an interrupted/failed pass cannot repeat
+            # maintenance on every finishing call. The separate lock persists.
+            atomic_write_text(marker, json.dumps({"checked_date": day}))
+            root = os.open(runs_root(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        if not re.fullmatch(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}", entry.name):
+                            continue
+                        try:
+                            _prune_run_streams(root, entry.name, cutoff)
+                        except (OSError, ValueError, OverflowError):
+                            pass  # preserve damaged or ambiguous records
+            finally:
+                os.close(root)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, OverflowError):
+        pass  # maintenance must never turn a completed call into a failure
+
+
 def journal_call_finish(run_dir: Path | None, payload: dict[str, Any]) -> None:
     if run_dir is None:
         return
@@ -2116,7 +2229,8 @@ def journal_call_finish(run_dir: Path | None, payload: dict[str, Any]) -> None:
     try:
         atomic_write_text(run_dir / "result.json", json.dumps(payload, ensure_ascii=False, indent=2))
     except OSError:
-        pass
+        return
+    prune_old_streams()
 
 
 def journal_call_answer(run_dir: Path | None, answer: str) -> None:

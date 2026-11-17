@@ -79,7 +79,7 @@ class YoyoTests(CliTestCase):
         code, stdout, stderr = self.run_cli(["--version"])
 
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout.strip(), "yoyo 0.34.0")
+        self.assertEqual(stdout.strip(), "yoyo 0.35.0")
 
     def test_custom_agent_receives_rendered_prompt_on_stdin(self):
         env = {"YOYO_AGENT_ECHO": "python3 -c \"import sys; print(sys.stdin.read())\""}
@@ -9281,6 +9281,246 @@ class TokenAuditTests(CliTestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[("codex", "shared-name")]["p90_tokens"], 10)
         self.assertEqual(rows[("claude", "shared-name")]["p90_tokens"], 30)
+
+
+class RetentionTests(CliTestCase):
+    def _old(self, *, age_days=40, running=False, completed=True):
+        number = getattr(self, "_retention_number", 0) + 1
+        self._retention_number = number
+        path = Path(self._state_guard.name) / "runs" / f"20260101T000001-{number:08x}"
+        path.mkdir(parents=True)
+        meta = {
+            "agent": "echo",
+            "mode": "call",
+            "started_at": yoyo.iso_utc(yoyo.datetime.fromtimestamp(time.time() - age_days * 86400, yoyo.timezone.utc)),
+        }
+        if running:
+            meta.update(pid=os.getpid(), pid_started=yoyo.pid_start_time(os.getpid()))
+        (path / "meta.json").write_text(json.dumps(meta))
+        for name in ("stdout.txt", "stderr.txt", "prompt.txt", "answer.txt"):
+            (path / name).write_text("keep me")
+        if completed:
+            (path / "result.json").write_text(json.dumps({"exit_code": 0, "tokens": {"total": 10}}))
+        return path
+
+    def _finish(self, days=None):
+        return self.run_cli(["ask", "echo", "work"], env={
+            "YOYO_AGENT_ECHO": shlex.join(["python3", "-c", "print('done')"]),
+            "YOYO_RETENTION_DAYS": days,
+        })
+
+    def test_default_retention_removes_only_old_raw_streams_and_keeps_audit(self):
+        old = self._old()
+        recent = self._old(age_days=20)
+        preserved = {name: (old / name).read_bytes() for name in ("meta.json", "result.json", "answer.txt", "prompt.txt")}
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        for name in ("stdout.txt", "stderr.txt"):
+            self.assertFalse((old / name).exists())
+            self.assertTrue((recent / name).exists())
+        for name, content in preserved.items():
+            self.assertEqual((old / name).read_bytes(), content)
+        code, out, err = self.run_cli(["runs", "audit", "--days", "90", "--json"])
+        self.assertEqual(code, 0, err)
+        row = json.loads(out)["agents"][0]
+        self.assertEqual(row["calls"], 3)
+        self.assertEqual(row["token_calls"], 2)
+
+    def test_retention_skips_live_pid_even_with_final_result(self):
+        records = []
+        for completed in (False, True):
+            records.append(self._old(running=True, completed=completed))
+        legacy = self._old(running=True)
+        meta = json.loads((legacy / "meta.json").read_text())
+        del meta["pid_started"]
+        (legacy / "meta.json").write_text(json.dumps(meta))
+        records.append(legacy)
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        for old in records:
+            self.assertTrue((old / "stdout.txt").exists())
+            self.assertTrue((old / "stderr.txt").exists())
+
+    def test_reused_pid_does_not_keep_dead_run_forever(self):
+        old = self._old(running=True, completed=False)
+        meta = json.loads((old / "meta.json").read_text())
+        meta["pid_started"] = "Sat Jan  1 00:00:00 2000"
+        (old / "meta.json").write_text(json.dumps(meta))
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        self.assertFalse((old / "stdout.txt").exists())
+        self.assertTrue((old / "answer.txt").exists())
+
+    def test_zero_or_invalid_retention_is_best_effort_and_does_not_mark(self):
+        old = self._old()
+        for days in ("0", "-1", "invalid", "1.5", "nan", "9" * 1000):
+            with self.subTest(days=days[:20]):
+                code, out, err = self._finish(days)
+                self.assertEqual(code, 0, err)
+                self.assertTrue((old / "stdout.txt").exists())
+                self.assertFalse((Path(self._state_guard.name) / "retention.json").exists())
+
+    def test_second_pass_same_utc_day_is_skipped_and_next_day_runs(self):
+        self._old()
+        today = yoyo.utc_now()
+        tomorrow = yoyo.datetime.fromtimestamp(today.timestamp() + 86400, yoyo.timezone.utc)
+        with mock.patch.object(yoyo, "utc_now", return_value=today):
+            self.assertEqual(self._finish()[0], 0)
+        state = Path(self._state_guard.name)
+        lock_inode = (state / "retention.lock").stat().st_ino
+        added = self._old()
+        with mock.patch.object(yoyo, "utc_now", return_value=today):
+            self.assertEqual(self._finish()[0], 0)
+        self.assertTrue((added / "stdout.txt").exists())
+        with mock.patch.object(yoyo, "utc_now", return_value=tomorrow):
+            self.assertEqual(self._finish()[0], 0)
+        self.assertFalse((added / "stdout.txt").exists())
+        self.assertEqual((state / "retention.lock").stat().st_ino, lock_inode)
+        marker = json.loads((state / "retention.json").read_text())
+        self.assertEqual(marker["checked_date"], tomorrow.date().isoformat())
+
+    def test_lock_contention_does_not_wait_scan_or_mark(self):
+        old = self._old()
+        state = Path(self._state_guard.name)
+        with (state / "retention.lock").open("w") as lock:
+            yoyo.fcntl.flock(lock, yoyo.fcntl.LOCK_EX | yoyo.fcntl.LOCK_NB)
+            before = time.monotonic()
+            code, out, err = self._finish()
+            self.assertEqual(code, 0, err)
+            self.assertLess(time.monotonic() - before, 2)
+            self.assertTrue((old / "stdout.txt").exists())
+            self.assertFalse((state / "retention.json").exists())
+        self.assertEqual(self._finish()[0], 0)
+        self.assertFalse((old / "stdout.txt").exists())
+
+    def test_malformed_metadata_and_ambiguous_pid_are_preserved(self):
+        changes = [
+            {"started_at": "bad"}, {"started_at": "2026-01-01T00:00:00"},
+            {"pid": "123"}, {"pid": True}, {"pid": None},
+            {"pid": os.getpid(), "pid_started": 15},
+            {"pid": os.getpid(), "pid_started": "not a process start"},
+            {"run_id": "different-run"},
+        ]
+        records = []
+        for change in changes:
+            old = self._old()
+            meta = json.loads((old / "meta.json").read_text())
+            meta.update(change)
+            (old / "meta.json").write_text(json.dumps(meta))
+            records.append(old)
+        for raw in ("{broken", "[]", "x" * 65537):
+            old = self._old()
+            (old / "meta.json").write_text(raw)
+            records.append(old)
+        for raw in ("{}", "[]", "bad", '{"unrelated": 1}', '{"exit_code": null}', '{"exit_code": true}'):
+            old = self._old()
+            (old / "result.json").write_text(raw)
+            records.append(old)
+        old = self._old()
+        (old / "meta.json").unlink()
+        os.mkfifo(old / "meta.json")
+        records.append(old)
+        records.append(self._old(completed=False))
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        for old in records:
+            self.assertTrue((old / "stdout.txt").exists(), old.name)
+
+    def test_symlinked_directories_metadata_and_nonregular_streams_are_preserved(self):
+        state = Path(self._state_guard.name)
+        outside = state / "outside"
+        outside.mkdir()
+        (outside / "stdout.txt").write_text("outside stdout")
+        (outside / "stderr.txt").write_text("outside stderr")
+        (outside / "result.json").write_text(json.dumps({"exit_code": 0}))
+        old = self._old()
+        (outside / "meta.json").write_bytes((old / "meta.json").read_bytes())
+        (old / "stdout.txt").unlink()
+        (old / "stdout.txt").symlink_to(outside / "stdout.txt")
+        (old / "stderr.txt").unlink()
+        os.mkfifo(old / "stderr.txt")
+        linked_meta = self._old()
+        (linked_meta / "meta.json").unlink()
+        (linked_meta / "meta.json").symlink_to(outside / "meta.json")
+        (state / "runs" / "20260101T000001-ffffffff").symlink_to(outside, target_is_directory=True)
+        nested = self._old()
+        nested.rename(state / "runs" / "not-a-run")
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        self.assertTrue((old / "stdout.txt").is_symlink())
+        self.assertTrue((old / "stderr.txt").exists())
+        self.assertTrue((linked_meta / "stdout.txt").exists())
+        self.assertTrue((state / "runs" / "not-a-run" / "stdout.txt").exists())
+        self.assertEqual((outside / "stdout.txt").read_text(), "outside stdout")
+        self.assertEqual((outside / "stderr.txt").read_text(), "outside stderr")
+
+    def test_symlinked_maintenance_files_and_ledger_root_are_preserved(self):
+        state = Path(self._state_guard.name)
+        target = state / "outside-marker"
+        target.write_text("outside")
+        old = self._old()
+        for name in ("retention.lock", "retention.json"):
+            with self.subTest(name=name):
+                maintenance = state / name
+                if maintenance.exists():
+                    maintenance.unlink()
+                maintenance.symlink_to(target)
+                code, out, err = self._finish()
+                self.assertEqual(code, 0, err)
+                self.assertTrue((old / "stdout.txt").exists())
+                self.assertEqual(target.read_text(), "outside")
+                self.assertTrue(maintenance.is_symlink())
+                maintenance.unlink()
+        root = state / "runs"
+        moved = state / "outside-runs"
+        root.rename(moved)
+        root.symlink_to(moved, target_is_directory=True)
+        with mock.patch.dict(os.environ, {"YOYO_STATE_DIR": str(state)}):
+            yoyo.prune_old_streams()
+        self.assertTrue((moved / old.name / "stdout.txt").exists())
+
+    def test_unlink_errors_do_not_fail_call_or_retry_on_same_day(self):
+        old = self._old()
+        unlink = os.unlink
+        def deny_stdout(path, *args, **kwargs):
+            if path == "stdout.txt" and "dir_fd" in kwargs:
+                raise PermissionError("fixture denies stdout removal")
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(yoyo.os, "unlink", side_effect=deny_stdout):
+            code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        self.assertTrue((old / "stdout.txt").exists())
+        self.assertFalse((old / "stderr.txt").exists())
+        code, out, err = self._finish()
+        self.assertEqual(code, 0, err)
+        self.assertTrue((old / "stdout.txt").exists())
+
+    def test_signal_flush_does_not_run_maintenance(self):
+        old = self._old()
+        entry = {"run_dir": old, "started": time.monotonic()}
+        with mock.patch.dict(yoyo._ACTIVE_JOURNALS, {str(old): entry}, clear=True), \
+             mock.patch.object(yoyo, "prune_old_streams") as maintenance:
+            yoyo._flush_active_journals(15)
+            maintenance.assert_not_called()
+        self.assertTrue((old / "stdout.txt").exists())
+
+    def test_python39_pathlib_signatures_allow_retention(self):
+        old = self._old()
+        original_stat = Path.stat
+
+        def legacy_stat(path):
+            return original_stat(path)
+
+        # Python 3.9 stat has no follow_symlinks keyword. Its lstat calls
+        # os.lstat directly; modern pathlib delegates lstat and is_dir
+        # through stat with the newer keyword.
+        with mock.patch.object(Path, "stat", legacy_stat), \
+             mock.patch.object(Path, "lstat", lambda path: os.lstat(path)), \
+             mock.patch.object(Path, "is_dir", lambda path: yoyo.stat.S_ISDIR(os.stat(path).st_mode)), \
+             mock.patch.dict(os.environ, {"YOYO_STATE_DIR": self._state_guard.name, "YOYO_RETENTION_DAYS": "30"}):
+            yoyo.prune_old_streams()
+        self.assertFalse((old / "stdout.txt").exists())
+        self.assertFalse((old / "stderr.txt").exists())
 
 
 if __name__ == "__main__":

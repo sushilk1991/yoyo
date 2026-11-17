@@ -2,6 +2,9 @@
 
 Branch: `feat/long-runs-and-quota`. No push, tag, release or installation.
 
+Commits: item1 `3b221dd`; item2 `370441b`; item3 `9b3fec4`;
+item4 `35be36e`; item5 `81d4a3d`. Item6 is the final commit of this branch.
+
 All tests and trials use isolated `YOYO_STATE_DIR` directories. Linux suites
 run through `boxrun` on retained Instabox `build` (items1–3) and `masonry`
 (items4–6), scheduled by remote Baton.
@@ -66,7 +69,7 @@ The probe transcript exists in the native project directory, and explicit-ID
 resume succeeds. For this CLI/version and safe-mode probe, the project picker
 did not add a visible conversation. No claim is made about other picker modes.
 
-Implementation and gate results follow as each item is completed.
+Implementation and gate results follow.
 
 ## Item 1 - renewable default deadline
 
@@ -288,3 +291,78 @@ Ran 9 tests in 0.064s
 
 OK
 ```
+
+
+## Item 6 - daily raw-stream retention
+
+Tests added: `RetentionTests` (12): default30-day cleanup and preserved audit;
+recent records; live PID with/without final result and legacy identity; reused
+PID; disabled/invalid settings; same UTC day and next-day scans; nonblocking
+lock contention; malformed metadata and ambiguous terminal proof; symlinked
+directories, metadata, lock, marker and ledger root; nonregular streams;
+per-file deletion failure; no maintenance during fatal-signal flushing; and
+Python3.9 pathlib API compatibility.
+Baseline red:4 tests in0.179s,1 failure (old streams remained). Final focused
+retention plus the updated version test:13 tests in0.709s, OK.
+
+Automatic retention runs only after a saved final call result. It deletes only
+regular stdout/stderr captures for old, inactive generated run directories,
+keeps the small history files, and preserves ambiguous records. The separate
+persistent nonblocking lock and UTC day marker coordinate finishing calls;
+marking precedes scanning, so partial failures retry the next day. Filesystem
+errors do not change a successful call into a failure. Settings and filesystem
+fixtures use isolated state directories; the real ledger was never pruned.
+Independent review found no additional defects after tightening terminal proof
+for legacy records without process identity. The implementation also uses
+`lstat()` for Python3.9 compatibility: [Python's documentation](https://docs.python.org/3.10/library/pathlib.html#pathlib.Path.stat)
+confirms the alternative `Path.stat(follow_symlinks=...)` keyword was added
+in3.10. A focused fixture emulates the older pathlib API; it failed against an
+in-memory variant using that keyword (1 test,1 error in0.003s), then passed
+against the actual `lstat()` implementation. No actual Python3.9 interpreter
+run is claimed. No smaller retention behavior shipped. VERSION and its expected
+test were changed together to0.35.0 here.
+
+Full remote gate output (`python3 -m py_compile bin/yoyo`: silent, exit0):
+
+```text
+boxrun: masonry:/data/workspace/yoyo-2c067b94/
+.............
+----------------------------------------------------------------------
+Ran 13 tests in 0.709s
+
+OK
+.........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 601 tests in 57.620s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.062s
+
+OK
+```
+
+## Verification and resource boundaries
+
+All six items have a red regression and passing per-item gates. Native recovery,
+quota and token trials used the installed authenticated macOS CLIs. All Python
+suites and compilation ran on Linux Instabox; the final gates used
+Python3.13.5 on Masonry. Credentials were not copied. SHA256 checks of the tested CLI, test file and skill matched the
+local final source.
+Real multi-hour production runs were not induced: timeout tests use short
+clocks. Quota exhaustion was simulated rather than consuming an account limit.
+CLI usage scope and picker limits are documented above; no billing totals or
+unreported model identity are inferred.
+
+All task-owned foreground test jobs completed; no detached job copies,
+containers or ports were created. The final Masonry Baton readback has no
+running or queued jobs. The retained build/Masonry machines and reusable
+YoYo checkout caches are preserved. The video box used only for preflight is
+back in suspended state, and no new VM was created. Native probe supervisors
+are no longer running. The two test Codex sessions were reversibly archived
+through the native protocol and verified archived; three empty temporary
+native workspaces were removed. Claude transcripts and isolated raw captures
+remain as verification evidence. No global Claude configuration was rewritten.
+
+The branch remains local: no push, tag, release or installation occurred.

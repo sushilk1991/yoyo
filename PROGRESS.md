@@ -1,41 +1,41 @@
 # Long runs and quota
 
-Branch: `feat/long-runs-and-quota`. Follow the six ordered items in
-`docs/plans/2026-11-17-long-runs-and-quota.md`; one passing commit per item.
-No push, tag, release or installation. Bump VERSION only in item6.
+Branch: `feat/long-runs-and-quota`. All six ordered plan items are done and
+checked in the same passing commit as their implementation. No push, tag,
+release or installation. VERSION changed once in item6 to0.35.0.
 
 Done:
-- Item1: `3b221dd`, renewable default deadlines; full535 tests OK.
-- Item2: `370441b`, interrupted answers and native continuation; full547 OK.
-- Item3: `9b3fec4`, sanitized quota and terminal usage-limit outcomes; full560 OK.
-- Every commit passed compile (silent0) and SkillGuard9.
-- Real Codex and Claude Yoyo deadline/resume trials retained answers and recalled
-  random words without sessions.json. Final native quota command passed.
+- Item1 `3b221dd`: renewable default deadlines; remote535 tests OK.
+- Item2 `370441b`: interrupted answers and continuation; remote547 OK.
+- Item3 `9b3fec4`: quota visibility and terminal limit classification; remote560 OK.
+- Item4 `35be36e`: explicit fallback/aliases and doctor catalogs; remote580 OK.
+- Item5 `81d4a3d`: reported tokens and audit percentiles; remote589 OK.
+- Item6 (final branch commit): daily raw-stream retention; remote601 OK.
+- Every item passed compilation and SkillGuard9. Final retention/version13 OK.
+- Native Codex and Claude deadline/resume trials retained answers and recalled
+  random words without sessions.json. Live sanitized quota passed. Native token
+  totals matched envelope+journal: Codex36,628 and Claude17,503.
+- Independent review of items5–6 found no unresolved material defects.
 
-Done: item4 fallback/aliases and doctor catalogs; remote580 tests, compile0,
-SkillGuard9 all passed.
+Decisions/limits:
+- Explicit timeouts stay hard; implicit active deadlines renew to a12h ceiling.
+- Quota routing and model choices are caller-controlled. No dollar figures.
+- Usage is provider-reported: resumed Codex can include prior thread totals;
+  Claude final usage excludes subagents. Unreported model/usage stays unknown.
+- Retention removes only old regular raw streams, at most daily under a
+  nonblocking lock; active/ambiguous/symlink states and all history stay.
+- Every test/trial used isolated YOYO_STATE_DIR. Real ledger never pruned.
 
-Done: item5 token recording and audit percentiles; remote589 tests,
-compile0, SkillGuard9 all passed. Native Codex36,628 and Claude17,503 totals
-match both JSON envelope and journal. Latest provider snapshots are used;
-resumed Codex can include earlier thread usage, Claude excludes subagents.
+Verification placement:
+User explicitly required all suites REMOTE and authorized another machine.
+Items1–3 used retained build; items4–6 used retained masonry via boxrun and
+remote Baton. No local suite ran. Native authenticated probes ran on Mac only;
+credentials were not copied. Video-verify failed disk preflight and was restored
+suspended; no new VM was created at the account limit. All owned jobs completed,
+no detached copies/containers/ports exist, and retained machines/caches remain.
 
-Next: item6 automatic raw-stream retention. Parent owns report, plan and
-commit; implementation ownership will be assigned after item5 is committed.
-Bump VERSION to0.35.0 only in item6 with its expected-version test.
-
-All suites stay REMOTE, explicitly confirmed by user. Use:
-`boxrun --box masonry --lane build --mem 2G -- 'env -u XDG_CONFIG_HOME ...'`.
-User authorized starting another existing machine after build contention and
-new-box quota5/5. Video-verify had only733MB free; restored suspended. Retained
-masonry resumed: Python3.13.5, idle Baton, /data2.2GiB free. Separate owned
-YoYo checkout `/data/workspace/yoyo-2c067b94`; preserve all Masonry data/services.
-Build box remains retained. No local suite ran. Native authenticated vendor
-probes run on Mac only; credentials never copied to remote boxes.
-
-Every test/trial has isolated YOYO_STATE_DIR. Never prune/retain real ledger.
-Evidence `.yoyo/long-runs/evidence/`; report:
+Evidence: ignored `.yoyo/long-runs/evidence/`; committed report:
 `docs/plans/2026-11-17-long-runs-and-quota-verification.md`.
-
-Muse sandbox could not create boxrun locks; its worker/descendants were stopped.
-Native worker completed items1-3. No task-owned native probe process remains.
+Next: no required implementation or verification work remains. No publishing.
+Python3.9-specific pathlib API regression passed under3.13; an actual3.9
+interpreter run was not performed. Test/source/skill SHA256 matched remote.
