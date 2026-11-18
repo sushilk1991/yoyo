@@ -435,3 +435,24 @@ probe evidence and provider-usage caveats above still apply. Final remote Baton
 readback has zero running or queued jobs; no detached copies, containers or
 ports were created. Program, test and skill source remain unchanged after the
 review. No push, tag, release or installation occurred.
+
+
+## Release - v0.35.0
+
+On2026-11-18, the user explicitly authorized commit, push and release,
+superseding the original local-only publishing scope. Upstream remained at
+v0.34.0; main fast-forwarded without conflicts. Release-preparation commit
+`4a33f372055c3ea6a16d0a29ce18beb8c11da23f` and annotated tag `v0.35.0`
+were pushed atomically. [yoyo v0.35.0](https://github.com/sushilk1991/yoyo/releases/tag/v0.35.0)
+was published with `--verify-tag --latest` and read back as published,
+non-draft and non-prerelease. Remote main and the peeled tag matched the
+release commit at publication.
+
+The downloaded public tagged `bin/yoyo` matched the Git tag byte-for-byte and
+the remote-tested SHA256:
+`0709e67c46aeb064fdb35860ede515afabdcdf4e31f78ccf86a2133efec06b7a`.
+The CLI, test and skill hashes also matched the Muse-reviewed verification
+manifest before publication. No program/test/skill changes followed that
+601-test run, so the same verified source was released without another suite
+run. This final verification record changes documentation only. The local
+installed CLI was not changed.
