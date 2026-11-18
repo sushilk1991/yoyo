@@ -1,8 +1,9 @@
 # Long runs and quota
 
-Branch: `feat/long-runs-and-quota`. All six ordered plan items are done and
-checked in the same passing commit as their implementation. No push, tag,
-release or installation. VERSION changed once in item6 to0.35.0.
+Release: `v0.35.0`. All six ordered plan items were completed on
+`feat/long-runs-and-quota`, one passing commit each. VERSION changed once in
+item6. The user authorized commit, push and release on2026-11-18, superseding
+the original no-publishing scope. Local installation is outside this release.
 
 Done:
 - Item1 `3b221dd`: renewable default deadlines; remote535 tests OK.
@@ -52,3 +53,12 @@ profile continuation remains unverified; no speculative flag replay patch.
 Evidence `.yoyo/muse-final/evidence`; full output and boundaries recorded in
 verification report. Program/test/skill unchanged. Remote Baton idle; no
 owned jobs/copies remain. Next: no outstanding task work. No publishing.
+
+
+Release preparation (2026-11-18): fetched origin/main and tags; origin/main
+remains v0.34.0 and the feature branch fast-forwards it. Current CLI/test/skill
+SHA256 values exactly match the601-test Muse-reviewed remote gate inputs.
+Prepared user-facing0.35.0 notes in `.yoyo/release-0.35.0/notes.md`. Integrate by
+fast-forward to main, create an annotated tag, push main+tag atomically, then
+publish GitHub latest release. Read back remote main/tag, release state and
+published CLI bytes. No code or skill changes after the verified inputs.
