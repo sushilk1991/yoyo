@@ -8880,14 +8880,15 @@ class QuotaTests(CliTestCase):
 
 
 class MuseQuotaTests(CliTestCase):
-    def _fake_muse(self, script):
+    def _fake_muse(self, script, *, answer=None):
         folder = Path(self._state_guard.name) / "bin"
         folder.mkdir(exist_ok=True)
         exe = folder / "muse"
+        launcher = f"#!{sys.executable}\nimport sys\n"
+        if answer is not None:
+            launcher += f"if sys.argv[1] == 'exec':\n    print({answer!r})\n    sys.exit(0)\n"
         exe.write_text(
-            f"#!{sys.executable}\n"
-            "import sys\n"
-            "assert sys.argv[1:] == ['usage', '--json'], sys.argv\n" + script,
+            launcher + "assert sys.argv[1:] == ['usage', '--json'], sys.argv\n" + script,
             encoding="utf-8",
         )
         exe.chmod(0o755)
@@ -8909,7 +8910,8 @@ class MuseQuotaTests(CliTestCase):
 
     def test_live_row_reports_only_normalized_quota(self):
         env = self._fake_muse(f"print({json.dumps(self._allowance())!r})\n")
-        with mock.patch.object(yoyo.time, "time", return_value=1795185685.459):
+        now = yoyo.parse_iso_utc("2026-11-20T14:41:25.459Z")
+        with mock.patch.object(yoyo, "utc_now", return_value=now):
             code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out), [{
@@ -8921,19 +8923,63 @@ class MuseQuotaTests(CliTestCase):
             ],
         }])
 
+    def test_probe_disables_launcher_auto_update(self):
+        captured = Path(self._state_guard.name) / "launcher-env"
+        env = self._fake_muse(
+            "import os\nfrom pathlib import Path\n"
+            f"Path({str(captured)!r}).write_text(os.getenv('MUSE_NO_AUTO_UPDATE', 'missing'))\n"
+            f"print({json.dumps(self._allowance())!r})\n"
+        )
+        code, out, err = self.run_cli(["quota", "muse", "--json"], env={**env, "MUSE_NO_AUTO_UPDATE": "0"})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)[0]["source"], "live")
+        self.assertEqual(captured.read_text(), "1")
+
     def test_full_windows_block_until_all_full_windows_reset(self):
+        now = yoyo.parse_iso_utc("2026-11-20T14:42:00Z")
         for window, weekly, reset in (
             (100, 50, "2026-11-20T19:11:51.123000Z"),
             (50, 101, "2026-11-23T00:00:00Z"),
             (100, 101, "2026-11-23T00:00:00Z"),
         ):
-            with self.subTest(window=window, weekly=weekly):
+            with self.subTest(window=window, weekly=weekly), mock.patch.object(yoyo, "utc_now", return_value=now):
                 env = self._fake_muse(f"print({json.dumps(self._allowance(window, weekly))!r})\n")
                 code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
                 self.assertEqual(code, 0, err)
                 row = json.loads(out)[0]
                 self.assertIs(row["blocked"], True)
                 self.assertEqual(row["resets_at"], reset)
+
+    def test_full_windows_expire_independently(self):
+        now = yoyo.parse_iso_utc("2026-11-20T20:00:00Z")
+        for weekly, blocked, reset in (
+            (50, False, None),
+            (100, True, "2026-11-23T00:00:00Z"),
+        ):
+            with self.subTest(weekly=weekly), mock.patch.object(yoyo, "utc_now", return_value=now):
+                env = self._fake_muse(f"print({json.dumps(self._allowance(100, weekly))!r})\n")
+                code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)[0]
+                self.assertEqual(row["windows"][0]["resets_at"], "2026-11-20T19:11:51.123000Z")
+                self.assertIs(row["blocked"], blocked)
+                self.assertEqual(row["resets_at"], reset)
+
+    def test_full_window_without_reset_stays_blocked(self):
+        now = yoyo.parse_iso_utc("2026-11-20T20:00:00Z")
+        for weekly in (50, 100):
+            with self.subTest(weekly=weekly):
+                payload = self._allowance(100, weekly)
+                del payload["allowance"]["window"]["resetsAtMs"]
+                env = self._fake_muse(f"print({json.dumps(payload)!r})\n")
+                with mock.patch.object(yoyo, "utc_now", return_value=now):
+                    code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)[0]
+                self.assertEqual(row["source"], "live")
+                self.assertIsNone(row["windows"][0]["resets_at"])
+                self.assertIs(row["blocked"], True)
+                self.assertIsNone(row["resets_at"])
 
     def test_bad_probe_returns_unknown(self):
         bad_reset = self._allowance()
@@ -8972,12 +9018,34 @@ class MuseQuotaTests(CliTestCase):
             sys.executable, "-c", "import sys; print('Individual quota reached', file=sys.stderr); sys.exit(1)",
         ])
         env["YOYO_AGENT_ECHO"] = shlex.join([sys.executable, "-c", "print('answered')"])
-        code, out, err = self.run_cli(["ask", "first", "--fallback", "muse,echo", "--json", "test"], env=env)
+        now = yoyo.parse_iso_utc("2026-11-20T14:42:00Z")
+        with mock.patch.object(yoyo, "utc_now", return_value=now):
+            code, out, err = self.run_cli(["ask", "first", "--fallback", "muse,echo", "--json", "test"], env=env)
         self.assertEqual(code, 0, err)
         row = json.loads(out)
         self.assertEqual(row["agent"], "echo")
         self.assertEqual([(step["agent"], step["reason"]) for step in row["routing"]],
                          [("first", "quota"), ("muse", "blocked"), ("echo", "answered")])
+
+    def test_routing_checks_muse_reset_again_after_the_probe(self):
+        payload = self._allowance(100, 50)
+        env = self._fake_muse(f"print({json.dumps(payload)!r})\n", answer="answered")
+        before_reset = yoyo.parse_iso_utc("2026-11-20T19:11:51Z")
+        at_reset = yoyo.parse_iso_utc("2026-11-20T19:11:51.123Z")
+        with mock.patch.object(yoyo, "utc_now", return_value=before_reset) as clock:
+            probe = yoyo.quota_for_agent
+
+            def probe_then_reset(*args, **kwargs):
+                row = probe(*args, **kwargs)
+                clock.return_value = at_reset
+                return row
+
+            with mock.patch.object(yoyo, "quota_for_agent", side_effect=probe_then_reset):
+                code, out, err = self.run_cli(["ask", "muse", "--fallback", "muse", "--json", "test"], env=env)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["routing"], [{
+            "agent": "muse", "model": None, "reason": "answered", "exit_code": 0,
+        }])
 
 
 class FallbackTests(CliTestCase):

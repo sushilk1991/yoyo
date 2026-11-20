@@ -3060,6 +3060,9 @@ def route_candidates(args: argparse.Namespace) -> list[dict[str, Any]]:
 def route_is_blocked(quota: dict[str, Any]) -> bool:
     if quota.get("blocked") is not True:
         return False
+    if quota.get("source") == "live" and quota.get("agent") == "muse":
+        reset = parse_iso_utc(quota.get("resets_at"))
+        return reset is None or reset > utc_now()
     if quota.get("source") == "observed":
         reset = parse_iso_utc(quota.get("resets_at"))
         if reset is None:
@@ -8027,7 +8030,8 @@ def muse_quota(command: str, cwd: Path, timeout: float) -> dict[str, Any]:
     try:
         with tempfile.TemporaryDirectory(prefix="yoyo-muse-usage-") as tmp:
             stdout_path = Path(tmp) / "stdout"
-            proc = run_to_files([command, "usage", "--json"], "", cwd, stdout_path, Path(tmp) / "stderr", timeout)
+            proc = run_to_files([command, "usage", "--json"], "", cwd, stdout_path, Path(tmp) / "stderr", timeout,
+                                env={**os.environ, "MUSE_NO_AUTO_UPDATE": "1"})
             if proc.returncode != 0:
                 return unknown_quota("muse")
             with stdout_path.open("rb") as handle:
@@ -8041,6 +8045,7 @@ def muse_quota(command: str, cwd: Path, timeout: float) -> dict[str, Any]:
     allowance = payload.get("allowance") if isinstance(payload, dict) else None
     if not isinstance(allowance, dict):
         return unknown_quota("muse")
+    now = utc_now()
     windows = []
     blocking_resets = []
     for name in ("window", "weekly"):
@@ -8048,25 +8053,31 @@ def muse_quota(command: str, cwd: Path, timeout: float) -> dict[str, Any]:
         if not isinstance(window, dict):
             return unknown_quota("muse")
         used = quota_number(window.get("usedPercent"))
-        reset_ms = quota_number(window.get("resetsAtMs"))
+        raw_reset = window.get("resetsAtMs")
+        reset_ms = quota_number(raw_reset)
         reset = quota_time(reset_ms / 1000) if reset_ms is not None else None
-        if used is None or reset is None:
+        if used is None or (raw_reset is not None and reset is None):
             return unknown_quota("muse")
         windows.append({"name": name, "used_percent": used, "resets_at": reset})
         if used >= 100:
-            blocking_resets.append((reset_ms, reset))
+            reset_at = parse_iso_utc(reset)
+            if reset_at is None or reset_at > now:
+                blocking_resets.append(reset_at)
 
-    observed_at = iso_utc(utc_now())
+    observed_at = iso_utc(now)
     age = 0
     if "asOfMs" in allowance:
         observed_ms = quota_number(allowance["asOfMs"])
         observed_at = quota_time(observed_ms / 1000) if observed_ms is not None else None
         if observed_at is None:
             return unknown_quota("muse")
-        age = round(max(0, time.time() - observed_ms / 1000), 1)
+        age = round(max(0, now.timestamp() - observed_ms / 1000), 1)
+    # A full window without a reset leaves the overall unblock time unknown.
+    known_resets = [reset for reset in blocking_resets if reset is not None]
+    overall_reset = max(known_resets, default=None) if len(known_resets) == len(blocking_resets) else None
     return {"agent": "muse", "source": "live", "observed_at": observed_at, "age_s": age,
             "windows": windows, "blocked": bool(blocking_resets),
-            "resets_at": max(blocking_resets)[1] if blocking_resets else None}
+            "resets_at": iso_utc(overall_reset) if overall_reset is not None else None}
 
 
 def quota_for_agent(agent: str, cwd: Path, timeout: float, agents: dict[str, AgentSpec] | None = None) -> dict[str, Any]:
