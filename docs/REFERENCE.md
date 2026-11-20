@@ -106,10 +106,13 @@ Discovery supports unmodified built-in Codex and Claude commands. If an agent is
 
 ```bash
 yoyo quota                         # Codex and Claude
-yoyo quota codex claude pi --json   # other agents report unknown
+yoyo quota muse --json             # Muse Code
+yoyo quota codex claude muse --json
 ```
 
 Codex reads `account/rateLimits/read` over its native app-server pipe after initialization, without a user turn or inference. `models codex` requests quota over the same pipe as its catalog; unavailable quota leaves a valid catalog intact. Claude's handshake has no quota, so Yoyo reports the last `rate_limit_event` in the newest applicable captured stream, labelled `observed` with its capture time and age. Each finishing Claude call also saves a sanitized snapshot in `result.json`, so the observation survives raw-stream retention. Stream scans use bounded lines and keep only the last event; metadata replies are size- and time-bounded. `--cwd` selects the probe directory and `--timeout` overrides the 20-second metadata deadline.
+
+Muse quota is opt-in by agent name. Yoyo runs `muse usage --json` without a model turn and reports the `window` and `weekly` percentages with UTC resets. Any window at 100% or higher blocks Muse in explicit fallback routing. The overall reset is the latest reset among full windows.
 
 JSON is an array of agent rows: `agent`, `source` (`live`, `observed`, `unknown`), `observed_at`, `age_s`, `windows` (`name`, `used_percent`, `resets_at`), `blocked`, and an overall `resets_at` when known. Unknown percentages, resets and block state remain null. Output excludes raw account replies, credits, identifiers and error details. Custom/wrapped agents report unknown rather than dropping profile arguments and querying a different account. Transport failure also reports unknown. Claude observations can belong to an earlier account configuration; their age is evidence, not a live allowance.
 

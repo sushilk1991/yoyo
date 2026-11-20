@@ -8879,6 +8879,107 @@ class QuotaTests(CliTestCase):
         self.assertIsNone(yoyo.parse_iso_utc('0001-01-01T00:00:00+23:59'))
 
 
+class MuseQuotaTests(CliTestCase):
+    def _fake_muse(self, script):
+        folder = Path(self._state_guard.name) / "bin"
+        folder.mkdir(exist_ok=True)
+        exe = folder / "muse"
+        exe.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "assert sys.argv[1:] == ['usage', '--json'], sys.argv\n" + script,
+            encoding="utf-8",
+        )
+        exe.chmod(0o755)
+        return {"PATH": str(folder), "YOYO_CONFIG": str(folder / "missing.json"), "YOYO_AGENT_MUSE": None}
+
+    def _allowance(self, window=3, weekly=19):
+        return {
+            "schemaVersion": 1,
+            "allowance": {
+                "tier": "Muse Code Power Usage",
+                "window": {"usedPercent": window, "resetsAtMs": 1795201911123},
+                "weekly": {"usedPercent": weekly, "resetsAtMs": 1795392000000},
+                "asOfMs": 1795185684259,
+                "source": "mint",
+            },
+            "reason": None,
+            "hint": None,
+        }
+
+    def test_live_row_reports_only_normalized_quota(self):
+        env = self._fake_muse(f"print({json.dumps(self._allowance())!r})\n")
+        with mock.patch.object(yoyo.time, "time", return_value=1795185685.459):
+            code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), [{
+            "agent": "muse", "source": "live", "observed_at": "2026-11-20T14:41:24.259000Z",
+            "age_s": 1.2, "blocked": False, "resets_at": None,
+            "windows": [
+                {"name": "window", "used_percent": 3, "resets_at": "2026-11-20T19:11:51.123000Z"},
+                {"name": "weekly", "used_percent": 19, "resets_at": "2026-11-23T00:00:00Z"},
+            ],
+        }])
+
+    def test_full_windows_block_until_all_full_windows_reset(self):
+        for window, weekly, reset in (
+            (100, 50, "2026-11-20T19:11:51.123000Z"),
+            (50, 101, "2026-11-23T00:00:00Z"),
+            (100, 101, "2026-11-23T00:00:00Z"),
+        ):
+            with self.subTest(window=window, weekly=weekly):
+                env = self._fake_muse(f"print({json.dumps(self._allowance(window, weekly))!r})\n")
+                code, out, err = self.run_cli(["quota", "muse", "--json"], env=env)
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)[0]
+                self.assertIs(row["blocked"], True)
+                self.assertEqual(row["resets_at"], reset)
+
+    def test_bad_probe_returns_unknown(self):
+        bad_reset = self._allowance()
+        bad_reset["allowance"]["weekly"]["resetsAtMs"] = 10**20
+        for case, script in {
+            "nonzero": f"print({json.dumps(self._allowance())!r}); sys.exit(1)\n",
+            "timeout": "import time; time.sleep(10)\n",
+            "malformed JSON": "print('{')\n",
+            "missing allowance": "print('{}')\n",
+            "missing window": "print('{\"allowance\": {\"window\": {}}}')\n",
+            "bad percentage": f"print({json.dumps(self._allowance(window=True))!r})\n",
+            "bad reset": f"print({json.dumps(bad_reset)!r})\n",
+            "missing binary": None,
+        }.items():
+            with self.subTest(case=case):
+                env = self._fake_muse(script or "")
+                if script is None:
+                    (Path(env["PATH"]) / "muse").unlink()
+                code, out, err = self.run_cli(["quota", "muse", "--json", "--timeout", ".2"], env=env)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out), [yoyo.unknown_quota("muse")])
+
+    def test_custom_muse_profile_remains_unknown(self):
+        env = self._fake_muse(f"print({json.dumps(self._allowance())!r})\n")
+        config = Path(self._state_guard.name) / "agents.json"
+        config.write_text(json.dumps({"agents": {"muse": {
+            "kind": "muse", "command": ["muse", "exec", "--permission-profile", "custom"],
+        }}}), encoding="utf-8")
+        code, out, err = self.run_cli(["quota", "muse", "--json"], env={**env, "YOYO_CONFIG": str(config)})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), [yoyo.unknown_quota("muse")])
+
+    def test_fallback_skips_blocked_muse_without_executing_it(self):
+        env = self._fake_muse(f"print({json.dumps(self._allowance(100))!r})\n")
+        env["YOYO_AGENT_FIRST"] = shlex.join([
+            sys.executable, "-c", "import sys; print('Individual quota reached', file=sys.stderr); sys.exit(1)",
+        ])
+        env["YOYO_AGENT_ECHO"] = shlex.join([sys.executable, "-c", "print('answered')"])
+        code, out, err = self.run_cli(["ask", "first", "--fallback", "muse,echo", "--json", "test"], env=env)
+        self.assertEqual(code, 0, err)
+        row = json.loads(out)
+        self.assertEqual(row["agent"], "echo")
+        self.assertEqual([(step["agent"], step["reason"]) for step in row["routing"]],
+                         [("first", "quota"), ("muse", "blocked"), ("echo", "answered")])
+
+
 class FallbackTests(CliTestCase):
     def _env(self, error):
         fail=shlex.join(['python3','-c','import sys;print('+repr(error)+',file=sys.stderr);sys.exit(1)'])

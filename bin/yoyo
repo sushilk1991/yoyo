@@ -8023,12 +8023,60 @@ def observed_claude_quota(agent: str = "claude") -> dict[str, Any]:
     return unknown_quota(agent)
 
 
+def muse_quota(command: str, cwd: Path, timeout: float) -> dict[str, Any]:
+    try:
+        with tempfile.TemporaryDirectory(prefix="yoyo-muse-usage-") as tmp:
+            stdout_path = Path(tmp) / "stdout"
+            proc = run_to_files([command, "usage", "--json"], "", cwd, stdout_path, Path(tmp) / "stderr", timeout)
+            if proc.returncode != 0:
+                return unknown_quota("muse")
+            with stdout_path.open("rb") as handle:
+                output = handle.read(MODEL_PROBE_MAX_BYTES + 1)
+            if len(output) > MODEL_PROBE_MAX_BYTES:
+                return unknown_quota("muse")
+            payload = json.loads(output)
+    except (OSError, subprocess.TimeoutExpired, ValueError, RecursionError):
+        return unknown_quota("muse")
+
+    allowance = payload.get("allowance") if isinstance(payload, dict) else None
+    if not isinstance(allowance, dict):
+        return unknown_quota("muse")
+    windows = []
+    blocking_resets = []
+    for name in ("window", "weekly"):
+        window = allowance.get(name)
+        if not isinstance(window, dict):
+            return unknown_quota("muse")
+        used = quota_number(window.get("usedPercent"))
+        reset_ms = quota_number(window.get("resetsAtMs"))
+        reset = quota_time(reset_ms / 1000) if reset_ms is not None else None
+        if used is None or reset is None:
+            return unknown_quota("muse")
+        windows.append({"name": name, "used_percent": used, "resets_at": reset})
+        if used >= 100:
+            blocking_resets.append((reset_ms, reset))
+
+    observed_at = iso_utc(utc_now())
+    age = 0
+    if "asOfMs" in allowance:
+        observed_ms = quota_number(allowance["asOfMs"])
+        observed_at = quota_time(observed_ms / 1000) if observed_ms is not None else None
+        if observed_at is None:
+            return unknown_quota("muse")
+        age = round(max(0, time.time() - observed_ms / 1000), 1)
+    return {"agent": "muse", "source": "live", "observed_at": observed_at, "age_s": age,
+            "windows": windows, "blocked": bool(blocking_resets),
+            "resets_at": max(blocking_resets)[1] if blocking_resets else None}
+
+
 def quota_for_agent(agent: str, cwd: Path, timeout: float, agents: dict[str, AgentSpec] | None = None) -> dict[str, Any]:
     agents = agents if agents is not None else load_agents()
-    if agent not in ("codex", "claude") or agents.get(agent) != DEFAULT_AGENTS.get(agent):
+    if agent not in ("codex", "claude", "muse") or agents.get(agent) != DEFAULT_AGENTS.get(agent):
         return unknown_quota(agent)  # never drop custom account/profile arguments
     if agent == "claude":
         return observed_claude_quota(agent)
+    if agent == "muse":
+        return muse_quota(agents[agent].command[0], cwd, timeout)
     try:
         with _metadata_process([agents[agent].command[0], "app-server"], cwd) as proc:
             deadline = time.monotonic() + timeout
@@ -9424,8 +9472,8 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("--json", action="store_true", help="Emit account type and selectable models as JSON")
     models.set_defaults(func=_cmd_models)
 
-    quota = sub.add_parser("quota", help="Read live Codex quota and the newest observed Claude quota, without inference")
-    quota.add_argument("agents", nargs="*", help="Agents to report (default: codex claude; other/custom agents are unknown)")
+    quota = sub.add_parser("quota", help="Report live Codex and Muse quota or the newest observed Claude quota")
+    quota.add_argument("agents", nargs="*", help="Supported agents: codex, claude, muse (default: codex claude)")
     quota.add_argument("--cwd", default=os.getcwd())
     quota.add_argument("--timeout", type=float, default=MODEL_PROBE_SECONDS, help="Native metadata deadline in seconds")
     quota.add_argument("--json", action="store_true", help="Emit only sanitized quota fields")
